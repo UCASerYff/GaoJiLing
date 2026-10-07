@@ -1,0 +1,10 @@
+搞机灵 V1.04 图标设计
+
+黑色圆角方底、白色简体书法字，竖排「机灵」。沿用此前中等字重、字形、大小及视觉居中位置；圆角方底以外透明。使用内置 image_gen 编辑原图；Scripts/MakeIcon.swift 仅缩放与打包 ICNS，不重新绘制画稿。
+
+最终文件：Assets/AppIcon.png、Assets/AppIcon.icns。
+
+只读验收：PNG 1254 × 1254，白字字框 (442,267)–(818,970)，中心约 (630,618.5)，沿用此前视觉居中位置；画布角落和圆角底以外透明，方底为黑色。ICNS 已经 AppKit 回读，共 11 个标准及 Retina 表示，覆盖 16–1024 px。生成画稿保留轻微抗锯齿与近白色笔触。
+
+最终提示词（内置 image_gen，透明背景编辑模式）：
+Precise color-swap edit of this existing macOS app icon. Preserve the exact recognizable simplified Chinese calligraphy characters 机 above 灵, their glyph shapes, medium stroke weight, proportions, vertical placement and spacing. Preserve the centered square rounded-corner tile geometry and generous outer transparent margin. Change ONLY the palette: the tile must become opaque near-pure black (#080808 to #000000); the calligraphy must become crisp opaque white (#FFFFFF). Clean the tile perimeter so it is smooth with no stray ink or pale fringe outside. No extra text, no embellishments, no new glyphs, no shadow, no 3D, no gradient. The area outside the rounded black tile must remain truly transparent. Output one production-ready square PNG icon.

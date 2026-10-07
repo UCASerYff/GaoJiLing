@@ -6,6 +6,10 @@ trap 'rm -rf "$TEST_TEMP"' EXIT
 export CLANG_MODULE_CACHE_PATH="$TEST_TEMP/module-cache"
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 swiftc -swift-version 5 -sdk "$SDK" -module-cache-path "$TEST_TEMP/module-cache" \
+  "$PROJECT_DIR/Sources/FloatingGeometry.swift" "$PROJECT_DIR/Tests/FloatingGeometryTests.swift" \
+  -o "$TEST_TEMP/FloatingGeometryTests"
+"$TEST_TEMP/FloatingGeometryTests"
+swiftc -swift-version 5 -sdk "$SDK" -module-cache-path "$TEST_TEMP/module-cache" \
   "$PROJECT_DIR/Sources/PanelInteraction.swift" "$PROJECT_DIR/Tests/PanelInteractionTests.swift" \
   -o "$TEST_TEMP/PanelInteractionTests"
 "$TEST_TEMP/PanelInteractionTests"

@@ -79,7 +79,7 @@ struct GLSettingsView: View {
         Form {
             Section {
                 Toggle("显示可移动唤起条", isOn: setting(\.edgeEnabled))
-                Picker("停靠侧边", selection: setting(\.edge)) {
+                Picker("快捷停靠侧边", selection: setting(\.edge)) {
                     Text("左侧").tag("left")
                     Text("右侧").tag("right")
                 }
@@ -94,11 +94,19 @@ struct GLSettingsView: View {
                     }
                 }
                 LabeledContent("唤起条位置") {
-                    Button("重置到当前屏幕中间") {
-                        guard !store.dataBusy else { return }
-                        NotificationCenter.default.post(name: .monitorResetEdgeHandle, object: nil)
+                    HStack {
+                        Button("停靠到所选侧边") {
+                            guard !store.dataBusy else { return }
+                            NotificationCenter.default.post(name: .monitorDockEdgeHandle, object: nil)
+                        }
+                        Button("重置到当前屏幕侧边中部") {
+                            guard !store.dataBusy else { return }
+                            NotificationCenter.default.post(name: .monitorResetEdgeHandle, object: nil)
+                        }
                     }
+                    .accessibilityElement(children: .contain)
                 }
+                .accessibilityElement(children: .contain)
                 Picker("呼出快捷键", selection: setting(\.hotkeyChoice)) {
                     Text("⌥ Option + ⌘ Command + G").tag("g")
                     Text("⌥ Option + ⌘ Command + M").tag("m")
@@ -106,7 +114,7 @@ struct GLSettingsView: View {
             } header: {
                 Text("边缘唤起条")
             } footer: {
-                Text("点击细线或在上面停留即可呼出面板。按住拖动可调整高度、侧边或屏幕，松开后自动贴边并记住位置。隐藏唤起条后，仍可用快捷键或菜单栏打开面板。")
+                Text("点击或悬停竖线可呼出面板。按住竖线或展开后的顶部 CPU 区域可自由移动，靠近左右边缘才吸附，松手记住位置和屏幕。切换侧边或点击停靠按钮可快捷停靠；重置回该侧边中部。隐藏竖线后仍可用快捷键或菜单栏打开。")
             }
 
             Section {
@@ -304,7 +312,7 @@ struct GLAboutView: View {
                 }
             }
             Section("使用提示") {
-                tip("唤起与收起", "点击或悬停竖线展开面板；鼠标进入后移出会快速收回，点击面板外或按 Esc 也可收起。只有面板内开始的拖动会暂缓收回。唤起悬停时间只控制展开等待，按住竖线可拖动位置。")
+                tip("唤起与收起", "点击或悬停竖线展开面板；按住竖线或顶部 CPU 区域可自由拖动，靠近左右侧边才吸附。进入后移出快速收回，点击面板外或按 Esc 也可收起；拖动期间保持展开。收回后的竖线跟随新位置。")
                 tip("键盘操作", "\(store.settings.hotkeyChoice == "m" ? "⌥⌘M" : "⌥⌘G") 呼出面板 · ⌘, 打开设置 · ⇧⌘E 打开数据。")
                 tip("数据口径", "CPU 使用全机 0–100% 口径。传感器因机型而异；无法获取时显示不可用。完全退出程序后不再采样，关闭窗口仍会继续监控。")
                 tip("暂停采样", "暂停后保留最后一次读数；进行中的任务仍继续计时，需在任务页面点击结束记录。")

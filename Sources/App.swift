@@ -64,6 +64,11 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     private var panelAutoCollapse = PanelAutoCollapse()
     private var panelContentHeight: CGFloat = 620
     private var openingStripFrame: NSRect?
+    private var panelExpansionEdge = "right"
+    private var panelDragOffset: NSSize?
+    private var panelDragScreen: NSScreen?
+    private var panelDidDrag = false
+    private var panelDragStart: NSPoint?
     private var localMouseMonitor: Any?
     private var globalMouseMonitor: Any?
     private var statusClickAlreadyCollapsed = false
@@ -131,9 +136,10 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
                 NSApp.reply(toApplicationShouldTerminate: true)
             }
         }.store(in: &subscriptions)
-        NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged), name: .monitorSettingsChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged(_:)), name: .monitorSettingsChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(settingsNavigationRequested(_:)), name: .monitorNavigate, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(resetEdgeHandle), name: .monitorResetEdgeHandle, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(dockEdgeHandle), name: .monitorDockEdgeHandle, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
@@ -245,6 +251,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showDashboard(); return true }
     func applicationWillTerminate(_ notification: Notification) {
+        finishPanelDrag()
         edgeTimer?.invalidate()
         if let localMouseMonitor { NSEvent.removeMonitor(localMouseMonitor) }
         if let globalMouseMonitor { NSEvent.removeMonitor(globalMouseMonitor) }
@@ -256,10 +263,12 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     @objc private func didWake() { edgeHandle?.resume() }
     @objc private func screensChanged() { hidePanel(); edgeHandle?.screensChanged() }
     @objc private func resetEdgeHandle() { hidePanel(); edgeHandle?.reset() }
-    @objc private func settingsChanged() {
+    @objc private func dockEdgeHandle() { hidePanel(); edgeHandle?.dock() }
+    @objc private func settingsChanged(_ notification: Notification? = nil) {
         NSApp.appearance = store.settings.appearance == "dark" ? NSAppearance(named: .darkAqua) : store.settings.appearance == "light" ? NSAppearance(named: .aqua) : nil
         updateStatus(store.latest); registerShortcut()
-        edgeHandle?.update(enabled: store.settings.edgeEnabled, edge: store.settings.edge)
+        edgeHandle?.update(enabled: store.settings.edgeEnabled, edge: store.settings.edge,
+                           restorePosition: notification?.object as? String == "restored")
         if !store.settings.edgeEnabled { hidePanel() }
     }
     private func updateStatus(_ sample: MetricsSample) {
@@ -316,9 +325,9 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     @objc private func pause() { store.togglePause() }
     private func configureEdgeHandle() {
         let handle = EdgeHandleController()
-        handle.onOpen = { [weak self] screen, anchorY, manual in
+        handle.onOpen = { [weak self] screen, anchor, manual in
             guard let self, !self.panel.isVisible else { return }
-            self.showPanel(on: screen, manual: manual, anchorY: anchorY)
+            self.showPanel(on: screen, manual: manual, anchor: anchor, fromStrip: true)
         }
         handle.onDragBegan = { [weak self] in self?.hidePanel() }
         handle.onEdgeChanged = { [weak self] edge in
@@ -328,12 +337,21 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         }
         edgeHandle = handle
     }
-    @objc func togglePanel() { panel.isVisible ? hidePanel() : showPanel(on: currentScreen(), manual: true) }
+    @objc func togglePanel() {
+        if panel.isVisible { hidePanel() }
+        else {
+            let screen = currentScreen()
+            showPanel(on: screen, manual: true, anchor: edgeHandle?.anchor(on: screen))
+        }
+    }
     private func currentScreen() -> NSScreen { NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main ?? NSScreen.screens[0] }
     private func updatePanelView() {
         let content = MonitorPanelContentView(rootView: PanelView(store: store,
             openDashboard: { [weak self] in self?.showDashboard() },
-            contentHeightChanged: { [weak self] height in self?.resizePanel(to: height) }))
+            contentHeightChanged: { [weak self] height in self?.resizePanel(to: height) },
+            panelDragBegan: { [weak self] point in self?.beginPanelDrag(at: point) },
+            panelDragged: { [weak self] point in self?.dragPanel(to: point) },
+            panelDragEnded: { [weak self] in self?.finishPanelDrag() }))
         content.pointerChanged = { [weak self] point in
             guard let self, self.panel.isVisible else { return }
             // Keep the original event position: a quick pass through the panel
@@ -355,21 +373,25 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         let height = max(320, ceil(contentHeight))
         guard abs(height - panelContentHeight) >= 1 else { return }
         panelContentHeight = height
-        guard panel.isVisible, let screen = panel.screen else { return }
+        applyPanelHeight()
+    }
+    private func applyPanelHeight() {
+        guard panel.isVisible, panelDragOffset == nil, let screen = panel.screen else { return }
         let visible = screen.visibleFrame
         var frame = panel.frame
-        frame.size.height = min(height, max(visible.height - 24, 1))
+        frame.size.height = min(panelContentHeight, max(visible.height - 24, 1))
         frame.origin.y = max(visible.minY + 12, min(panel.frame.maxY - frame.height, visible.maxY - frame.height - 12))
         panel.setFrame(frame, display: true)
     }
-    private func showPanel(on screen: NSScreen, manual: Bool = false, anchorY: CGFloat? = nil) {
-        let f = screen.visibleFrame; let height = min(panelContentHeight, f.height - 24); let width = min(398, f.width - 32)
-        let x = store.settings.edge == "left" ? f.minX + 12 : f.maxX - width - 12
-        let desiredY = anchorY.map { $0 - height * 0.5 } ?? (NSEvent.mouseLocation.y - height * 0.65)
-        let y = max(f.minY + 12, min(desiredY, f.maxY - height - 12))
-        panel.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
+    private func showPanel(on screen: NSScreen, manual: Bool = false, anchor: NSRect? = nil, fromStrip: Bool = false) {
+        let visible = screen.visibleFrame
+        let size = NSSize(width: min(398, max(visible.width - 32, 1)), height: min(panelContentHeight, max(visible.height - 24, 1)))
+        let strip = anchor ?? EdgeHandleGeometry.frame(in: visible, edge: store.settings.edge, verticalRatio: 0.5)
+        let placement = FloatingPanelGeometry.placement(anchor: strip, size: size, in: visible, preferredEdge: store.settings.edge)
+        panelExpansionEdge = placement.edge
+        panel.setFrame(placement.frame, display: true)
         panelAutoCollapse.opened(at: ProcessInfo.processInfo.systemUptime)
-        openingStripFrame = anchorY == nil ? nil : edgeHandle?.frame
+        openingStripFrame = fromStrip ? strip : nil
         _ = panelAutoCollapse.shouldCollapse(at: ProcessInfo.processInfo.systemUptime,
                                              pointerInside: PanelHitRegion.contains(NSEvent.mouseLocation, in: panel.frame))
         panel.alphaValue = 0
@@ -378,7 +400,45 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         if manual { panel.makeKeyAndOrderFront(nil) }
         NSAnimationContext.runAnimationGroup { context in context.duration = 0.16; panel.animator().alphaValue = 1 }
     }
-    private func hidePanel() { guard panel != nil else { return }; panelAutoCollapse.closed(); openingStripFrame = nil; panel.orderOut(nil); suppressEdgeUntil = Date().addingTimeInterval(0.8); edgeHandle?.setExpanded(false) }
+    private func beginPanelDrag(at point: NSPoint) {
+        guard panel.isVisible else { return }
+        panelDragStart = point
+        panelDragOffset = NSSize(width: point.x - panel.frame.minX, height: point.y - panel.frame.minY)
+        panelDragScreen = panel.screen
+        panelDidDrag = false
+    }
+    private func dragPanel(to point: NSPoint) {
+        guard let offset = panelDragOffset, let start = panelDragStart,
+              let screen = EdgeHandleScreen.containing(point) ?? panelDragScreen else { return }
+        guard panelDidDrag || hypot(point.x - start.x, point.y - start.y) >= EdgeHandleGeometry.dragThreshold else { return }
+        panelDidDrag = true
+        panelDragScreen = screen
+        let frame = FloatingPanelGeometry.draggingFrame(pointer: point, grabOffset: offset, size: panel.frame.size, in: screen.visibleFrame)
+        if abs(frame.minX - (screen.visibleFrame.minX + 12)) < 0.5 { panelExpansionEdge = "left" }
+        else if abs(frame.maxX - (screen.visibleFrame.maxX - 12)) < 0.5 { panelExpansionEdge = "right" }
+        openingStripFrame = nil
+        panel.setFrame(frame, display: true)
+    }
+    private func finishPanelDrag() {
+        guard panelDragOffset != nil else { return }
+        let didDrag = panelDidDrag; let screen = panelDragScreen
+        panelDragOffset = nil; panelDragStart = nil; panelDragScreen = nil; panelDidDrag = false
+        applyPanelHeight()
+        if didDrag, let screen { edgeHandle?.commitPanelPosition(panel.frame, on: screen, edge: panelExpansionEdge) }
+        checkPanelPointer()
+    }
+    private func hidePanel() {
+        guard panel != nil else { return }
+        // Save a completed move if Esc, sleep or display changes close the
+        // panel before its mouse-up arrives.
+        if panelDragOffset != nil {
+            let screen = panelDragScreen; let didDrag = panelDidDrag
+            panelDragOffset = nil; panelDragStart = nil; panelDragScreen = nil; panelDidDrag = false
+            if didDrag, let screen { edgeHandle?.commitPanelPosition(panel.frame, on: screen, edge: panelExpansionEdge) }
+        }
+        panelAutoCollapse.closed(); openingStripFrame = nil; panel.orderOut(nil)
+        suppressEdgeUntil = Date().addingTimeInterval(0.8); edgeHandle?.setExpanded(false)
+    }
     @objc private func checkEdge() {
         guard !NSScreen.screens.isEmpty else { return }
         edgeHandle?.checkPointer(delay: store.settings.edgeDelay, canOpen: !panel.isVisible && Date() > suppressEdgeUntil)
@@ -389,6 +449,10 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     private func checkPanelPointer() {
         guard panel?.isVisible == true else { return }
         guard edgeHandle?.isInteracting != true else { return }
+        if panelDragOffset != nil {
+            if NSEvent.pressedMouseButtons & 1 == 0 { finishPanelDrag() }
+            return
+        }
         let point = NSEvent.mouseLocation
         if panelAutoCollapse.shouldCollapse(at: ProcessInfo.processInfo.systemUptime,
                                             pointerInside: PanelHitRegion.contains(point, in: panel.frame),

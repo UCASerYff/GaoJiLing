@@ -38,7 +38,7 @@ extension Notification.Name {
     private let detector = EventDetector()
     private var settingsWritable = true
     private var dataGeneration = 0
-    private let edgePreferenceKeys = ["GaoJiLing.EdgeHandle.verticalRatio", "GaoJiLing.EdgeHandle.displayUUID"]
+    private let edgePreferenceKeys = ["GaoJiLing.EdgeHandle.verticalRatio", "GaoJiLing.EdgeHandle.displayUUID", "GaoJiLing.EdgeHandle.horizontalRatio"]
 
     init(startSampling: Bool = true, directory: URL? = nil) {
         dataDirectory = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("GaoSeries/GaoJiLing", isDirectory: true)
@@ -343,8 +343,11 @@ extension MonitorStore {
                 if let value = backup.auxiliaryPreferences?[edgePreferenceKeys[1]], UUID(uuidString: value) != nil {
                     UserDefaults.standard.set(value, forKey: edgePreferenceKeys[1])
                 }
+                if let value = backup.auxiliaryPreferences?[edgePreferenceKeys[2]], let ratio = Double(value), ratio.isFinite, (0...1).contains(ratio) {
+                    UserDefaults.standard.set(ratio, forKey: edgePreferenceKeys[2])
+                }
                 focusedEvent = nil; eventHistory = []; latest = .empty; lastPersisted = .distantPast; lastPruned = Date()
-                restartTimer(); NotificationCenter.default.post(name: .monitorSettingsChanged, object: nil)
+                restartTimer(); NotificationCenter.default.post(name: .monitorSettingsChanged, object: "restored")
                 lastExportURL = recovery; statusMessage = "恢复完成。恢复前的数据已保存在数据目录的 Recovery 文件夹。"
             } catch {
                 if restoreCommitted {

@@ -215,7 +215,7 @@ private func expectFailure(_ message: String, _ operation: () throws -> Void) th
             try source.save(task)
         }
         let path = root.appendingPathComponent("full-backup.json")
-        let preferences = ["edgeHandleY": "0.314159", "edgeHandleDisplay": "main"]
+        let preferences = ["GaoJiLing.EdgeHandle.verticalRatio": "0.314159", "GaoJiLing.EdgeHandle.displayUUID": "00000000-0000-0000-0000-000000000001", "GaoJiLing.EdgeHandle.horizontalRatio": "0.618034"]
         let summary = try source.exportBackup(to: path, appVersion: "1.01", auxiliaryPreferences: preferences)
         try expect(summary == MonitorDataSummary(sampleCount: 2, eventCount: 305, sessionCount: 305), "backup must not inherit the UI 300-record cap")
         try expect(try source.allEvents().count == 305 && source.allSessions().count == 305, "CSV all-record readers must be unbounded")

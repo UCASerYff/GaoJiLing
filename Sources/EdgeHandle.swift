@@ -2,52 +2,7 @@ import AppKit
 
 extension Notification.Name {
     static let monitorResetEdgeHandle = Notification.Name("GaoJiLing.ResetEdgeHandle")
-}
-
-/// The visible strip and its small hit target share one window. No full-height
-/// transparent window is left in front of other applications.
-enum EdgeHandleGeometry {
-    static let hitSize = NSSize(width: 20, height: 104)
-    static let visualWidth: CGFloat = 6
-    static let visualHeight: CGFloat = 96
-    static let verticalInset: CGFloat = 12
-    static let snapDistance: CGFloat = 28
-    static let dragThreshold: CGFloat = 4
-
-    static func clamp(_ ratio: Double) -> Double {
-        ratio.isFinite ? min(max(ratio, 0), 1) : 0.5
-    }
-
-    static func frame(in visible: NSRect, edge: String, verticalRatio: Double) -> NSRect {
-        let width = min(hitSize.width, max(visible.width, 1))
-        let height = min(hitSize.height, max(visible.height - verticalInset * 2, 1))
-        let travel = max(visible.height - height - verticalInset * 2, 0)
-        let x = edge == "left" ? visible.minX : visible.maxX - width
-        let y = visible.minY + min(verticalInset, max((visible.height - height) / 2, 0))
-            + CGFloat(1 - clamp(verticalRatio)) * travel
-        return NSRect(x: x, y: y, width: width, height: height)
-    }
-
-    static func ratio(for frame: NSRect, in visible: NSRect) -> Double {
-        let travel = max(visible.height - frame.height - verticalInset * 2, 0)
-        guard travel > 0 else { return 0.5 }
-        return clamp(1 - Double((frame.minY - visible.minY - verticalInset) / travel))
-    }
-
-    static func nearestEdge(to point: NSPoint, in visible: NSRect) -> String {
-        point.x < visible.midX ? "left" : "right"
-    }
-
-    static func draggingFrame(pointer: NSPoint, grabOffset: NSSize, in visible: NSRect) -> NSRect {
-        var frame = self.frame(in: visible, edge: "left", verticalRatio: 0.5)
-        frame.origin.x = min(max(pointer.x - grabOffset.width, visible.minX), max(visible.minX, visible.maxX - frame.width))
-        let lowY = visible.minY + min(verticalInset, max((visible.height - frame.height) / 2, 0))
-        let highY = max(lowY, visible.maxY - verticalInset - frame.height)
-        frame.origin.y = min(max(pointer.y - grabOffset.height, lowY), highY)
-        if pointer.x - visible.minX <= snapDistance { frame.origin.x = visible.minX }
-        else if visible.maxX - pointer.x <= snapDistance { frame.origin.x = visible.maxX - frame.width }
-        return frame
-    }
+    static let monitorDockEdgeHandle = Notification.Name("GaoJiLing.DockEdgeHandle")
 }
 
 enum EdgeHandleScreen {
@@ -69,10 +24,11 @@ enum EdgeHandleScreen {
 
 @MainActor final class EdgeHandleController {
     static let ratioDefaultsKey = "GaoJiLing.EdgeHandle.verticalRatio"
+    static let horizontalRatioDefaultsKey = "GaoJiLing.EdgeHandle.horizontalRatio"
     static let displayDefaultsKey = "GaoJiLing.EdgeHandle.displayUUID"
 
-    /// Anchor is the strip's vertical centre in global AppKit coordinates.
-    var onOpen: ((NSScreen, CGFloat, Bool) -> Void)?
+    /// Anchor is the strip's complete hit frame in global AppKit coordinates.
+    var onOpen: ((NSScreen, NSRect, Bool) -> Void)?
     var onDragBegan: (() -> Void)?
     var onEdgeChanged: ((String) -> Void)?
 
@@ -83,7 +39,9 @@ enum EdgeHandleScreen {
     private var expanded = false
     private var suspended = false
     private var edge = "right"
+    private var hasConfiguredEdge = false
     private var verticalRatio: Double
+    private var horizontalRatio: Double?
     private var displayIdentifier: String?
     private var hoverSince: Date?
     private var suppressHoverUntil = Date.distantPast
@@ -96,6 +54,7 @@ enum EdgeHandleScreen {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         verticalRatio = EdgeHandleGeometry.clamp(defaults.object(forKey: Self.ratioDefaultsKey) as? Double ?? 0.5)
+        horizontalRatio = (defaults.object(forKey: Self.horizontalRatioDefaultsKey) as? Double).map(EdgeHandleGeometry.clamp)
         displayIdentifier = defaults.string(forKey: Self.displayDefaultsKey)
         window = EdgeHandlePanel(contentRect: NSRect(origin: .zero, size: EdgeHandleGeometry.hitSize),
                                  styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -110,7 +69,7 @@ enum EdgeHandleScreen {
         window.isReleasedWhenClosed = false
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         window.contentView = stripView
-        stripView.toolTip = "悬停或点击打开搞机灵；按住拖动可调整位置，也可拖到另一台显示器。"
+        stripView.toolTip = "悬停或点击展开；按住可自由移动，也可跨屏拖动，仅靠近左右边缘时吸附。"
         stripView.onPress = { [weak self] in self?.open(manual: true) }
         window.onPressBegan = { [weak self] in
             self?.hoverSince = nil
@@ -125,15 +84,48 @@ enum EdgeHandleScreen {
         window.onRelease = { [weak self] dragged in self?.release(dragged: dragged) }
     }
 
-    func update(enabled: Bool, edge: String) {
+    func update(enabled: Bool, edge: String, restorePosition: Bool = false) {
         self.enabled = enabled
-        self.edge = edge == "left" ? "left" : "right"
         hoverSince = nil
         guard !isInteracting else { return }
+        let selectedEdge = edge == "left" ? "left" : "right"
+        let changedSide = hasConfiguredEdge && self.edge != selectedEdge && !restorePosition
+        self.edge = selectedEdge
+        hasConfiguredEdge = true
         // Backup restoration changes defaults before broadcasting settings.
         verticalRatio = EdgeHandleGeometry.clamp(defaults.object(forKey: Self.ratioDefaultsKey) as? Double ?? 0.5)
+        horizontalRatio = (defaults.object(forKey: Self.horizontalRatioDefaultsKey) as? Double).map(EdgeHandleGeometry.clamp)
         displayIdentifier = defaults.string(forKey: Self.displayDefaultsKey)
+        if changedSide {
+            horizontalRatio = selectedEdge == "left" ? 0 : 1
+            persist()
+        }
         reposition()
+    }
+
+    /// Available while the strip window is hidden or disabled, without moving it.
+    func anchor(on screen: NSScreen) -> NSRect? {
+        let identifier = EdgeHandleScreen.identifier(of: screen)
+        if let displayIdentifier {
+            guard identifier == displayIdentifier else { return nil }
+        } else {
+            guard let fallback = EdgeHandleScreen.resolve(nil),
+                  EdgeHandleScreen.identifier(of: fallback) == identifier else { return nil }
+        }
+        return EdgeHandleGeometry.frame(in: screen.visibleFrame, edge: edge,
+                                         verticalRatio: verticalRatio, horizontalRatio: horizontalRatio)
+    }
+
+    func commitPanelPosition(_ frame: NSRect, on screen: NSScreen, edge: String) {
+        let anchor = FloatingPanelGeometry.anchor(for: frame, in: screen.visibleFrame, edge: edge)
+        self.edge = dockedEdge(for: anchor, in: screen.visibleFrame) ?? (edge == "left" ? "left" : "right")
+        verticalRatio = EdgeHandleGeometry.ratio(for: anchor, in: screen.visibleFrame)
+        horizontalRatio = EdgeHandleGeometry.horizontalRatio(for: anchor, in: screen.visibleFrame)
+        displayIdentifier = EdgeHandleScreen.identifier(of: screen)
+        placedScreen = screen
+        persist()
+        reposition()
+        onEdgeChanged?(self.edge)
     }
 
     func setExpanded(_ expanded: Bool) {
@@ -161,7 +153,18 @@ enum EdgeHandleScreen {
     func reset() {
         window.cancelInteraction()
         verticalRatio = 0.5
-        displayIdentifier = (NSScreen.main ?? NSScreen.screens.first).flatMap { EdgeHandleScreen.identifier(of: $0) }
+        horizontalRatio = edge == "left" ? 0 : 1
+        displayIdentifier = (EdgeHandleScreen.containing(NSEvent.mouseLocation) ?? NSScreen.main ?? NSScreen.screens.first)
+            .flatMap { EdgeHandleScreen.identifier(of: $0) }
+        persist()
+        hoverSince = nil
+        suppressHoverUntil = Date().addingTimeInterval(0.8)
+        reposition()
+    }
+
+    func dock() {
+        window.cancelInteraction()
+        horizontalRatio = edge == "left" ? 0 : 1
         persist()
         hoverSince = nil
         suppressHoverUntil = Date().addingTimeInterval(0.8)
@@ -205,17 +208,21 @@ enum EdgeHandleScreen {
             displayIdentifier = EdgeHandleScreen.identifier(of: screen)
             persist()
         }
-        stripView.edge = edge
-        window.setFrame(EdgeHandleGeometry.frame(in: screen.visibleFrame, edge: edge, verticalRatio: verticalRatio), display: true)
+        let frame = EdgeHandleGeometry.frame(in: screen.visibleFrame, edge: edge,
+                                             verticalRatio: verticalRatio, horizontalRatio: horizontalRatio)
+        stripView.edge = dockedEdge(for: frame, in: screen.visibleFrame) ?? "floating"
+        window.setFrame(frame, display: true)
         window.orderFrontRegardless()
     }
 
     private func drag(to pointer: NSPoint, offset: NSSize) {
         guard let screen = EdgeHandleScreen.containing(pointer) ?? placedScreen ?? NSScreen.main else { return }
         placedScreen = screen
-        edge = EdgeHandleGeometry.nearestEdge(to: pointer, in: screen.visibleFrame)
-        stripView.edge = edge
-        window.setFrame(EdgeHandleGeometry.draggingFrame(pointer: pointer, grabOffset: offset, in: screen.visibleFrame), display: true)
+        let frame = EdgeHandleGeometry.draggingFrame(pointer: pointer, grabOffset: offset, in: screen.visibleFrame)
+        edge = dockedEdge(for: frame, in: screen.visibleFrame)
+            ?? EdgeHandleGeometry.nearestEdge(to: CGPoint(x: frame.midX, y: frame.midY), in: screen.visibleFrame)
+        stripView.edge = dockedEdge(for: frame, in: screen.visibleFrame) ?? "floating"
+        window.setFrame(frame, display: true)
     }
 
     private func release(dragged: Bool) {
@@ -223,6 +230,7 @@ enum EdgeHandleScreen {
         hoverSince = nil
         if dragged, let screen = placedScreen {
             verticalRatio = EdgeHandleGeometry.ratio(for: window.frame, in: screen.visibleFrame)
+            horizontalRatio = EdgeHandleGeometry.horizontalRatio(for: window.frame, in: screen.visibleFrame)
             displayIdentifier = EdgeHandleScreen.identifier(of: screen)
             persist()
             // Reopen only after the pointer leaves and re-enters, not on mouse-up.
@@ -238,12 +246,20 @@ enum EdgeHandleScreen {
     private func open(manual: Bool) {
         guard enabled, !expanded, !suspended, !window.isPressed,
               let screen = placedScreen ?? EdgeHandleScreen.resolve(displayIdentifier) else { return }
-        onOpen?(screen, window.frame.midY, manual)
+        onOpen?(screen, window.frame, manual)
     }
 
     private func persist() {
         defaults.set(verticalRatio, forKey: Self.ratioDefaultsKey)
+        if let horizontalRatio { defaults.set(horizontalRatio, forKey: Self.horizontalRatioDefaultsKey) }
+        else { defaults.removeObject(forKey: Self.horizontalRatioDefaultsKey) }
         defaults.set(displayIdentifier, forKey: Self.displayDefaultsKey)
+    }
+
+    private func dockedEdge(for frame: CGRect, in visible: CGRect) -> String? {
+        if abs(frame.minX - visible.minX) <= 0.5 { return "left" }
+        if abs(frame.maxX - visible.maxX) <= 0.5 { return "right" }
+        return nil
     }
 }
 
@@ -300,7 +316,7 @@ private final class EdgeHandleView: NSView {
         setAccessibilityElement(true)
         setAccessibilityRole(.button)
         setAccessibilityLabel("搞机灵唤起条")
-        setAccessibilityHelp("悬停或点击打开；按住拖动调整位置，松手吸附左右边缘。")
+        setAccessibilityHelp("悬停或点击展开；按住可自由移动，仅靠近左右边缘时吸附。")
     }
     required init?(coder: NSCoder) { nil }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -312,14 +328,14 @@ private final class EdgeHandleView: NSView {
         super.draw(dirtyRect)
         let width = hovered || dragging ? 7.0 : EdgeHandleGeometry.visualWidth
         let height = min(EdgeHandleGeometry.visualHeight, bounds.height - 8)
-        let x = edge == "left" ? 1 : bounds.width - width - 1
+        let x = edge == "left" ? 1 : edge == "right" ? bounds.width - width - 1 : (bounds.width - width) / 2
         let capsule = NSBezierPath(roundedRect: NSRect(x: x, y: (bounds.height - height) / 2, width: width, height: height),
                                   xRadius: width / 2, yRadius: width / 2)
         NSGraphicsContext.saveGraphicsState()
         let shadow = NSShadow()
         shadow.shadowColor = NSColor.black.withAlphaComponent(0.20)
         shadow.shadowBlurRadius = 3
-        shadow.shadowOffset = NSSize(width: edge == "left" ? 1 : -1, height: 0)
+        shadow.shadowOffset = NSSize(width: edge == "left" ? 1 : edge == "right" ? -1 : 0, height: 0)
         shadow.set()
         let alpha: CGFloat = hovered || dragging ? 1 : 0.84
         let top = NSColor(calibratedRed: 0.33, green: 0.65, blue: 0.58, alpha: alpha)

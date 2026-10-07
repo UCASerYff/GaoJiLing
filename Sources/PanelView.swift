@@ -5,12 +5,18 @@ struct PanelView: View {
     @ObservedObject var store: MonitorStore
     var openDashboard: () -> Void
     var contentHeightChanged: (CGFloat) -> Void
+    var panelDragBegan: (NSPoint) -> Void
+    var panelDragged: (NSPoint) -> Void
+    var panelDragEnded: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     cpuHero
+                        .overlay(PanelDragArea(began: panelDragBegan, moved: panelDragged, ended: panelDragEnded)
+                            .accessibilityHidden(true))
+                        .help("按住 CPU 展示区域可移动面板，靠近左右侧边自动吸附。")
                     compactMemory
                     HStack(spacing: 12) {
                         networkMetric("下载", icon: "arrow.down", rate: store.latest.networkDown,
@@ -182,6 +188,30 @@ struct PanelView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .ignore).accessibilityLabel(label).accessibilityValue(value ?? unavailableText)
     }
+}
+
+/// Desktop coordinates keep the gesture stable while its window moves.
+/// Only the CPU display captures dragging; buttons and other scroll content
+/// retain their normal mouse handling.
+private struct PanelDragArea: NSViewRepresentable {
+    var began: (NSPoint) -> Void
+    var moved: (NSPoint) -> Void
+    var ended: () -> Void
+    func makeNSView(context: Context) -> PanelDragView { PanelDragView() }
+    func updateNSView(_ view: PanelDragView, context: Context) {
+        view.began = began; view.moved = moved; view.ended = ended
+    }
+}
+
+private final class PanelDragView: NSView {
+    var began: ((NSPoint) -> Void)?
+    var moved: ((NSPoint) -> Void)?
+    var ended: (() -> Void)?
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
+    override func mouseDown(with event: NSEvent) { began?(NSEvent.mouseLocation) }
+    override func mouseDragged(with event: NSEvent) { moved?(NSEvent.mouseLocation) }
+    override func mouseUp(with event: NSEvent) { ended?() }
 }
 
 private struct PanelHeightPreference: PreferenceKey {

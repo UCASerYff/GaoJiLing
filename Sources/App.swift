@@ -75,7 +75,7 @@ final class MonitorPanel: NSPanel {
         let overlay = MonitorPanel(contentRect: NSRect(x: 0, y: 0, width: 398, height: 720), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         overlay.dismiss = { [weak self] in self?.hidePanel() }
         panel = overlay
-        panel.title = "搞机灵 · 边缘面板"
+        panel.title = "系统监控面板"
         panel.delegate = self
         panel.isFloatingPanel = true
         panel.level = .floating

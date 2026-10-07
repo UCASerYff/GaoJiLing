@@ -1,4 +1,4 @@
-# 搞机灵 V1.04
+# 搞机灵 V1.05
 
 <img src="Assets/AppIcon.png" width="96" alt="搞机灵：黑底白字的机灵图标">
 
@@ -6,7 +6,7 @@
 
 搞机灵是一款原生 macOS 边缘系统监控工具，使用 SwiftUI、AppKit、Mach/IOKit/libproc 和 SQLite。监控记录保存在本机，无第三方运行时，无 AI 和账号。
 
-[下载最新版](https://github.com/UCASerYff/GaoJiLing/releases/latest) · [V1.04 发布页](https://github.com/UCASerYff/GaoJiLing/releases/tag/v1.04) · [使用说明](使用说明.txt) · [验证范围](VALIDATION.md)
+[下载最新版](https://github.com/UCASerYff/GaoJiLing/releases/latest) · [V1.05 发布页](https://github.com/UCASerYff/GaoJiLing/releases/tag/v1.05) · [使用说明](使用说明.txt) · [验证范围](VALIDATION.md)
 
 ## 安装
 
@@ -18,7 +18,7 @@
 
 ## 功能
 
-- **边缘面板**：可见细线支持点击、悬停呼出和拖动位置，可沿边及跨屏吸附，位置自动保存；支持菜单栏、全局快捷键和面板固定。
+- **边缘面板**：可见细线支持点击、悬停呼出和拖动位置，可沿边及跨屏吸附，位置自动保存；悬浮面板隐藏软件名称、标题和版本，保留实时监控、固定与收起，支持菜单栏和全局快捷键。
 - **实时监控**：CPU、内存压力、压缩内存、Swap、网络与磁盘吞吐、应用排行，以及按机型可读取的传感器。
 - **历史回看**：查看最近 24 小时趋势，定位异常事件前后的记录；较长的采样空档留白。
 - **任务记录**：手动记录编译、渲染等工作的时长、平均与峰值指标，并导出结果。
@@ -48,7 +48,7 @@ CPU 与应用 CPU 统一采用全机 0–100% 口径，与活动监视器的单�
     ./Scripts/test.sh
     ./Scripts/build.sh
 
-构建输出为 Release/GaoJiLing-1.04.dmg 及对应的 .sha256 文件。构建使用专属临时目录，并在退出时清理。
+构建输出为 Release/GaoJiLing-1.05.dmg 及对应的 .sha256 文件。构建使用专属临时目录，并在退出时清理。
 
 如需使用项目安装脚本：
 
@@ -60,11 +60,11 @@ CPU 与应用 CPU 统一采用全机 0–100% 口径，与活动监视器的单�
 
     python3 Scripts/bump-version.py
 
-每次准确增加 0.01；同一未交付版本的修复和重新构建不递增版本。DMG 不提交到 Git 历史。
+每次正式更新准确增加 0.01；同一未交付版本的修复和重新构建不递增版本。正式发布均需核对更新前后的历史、任务与设置保留情况，安装替换并验证新版启动，再清理本项目旧应用、旧安装包及中间构建产物，不删除用户数据。源码同步 GitHub，DMG 与 SHA-256 校验文件发布到对应版本的 GitHub Release；DMG 不提交到 Git 历史。
 
-## V1.04
+## V1.05
 
-应用图标更新为黑底白字、竖排“机灵”，整理公开源码及发布文档。监控、回看、任务和独立设置延续 V1.03 行为。本版实际验证状态见 [VALIDATION.md](VALIDATION.md)。
+悬浮面板不再显示软件名称、标题和版本，直接呈现监控信息；固定、收起与监控功能保留。主窗口和独立设置继续显示应用名称与版本，保留黑底白字图标。本版实际验证状态见 [VALIDATION.md](VALIDATION.md)。
 
 ## 致谢与第三方许可
 

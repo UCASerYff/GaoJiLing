@@ -11,14 +11,6 @@ struct PanelView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
-                Image(nsImage: NSApplication.shared.applicationIconImage)
-                    .resizable().frame(width: 27, height: 27).accessibilityHidden(true)
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text("搞机灵").font(.system(size: 14, weight: .semibold))
-                    Text("V\(GLPalette.version)")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                }.lineLimit(1).accessibilityElement(children: .combine)
                 Spacer(minLength: 4)
                 Button(action: togglePin) {
                     Image(systemName: isPinned ? "pin.fill" : "pin")
@@ -33,7 +25,7 @@ struct PanelView: View {
                         .frame(width: 30, height: 30).contentShape(Rectangle())
                 }.help("收起面板（Esc）").accessibilityLabel("收起边缘面板")
             }
-            .buttonStyle(.plain).font(.system(size: 12)).padding(.horizontal, 22).padding(.top, 16).padding(.bottom, 13)
+            .buttonStyle(.plain).font(.system(size: 12)).padding(.horizontal, 22).padding(.top, 10).padding(.bottom, 6)
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     cpuHero

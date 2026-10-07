@@ -9,7 +9,7 @@ extension Notification.Name {
 enum EdgeHandleGeometry {
     static let hitSize = NSSize(width: 20, height: 104)
     static let visualWidth: CGFloat = 6
-    static let visualHeight: CGFloat = 88
+    static let visualHeight: CGFloat = 96
     static let verticalInset: CGFloat = 12
     static let snapDistance: CGFloat = 28
     static let dragThreshold: CGFloat = 4
@@ -136,9 +136,11 @@ enum EdgeHandleScreen {
     }
 
     func setExpanded(_ expanded: Bool) {
+        let wasExpanded = self.expanded
         self.expanded = expanded
         hoverSince = nil
         stripView.hovered = false
+        if wasExpanded && !expanded { requiresPointerExit = true }
         if expanded { window.orderOut(nil) } else { reposition() }
     }
 

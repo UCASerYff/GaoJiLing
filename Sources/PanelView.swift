@@ -4,28 +4,10 @@ import AppKit
 struct PanelView: View {
     @ObservedObject var store: MonitorStore
     var openDashboard: () -> Void
-    var close: () -> Void
-    var togglePin: () -> Void
-    var isPinned: Bool
+    var contentHeightChanged: (CGFloat) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Spacer(minLength: 4)
-                Button(action: togglePin) {
-                    Image(systemName: isPinned ? "pin.fill" : "pin")
-                        .foregroundStyle(isPinned ? GLPalette.accent : .secondary)
-                        .frame(width: 30, height: 30).contentShape(Rectangle())
-                }
-                .help(isPinned ? "取消固定，移开鼠标后自动收起" : "固定面板，移开鼠标后保持显示")
-                .accessibilityLabel(isPinned ? "取消固定面板" : "固定面板")
-                .accessibilityValue(isPinned ? "已固定" : "未固定")
-                Button(action: close) {
-                    Image(systemName: "xmark").foregroundStyle(.secondary)
-                        .frame(width: 30, height: 30).contentShape(Rectangle())
-                }.help("收起面板（Esc）").accessibilityLabel("收起边缘面板")
-            }
-            .buttonStyle(.plain).font(.system(size: 12)).padding(.horizontal, 22).padding(.top, 10).padding(.bottom, 6)
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     cpuHero
@@ -76,7 +58,10 @@ struct PanelView: View {
                             }
                         }.font(.system(size: 11)).foregroundStyle(GLPalette.accent).padding(10).background(GLPalette.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
                     }
-                }.padding(.horizontal, 22).padding(.bottom, 12)
+                }.padding(.horizontal, 22).padding(.top, 20).padding(.bottom, 12)
+                    .background(GeometryReader { geometry in
+                        Color.clear.preference(key: PanelHeightPreference.self, value: ["content": geometry.size.height])
+                    })
             }
             Divider().opacity(0.5)
             HStack {
@@ -98,11 +83,18 @@ struct PanelView: View {
                         .font(.system(size: 11, weight: .medium)).padding(.horizontal, 6).frame(minHeight: 30).contentShape(Rectangle())
                 }.buttonStyle(.plain).foregroundStyle(GLPalette.accent).accessibilityLabel("打开搞机灵主窗口")
             }.padding(.horizontal, 22).padding(.vertical, 9)
+                .background(GeometryReader { geometry in
+                    Color.clear.preference(key: PanelHeightPreference.self, value: ["footer": geometry.size.height])
+                })
         }
         .frame(maxWidth: .infinity)
         .frame(maxHeight: .infinity)
         .background(GLPalette.canvas)
         .tint(GLPalette.accent)
+        .onPreferenceChange(PanelHeightPreference.self) { heights in
+            guard let content = heights["content"], let footer = heights["footer"] else { return }
+            contentHeightChanged(ceil(content + footer + 1))
+        }
     }
 
     private var cpuHero: some View {
@@ -189,5 +181,12 @@ struct PanelView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .ignore).accessibilityLabel(label).accessibilityValue(value ?? unavailableText)
+    }
+}
+
+private struct PanelHeightPreference: PreferenceKey {
+    static let defaultValue: [String: CGFloat] = [:]
+    static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }

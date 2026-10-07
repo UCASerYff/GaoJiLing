@@ -23,6 +23,8 @@ final class MonitorPanel: NSPanel {
     var dismiss: (() -> Void)?
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+    override func performMiniaturize(_ sender: Any?) { dismiss?() }
+    override func miniaturize(_ sender: Any?) { dismiss?() }
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { dismiss?() } else { super.keyDown(with: event) }
     }
@@ -38,11 +40,8 @@ final class MonitorPanel: NSPanel {
     private var edgeHandle: EdgeHandleController?
     private var edgeTimer: Timer?
     private var subscriptions = Set<AnyCancellable>()
-    private var panelOpened = Date.distantPast
-    private var leftPanelAt: Date?
-    private var pinned = false
-    private var manualPanel = false
-    private var enteredPanel = false
+    private var panelAutoCollapse = PanelAutoCollapse()
+    private var panelContentHeight: CGFloat = 620
     private var suppressEdgeUntil = Date.distantPast
     private var hotkey: EventHotKeyRef?
     private var hotkeyHandler: EventHandlerRef?
@@ -72,7 +71,7 @@ final class MonitorPanel: NSPanel {
         window.setFrameAutosaveName("GaoJiLing.MainWindow")
         if !window.setFrameUsingName("GaoJiLing.MainWindow") { window.center() }
 
-        let overlay = MonitorPanel(contentRect: NSRect(x: 0, y: 0, width: 398, height: 720), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let overlay = MonitorPanel(contentRect: NSRect(x: 0, y: 0, width: 398, height: panelContentHeight), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         overlay.dismiss = { [weak self] in self?.hidePanel() }
         panel = overlay
         panel.title = "系统监控面板"
@@ -196,7 +195,8 @@ final class MonitorPanel: NSPanel {
         return false
     }
     func windowDidResignKey(_ notification: Notification) {
-        if let sender = notification.object as? NSWindow, sender === panel, manualPanel && !pinned { hidePanel() }
+        if let sender = notification.object as? NSWindow, sender === panel,
+           NSEvent.pressedMouseButtons == 0, edgeHandle?.isInteracting != true { hidePanel() }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -216,7 +216,7 @@ final class MonitorPanel: NSPanel {
         NSApp.appearance = store.settings.appearance == "dark" ? NSAppearance(named: .darkAqua) : store.settings.appearance == "light" ? NSAppearance(named: .aqua) : nil
         updateStatus(store.latest); registerShortcut()
         edgeHandle?.update(enabled: store.settings.edgeEnabled, edge: store.settings.edge)
-        if !store.settings.edgeEnabled && !pinned { hidePanel() }
+        if !store.settings.edgeEnabled { hidePanel() }
     }
     private func updateStatus(_ sample: MetricsSample) {
         guard let button = statusItem?.button else { return }
@@ -253,37 +253,48 @@ final class MonitorPanel: NSPanel {
     @objc func togglePanel() { panel.isVisible ? hidePanel() : showPanel(on: currentScreen(), manual: true) }
     private func currentScreen() -> NSScreen { NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main ?? NSScreen.screens[0] }
     private func updatePanelView() {
-        panel.contentView = NSHostingView(rootView: PanelView(store: store, openDashboard: { [weak self] in self?.showDashboard() }, close: { [weak self] in self?.hidePanel() }, togglePin: { [weak self] in self?.togglePin() }, isPinned: pinned))
+        panel.contentView = NSHostingView(rootView: PanelView(store: store,
+            openDashboard: { [weak self] in self?.showDashboard() },
+            contentHeightChanged: { [weak self] height in self?.resizePanel(to: height) }))
         panel.contentView?.wantsLayer = true
         panel.contentView?.layer?.cornerRadius = 20
         panel.contentView?.layer?.masksToBounds = true
     }
-    private func togglePin() { pinned.toggle(); updatePanelView() }
+    private func resizePanel(to contentHeight: CGFloat) {
+        guard contentHeight.isFinite, contentHeight > 0 else { return }
+        let height = max(320, ceil(contentHeight))
+        guard abs(height - panelContentHeight) >= 1 else { return }
+        panelContentHeight = height
+        guard panel.isVisible, let screen = panel.screen else { return }
+        let visible = screen.visibleFrame
+        var frame = panel.frame
+        frame.size.height = min(height, max(visible.height - 24, 1))
+        frame.origin.y = max(visible.minY + 12, min(panel.frame.maxY - frame.height, visible.maxY - frame.height - 12))
+        panel.setFrame(frame, display: true)
+    }
     private func showPanel(on screen: NSScreen, manual: Bool = false, anchorY: CGFloat? = nil) {
-        let f = screen.visibleFrame; let height = min(720, f.height - 24); let width = min(398, f.width - 32)
+        let f = screen.visibleFrame; let height = min(panelContentHeight, f.height - 24); let width = min(398, f.width - 32)
         let x = store.settings.edge == "left" ? f.minX + 12 : f.maxX - width - 12
         let desiredY = anchorY.map { $0 - height * 0.5 } ?? (NSEvent.mouseLocation.y - height * 0.65)
         let y = max(f.minY + 12, min(desiredY, f.maxY - height - 12))
         panel.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
-        panelOpened = Date(); leftPanelAt = nil; panel.alphaValue = 0
-        manualPanel = manual; enteredPanel = false
+        panelAutoCollapse.opened(at: ProcessInfo.processInfo.systemUptime)
+        panel.alphaValue = 0
         edgeHandle?.setExpanded(true)
         panel.orderFrontRegardless()
         if manual { panel.makeKeyAndOrderFront(nil) }
         NSAnimationContext.runAnimationGroup { context in context.duration = 0.16; panel.animator().alphaValue = 1 }
     }
-    private func hidePanel() { guard panel != nil else { return }; manualPanel = false; panel.orderOut(nil); pinned = false; leftPanelAt = nil; suppressEdgeUntil = Date().addingTimeInterval(0.8); updatePanelView(); edgeHandle?.setExpanded(false) }
+    private func hidePanel() { guard panel != nil else { return }; panelAutoCollapse.closed(); panel.orderOut(nil); suppressEdgeUntil = Date().addingTimeInterval(0.8); edgeHandle?.setExpanded(false) }
     @objc private func checkEdge() {
         guard !NSScreen.screens.isEmpty else { return }
         edgeHandle?.checkPointer(delay: store.settings.edgeDelay, canOpen: !panel.isVisible && Date() > suppressEdgeUntil)
         guard edgeHandle?.isInteracting != true else { return }
         let point = NSEvent.mouseLocation
         if panel.isVisible {
-            if panel.frame.insetBy(dx: -24, dy: -16).contains(point) { enteredPanel = true; leftPanelAt = nil; return }
-            if pinned || (manualPanel && !enteredPanel && NSEvent.pressedMouseButtons == 0) { return }
-            if Date().timeIntervalSince(panelOpened) < 1.8 { return }
-            if leftPanelAt == nil { leftPanelAt = Date() }
-            if Date().timeIntervalSince(leftPanelAt!) > 0.45 { hidePanel() }
+            if panelAutoCollapse.shouldCollapse(at: ProcessInfo.processInfo.systemUptime,
+                                                pointerInside: panel.frame.insetBy(dx: -24, dy: -16).contains(point),
+                                                mousePressed: NSEvent.pressedMouseButtons != 0) { hidePanel() }
             return
         }
         // Only the visible strip is a hover target. The remaining screen edge

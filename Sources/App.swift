@@ -30,6 +30,27 @@ final class MonitorPanel: NSPanel {
     }
 }
 
+final class MonitorPanelContentView: NSHostingView<PanelView> {
+    var pointerChanged: ((NSPoint) -> Void)?
+    private var pointerArea: NSTrackingArea?
+    override func updateTrackingAreas() {
+        if let pointerArea { removeTrackingArea(pointerArea) }
+        super.updateTrackingAreas()
+        let area = NSTrackingArea(rect: .zero,
+                                  options: [.inVisibleRect, .mouseEnteredAndExited, .mouseMoved, .activeAlways],
+                                  owner: self, userInfo: nil)
+        pointerArea = area
+        addTrackingArea(area)
+    }
+    private func trackPointer(_ event: NSEvent) {
+        guard let window else { return }
+        pointerChanged?(window.convertPoint(toScreen: event.locationInWindow))
+    }
+    override func mouseEntered(with event: NSEvent) { trackPointer(event) }
+    override func mouseExited(with event: NSEvent) { trackPointer(event) }
+    override func mouseMoved(with event: NSEvent) { trackPointer(event) }
+}
+
 @MainActor final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var store: MonitorStore!
     private var window: NSWindow!
@@ -42,6 +63,10 @@ final class MonitorPanel: NSPanel {
     private var subscriptions = Set<AnyCancellable>()
     private var panelAutoCollapse = PanelAutoCollapse()
     private var panelContentHeight: CGFloat = 620
+    private var openingStripFrame: NSRect?
+    private var localMouseMonitor: Any?
+    private var globalMouseMonitor: Any?
+    private var statusClickAlreadyCollapsed = false
     private var suppressEdgeUntil = Date.distantPast
     private var hotkey: EventHotKeyRef?
     private var hotkeyHandler: EventHandlerRef?
@@ -83,6 +108,7 @@ final class MonitorPanel: NSPanel {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.hidesOnDeactivate = false
+        panel.acceptsMouseMovedEvents = true
         panel.isReleasedWhenClosed = false
         updatePanelView()
         configureEdgeHandle()
@@ -92,6 +118,7 @@ final class MonitorPanel: NSPanel {
         statusItem.button?.imagePosition = .imageLeading
         statusItem.button?.target = self; statusItem.button?.action = #selector(statusTapped)
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        configurePanelMouseMonitoring()
         store.$latest.sink { [weak self] sample in self?.updateStatus(sample) }.store(in: &subscriptions)
         store.$isPaused.sink { [weak self] _ in DispatchQueue.main.async { self?.updateStatus(self?.store.latest ?? .empty) } }.store(in: &subscriptions)
         store.$dataBusy.sink { [weak self] busy in
@@ -110,7 +137,8 @@ final class MonitorPanel: NSPanel {
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
-        edgeTimer = Timer.scheduledTimer(timeInterval: 0.12, target: self, selector: #selector(checkEdge), userInfo: nil, repeats: true)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(activeApplicationChanged(_:)), name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        edgeTimer = Timer.scheduledTimer(timeInterval: 0.05, target: self, selector: #selector(checkEdge), userInfo: nil, repeats: true)
         if let edgeTimer { RunLoop.main.add(edgeTimer, forMode: .common) }
         settingsChanged()
         showDashboard()
@@ -195,8 +223,17 @@ final class MonitorPanel: NSPanel {
         return false
     }
     func windowDidResignKey(_ notification: Notification) {
-        if let sender = notification.object as? NSWindow, sender === panel,
-           NSEvent.pressedMouseButtons == 0, edgeHandle?.isInteracting != true { hidePanel() }
+        if let sender = notification.object as? NSWindow, sender === panel { dismissPanelAfterFocusLoss() }
+    }
+    func applicationDidResignActive(_ notification: Notification) { dismissPanelAfterFocusLoss() }
+    @objc private func activeApplicationChanged(_ notification: Notification) {
+        guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              application.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+        dismissPanelAfterFocusLoss()
+    }
+    private func dismissPanelAfterFocusLoss() {
+        guard panel?.isVisible == true, edgeHandle?.isInteracting != true else { return }
+        if panelAutoCollapse.shouldCollapseOnFocusLoss(pressedMouseButtons: UInt(bitPattern: NSEvent.pressedMouseButtons)) { hidePanel() }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -207,7 +244,14 @@ final class MonitorPanel: NSPanel {
         return .terminateNow
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showDashboard(); return true }
-    func applicationWillTerminate(_ notification: Notification) { edgeTimer?.invalidate(); edgeHandle?.suspend(); store?.shutdown(); if let hotkey { UnregisterEventHotKey(hotkey) }; if let hotkeyHandler { RemoveEventHandler(hotkeyHandler) } }
+    func applicationWillTerminate(_ notification: Notification) {
+        edgeTimer?.invalidate()
+        if let localMouseMonitor { NSEvent.removeMonitor(localMouseMonitor) }
+        if let globalMouseMonitor { NSEvent.removeMonitor(globalMouseMonitor) }
+        edgeHandle?.suspend(); store?.shutdown()
+        if let hotkey { UnregisterEventHotKey(hotkey) }
+        if let hotkeyHandler { RemoveEventHandler(hotkeyHandler) }
+    }
     @objc private func willSleep() { store.prepareForSleep(); hidePanel(); edgeHandle?.suspend() }
     @objc private func didWake() { edgeHandle?.resume() }
     @objc private func screensChanged() { hidePanel(); edgeHandle?.screensChanged() }
@@ -224,6 +268,8 @@ final class MonitorPanel: NSPanel {
         button.toolTip = "搞机灵 · CPU \(Format.percent(sample.cpuPercent)) · 内存 \(Format.bytes(sample.memoryUsed))\n单击打开面板，右键更多选项"
     }
     @objc private func statusTapped() {
+        let alreadyCollapsed = statusClickAlreadyCollapsed
+        statusClickAlreadyCollapsed = false
         if NSApp.currentEvent?.type == .rightMouseUp {
             let menu = NSMenu()
             for (title, action) in [("打开搞机灵", #selector(showDashboard)), ("显示 / 收起面板", #selector(togglePanel)), (store.isPaused ? "继续监控" : "暂停监控", #selector(pause))] { let item = NSMenuItem(title: title, action: action, keyEquivalent: ""); item.target = self; menu.addItem(item) }
@@ -233,7 +279,39 @@ final class MonitorPanel: NSPanel {
             }
             menu.addItem(.separator()); menu.addItem(withTitle: "退出搞机灵", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
             statusItem.menu = menu; statusItem.button?.performClick(nil); statusItem.menu = nil
-        } else { togglePanel() }
+        } else if !alreadyCollapsed { togglePanel() }
+    }
+    private func configurePanelMouseMonitoring() {
+        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown,
+                                          .leftMouseUp, .rightMouseUp, .otherMouseUp]
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            self?.handlePanelMouseEvent(event, local: true)
+            return event // Other windows and controls still receive their click.
+        }
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
+            self?.handlePanelMouseEvent(event, local: false)
+        }
+    }
+    private func handlePanelMouseEvent(_ event: NSEvent, local: Bool) {
+        switch event.type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            statusClickAlreadyCollapsed = false
+            guard panel.isVisible else { return }
+            let point = event.window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
+            let inside = local && event.window === panel && PanelHitRegion.contains(point, in: panel.frame)
+            if panelAutoCollapse.mouseDown(button: event.buttonNumber, insidePanel: inside) {
+                if local, let button = statusItem.button, let buttonWindow = button.window,
+                   event.window === buttonWindow {
+                    let buttonFrame = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+                    statusClickAlreadyCollapsed = buttonFrame.contains(point)
+                }
+                hidePanel()
+            }
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            panelAutoCollapse.mouseUp(button: event.buttonNumber)
+            checkPanelPointer()
+        default: break
+        }
     }
     @objc private func pause() { store.togglePause() }
     private func configureEdgeHandle() {
@@ -253,9 +331,21 @@ final class MonitorPanel: NSPanel {
     @objc func togglePanel() { panel.isVisible ? hidePanel() : showPanel(on: currentScreen(), manual: true) }
     private func currentScreen() -> NSScreen { NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main ?? NSScreen.screens[0] }
     private func updatePanelView() {
-        panel.contentView = NSHostingView(rootView: PanelView(store: store,
+        let content = MonitorPanelContentView(rootView: PanelView(store: store,
             openDashboard: { [weak self] in self?.showDashboard() },
             contentHeightChanged: { [weak self] height in self?.resizePanel(to: height) }))
+        content.pointerChanged = { [weak self] point in
+            guard let self, self.panel.isVisible else { return }
+            // Keep the original event position: a quick pass through the panel
+            // must count as an entry even if the current pointer has moved on.
+            if PanelHitRegion.contains(point, in: self.panel.frame) {
+                _ = self.panelAutoCollapse.shouldCollapse(at: ProcessInfo.processInfo.systemUptime,
+                                                          pointerInside: true,
+                                                          pressedMouseButtons: UInt(bitPattern: NSEvent.pressedMouseButtons))
+            }
+            self.checkPanelPointer()
+        }
+        panel.contentView = content
         panel.contentView?.wantsLayer = true
         panel.contentView?.layer?.cornerRadius = 20
         panel.contentView?.layer?.masksToBounds = true
@@ -279,26 +369,31 @@ final class MonitorPanel: NSPanel {
         let y = max(f.minY + 12, min(desiredY, f.maxY - height - 12))
         panel.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
         panelAutoCollapse.opened(at: ProcessInfo.processInfo.systemUptime)
+        openingStripFrame = anchorY == nil ? nil : edgeHandle?.frame
+        _ = panelAutoCollapse.shouldCollapse(at: ProcessInfo.processInfo.systemUptime,
+                                             pointerInside: PanelHitRegion.contains(NSEvent.mouseLocation, in: panel.frame))
         panel.alphaValue = 0
         edgeHandle?.setExpanded(true)
         panel.orderFrontRegardless()
         if manual { panel.makeKeyAndOrderFront(nil) }
         NSAnimationContext.runAnimationGroup { context in context.duration = 0.16; panel.animator().alphaValue = 1 }
     }
-    private func hidePanel() { guard panel != nil else { return }; panelAutoCollapse.closed(); panel.orderOut(nil); suppressEdgeUntil = Date().addingTimeInterval(0.8); edgeHandle?.setExpanded(false) }
+    private func hidePanel() { guard panel != nil else { return }; panelAutoCollapse.closed(); openingStripFrame = nil; panel.orderOut(nil); suppressEdgeUntil = Date().addingTimeInterval(0.8); edgeHandle?.setExpanded(false) }
     @objc private func checkEdge() {
         guard !NSScreen.screens.isEmpty else { return }
         edgeHandle?.checkPointer(delay: store.settings.edgeDelay, canOpen: !panel.isVisible && Date() > suppressEdgeUntil)
-        guard edgeHandle?.isInteracting != true else { return }
-        let point = NSEvent.mouseLocation
-        if panel.isVisible {
-            if panelAutoCollapse.shouldCollapse(at: ProcessInfo.processInfo.systemUptime,
-                                                pointerInside: panel.frame.insetBy(dx: -24, dy: -16).contains(point),
-                                                mousePressed: NSEvent.pressedMouseButtons != 0) { hidePanel() }
-            return
-        }
+        checkPanelPointer()
         // Only the visible strip is a hover target. The remaining screen edge
         // stays available to scrollbars, neighbouring displays and other apps.
+    }
+    private func checkPanelPointer() {
+        guard panel?.isVisible == true else { return }
+        guard edgeHandle?.isInteracting != true else { return }
+        let point = NSEvent.mouseLocation
+        if panelAutoCollapse.shouldCollapse(at: ProcessInfo.processInfo.systemUptime,
+                                            pointerInside: PanelHitRegion.contains(point, in: panel.frame),
+                                            pointerInOpeningBridge: openingStripFrame.map { PanelHitRegion.openingBridge(panel: panel.frame, strip: $0).contains(point) } ?? false,
+                                            pressedMouseButtons: UInt(bitPattern: NSEvent.pressedMouseButtons)) { hidePanel() }
     }
     private func registerShortcut() {
         panelMenuItem?.keyEquivalent = store.settings.hotkeyChoice == "m" ? "m" : "g"

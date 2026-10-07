@@ -91,6 +91,7 @@ enum EdgeHandleScreen {
     private var placedScreen: NSScreen?
 
     var isInteracting: Bool { window.isPressed }
+    var frame: NSRect { window.frame }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults

@@ -83,7 +83,7 @@ struct GLSettingsView: View {
                     Text("左侧").tag("left")
                     Text("右侧").tag("right")
                 }
-                LabeledContent("悬停时间") {
+                LabeledContent("唤起悬停时间") {
                     HStack(spacing: 10) {
                         Slider(value: setting(\.edgeDelay), in: 0.2...1.5, step: 0.05)
                             .frame(width: 145)
@@ -304,7 +304,7 @@ struct GLAboutView: View {
                 }
             }
             Section("使用提示") {
-                tip("唤起与收起", "点击或悬停屏幕边缘的竖线展开面板；鼠标移开且结束操作后自动收回竖线，Esc 也可收起。按住竖线可拖动位置。")
+                tip("唤起与收起", "点击或悬停竖线展开面板；鼠标进入后移出会快速收回，点击面板外或按 Esc 也可收起。只有面板内开始的拖动会暂缓收回。唤起悬停时间只控制展开等待，按住竖线可拖动位置。")
                 tip("键盘操作", "\(store.settings.hotkeyChoice == "m" ? "⌥⌘M" : "⌥⌘G") 呼出面板 · ⌘, 打开设置 · ⇧⌘E 打开数据。")
                 tip("数据口径", "CPU 使用全机 0–100% 口径。传感器因机型而异；无法获取时显示不可用。完全退出程序后不再采样，关闭窗口仍会继续监控。")
                 tip("暂停采样", "暂停后保留最后一次读数；进行中的任务仍继续计时，需在任务页面点击结束记录。")

@@ -31,4 +31,16 @@ int gjl_process_snapshot(GJLProcess **out, int *total_count);
 void gjl_free_processes(GJLProcess *processes);
 void gjl_sensor_snapshot(GJLSensors *out);
 int gjl_sysctl_string(const char *name, char *out, size_t capacity);
+
+/* Independent, fresh snapshot for maintenance; does not alter monitor sampling. */
+typedef struct {
+    uint64_t total, used, free_bytes, file_cache, purgeable, compressed, swap;
+    int memory_valid, swap_valid, pressure_level;
+} GJLMemoryMaintenance;
+int gjl_memory_maintenance_snapshot(GJLMemoryMaintenance *out);
+uint64_t gjl_memory_maintenance_relief(void);
+/* 1: running, 0: absent, -1: cannot safely establish absence. */
+int gjl_application_running(const char *bundle_path, int check_developer_tools);
+/* Conservative global check for package managers and compilers, no argv read. */
+int gjl_development_tools_running(void);
 #endif

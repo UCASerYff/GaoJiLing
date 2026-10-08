@@ -5,6 +5,21 @@ TEST_TEMP="$(mktemp -d /private/tmp/gaojiling-tests.XXXXXX)"
 trap 'rm -rf "$TEST_TEMP"' EXIT
 export CLANG_MODULE_CACHE_PATH="$TEST_TEMP/module-cache"
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
+PYTHONDONTWRITEBYTECODE=1 python3 "$PROJECT_DIR/Tests/BackupTests.py"
+swiftc -swift-version 5 -sdk "$SDK" -module-cache-path "$TEST_TEMP/module-cache" \
+  "$PROJECT_DIR/Sources/CleanupEngine.swift" "$PROJECT_DIR/Tests/CleanupEngineTests.swift" \
+  -o "$TEST_TEMP/CleanupEngineTests"
+"$TEST_TEMP/CleanupEngineTests"
+swiftc -swift-version 5 -sdk "$SDK" -module-cache-path "$TEST_TEMP/module-cache" \
+  "$PROJECT_DIR/Sources/StorageAnalysis.swift" "$PROJECT_DIR/Tests/StorageAnalysisTests.swift" \
+  -framework AppKit -o "$TEST_TEMP/StorageAnalysisTests"
+"$TEST_TEMP/StorageAnalysisTests"
+swiftc -swift-version 5 -sdk "$SDK" -module-cache-path "$TEST_TEMP/module-cache" \
+  "$PROJECT_DIR/Sources/StorageAnalysis.swift" "$PROJECT_DIR/Sources/StorageAnalysisController.swift" \
+  "$PROJECT_DIR/Sources/Models.swift" "$PROJECT_DIR/Sources/DataExport.swift" \
+  "$PROJECT_DIR/Tests/StorageAnalysisControllerTests.swift" \
+  -framework AppKit -o "$TEST_TEMP/StorageAnalysisControllerTests"
+"$TEST_TEMP/StorageAnalysisControllerTests"
 swiftc -swift-version 5 -sdk "$SDK" -module-cache-path "$TEST_TEMP/module-cache" \
   "$PROJECT_DIR/Sources/FloatingGeometry.swift" "$PROJECT_DIR/Tests/FloatingGeometryTests.swift" \
   -o "$TEST_TEMP/FloatingGeometryTests"
@@ -40,6 +55,12 @@ fi
 print 'PASS: invalid version is rejected without modifying the file'
 xcrun clang -O2 -Wall -Wextra -isysroot "$SDK" \
   -c "$PROJECT_DIR/Sources/NativeMetrics.c" -o "$TEST_TEMP/NativeMetrics.o"
+swiftc -O -swift-version 5 -sdk "$SDK" -module-cache-path "$TEST_TEMP/module-cache" \
+  -import-objc-header "$PROJECT_DIR/Sources/NativeMetrics.h" \
+  "$PROJECT_DIR/Sources/MemoryMaintenance.swift" "$PROJECT_DIR/Tests/MemoryMaintenanceTests.swift" \
+  "$TEST_TEMP/NativeMetrics.o" -framework IOKit -framework CoreFoundation \
+  -o "$TEST_TEMP/MemoryMaintenanceTests"
+"$TEST_TEMP/MemoryMaintenanceTests"
 swiftc -O -swift-version 5 -sdk "$SDK" -module-cache-path "$TEST_TEMP/module-cache" \
   -import-objc-header "$PROJECT_DIR/Sources/NativeMetrics.h" \
   "$PROJECT_DIR/Sources/Models.swift" "$PROJECT_DIR/Sources/MetricsCollector.swift" \

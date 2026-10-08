@@ -37,7 +37,7 @@ enum GLPalette {
 }
 
 enum GLPage: String, CaseIterable, Identifiable {
-    case overview = "概览", apps = "应用", history = "回看", sessions = "任务", network = "网络"
+    case overview = "概览", apps = "应用", history = "回看", sessions = "任务", network = "网络", cleanup = "清理", storage = "存储"
     var id: String { rawValue }
     var icon: String {
         switch self {
@@ -46,6 +46,8 @@ enum GLPage: String, CaseIterable, Identifiable {
         case .history: return "clock.arrow.circlepath"
         case .sessions: return "record.circle"
         case .network: return "network"
+        case .cleanup: return "sparkles"
+        case .storage: return "internaldrive"
         }
     }
     var subtitle: String {
@@ -55,12 +57,16 @@ enum GLPage: String, CaseIterable, Identifiable {
         case .history: return "沿着时间，回看每一次状态变化。"
         case .sessions: return "为编译、渲染和每一项专注的工作留一份记录。"
         case .network: return "按需检查连接，了解网络在哪里遇到问题。"
+        case .cleanup: return "先查看，再清理；按需回收内存。"
+        case .storage: return "查看开发环境和所选目录的占用。"
         }
     }
 }
 
 struct DashboardView: View {
     @ObservedObject var store: MonitorStore
+    @ObservedObject var cleanup: CleanupController
+    @ObservedObject var analysis: StorageAnalysisController
     var openSettings: () -> Void
     @State private var page: GLPage = .overview
     @State private var search = ""
@@ -101,6 +107,8 @@ struct DashboardView: View {
                         case .history: history
                         case .sessions: sessions
                         case .network: network
+                        case .cleanup: CleanupView(cleanup: cleanup, dataBusy: store.dataBusy || analysis.isBusy)
+                        case .storage: StorageAnalysisView(analysis: analysis, dataBusy: store.dataBusy || cleanup.isBusy)
                         }
                     }
                     .disabled(store.dataBusy)

@@ -21,6 +21,11 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <malloc/malloc.h>
+#include <errno.h>
+#include <signal.h>
+#include <unistd.h>
+#include <limits.h>
 
 int gjl_sysctl_string(const char *name, char *out, size_t capacity) {
     if (!capacity) return 0;
@@ -319,3 +324,125 @@ void gjl_sensor_snapshot(GJLSensors *out) {
         IOObjectRelease(smc);
     }
 }
+
+int gjl_memory_maintenance_snapshot(GJLMemoryMaintenance *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    size_t size = sizeof(out->total);
+    if (sysctlbyname("hw.memsize", &out->total, &size, NULL, 0) != 0 ||
+        size != sizeof(out->total) || out->total == 0) return 0;
+
+    mach_port_t host = mach_host_self();
+    vm_statistics64_data_t vm = {0};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_size_t page_size = 0;
+    kern_return_t stats_result = host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vm, &count);
+    kern_return_t page_result = host_page_size(host, &page_size);
+    mach_port_deallocate(mach_task_self(), host);
+    if (stats_result != KERN_SUCCESS || page_result != KERN_SUCCESS ||
+        count < HOST_VM_INFO64_REV1_COUNT || page_size == 0) return 0;
+
+    uint64_t page_bytes = page_size;
+    uint64_t anonymous = vm.internal_page_count > vm.purgeable_count ? vm.internal_page_count - vm.purgeable_count : 0;
+    out->used = (anonymous + vm.wire_count + vm.compressor_page_count) * page_bytes;
+    if (out->used > out->total) out->used = out->total;
+    // XNU already includes speculative pages in free_count; never add them twice.
+    out->free_bytes = (uint64_t)vm.free_count * page_bytes;
+    // File-backed pages are an observation, not a promise of reclaimable bytes.
+    out->file_cache = (uint64_t)vm.external_page_count * page_bytes;
+    out->purgeable = (uint64_t)vm.purgeable_count * page_bytes;
+    out->compressed = (uint64_t)vm.compressor_page_count * page_bytes;
+    out->memory_valid = 1;
+
+    struct xsw_usage swap = {0};
+    size = sizeof(swap);
+    if (sysctlbyname("vm.swapusage", &swap, &size, NULL, 0) == 0 && size == sizeof(swap)) {
+        out->swap = swap.xsu_used;
+        out->swap_valid = 1;
+    }
+    size = sizeof(out->pressure_level);
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level", &out->pressure_level, &size, NULL, 0) != 0 ||
+        size != sizeof(out->pressure_level)) out->pressure_level = 0;
+    return out->memory_valid && out->swap_valid;
+}
+
+uint64_t gjl_memory_maintenance_relief(void) {
+    // Public libmalloc API: returns unused allocations from this process only.
+    // It never allocates a pressure buffer and cannot release another app's heap.
+    return (uint64_t)malloc_zone_pressure_relief(NULL, 0);
+}
+
+static int gjl_process_is_gone(pid_t pid) {
+    return kill(pid, 0) != 0 && errno == ESRCH;
+}
+
+static int gjl_build_tool_path(const char *path) {
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    const char *tools[] = { "xcodebuild", "XCBBuildService", "SWBBuildService", "swift-build",
+        "swift-package", "swift", "swiftc", "swift-driver", "swift-frontend", "clang", "clang++",
+        "ld", "ld64", "metal", "metallib", "actool", "ibtool", "make", "gmake", "ninja", "cmake" };
+    for (size_t i = 0; i < sizeof(tools) / sizeof(tools[0]); i++)
+        if (strcmp(name, tools[i]) == 0) return 1;
+    return 0;
+}
+
+static int gjl_package_tool_path(const char *path) {
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    const char *tools[] = { "node", "npm", "npx", "pnpm", "yarn", "bun", "pip", "pip3", "pipx",
+        "poetry", "uv", "ruby", "brew", "java", "gradle", "gradlew", "mvn", "mvnw" };
+    if (gjl_build_tool_path(path)) return 1;
+    for (size_t i = 0; i < sizeof(tools) / sizeof(tools[0]); i++)
+        if (strcmp(name, tools[i]) == 0) return 1;
+    if (strncmp(name, "python", 6) == 0 && (name[6] == '\0' || (name[6] >= '0' && name[6] <= '9'))) return 1;
+    if (strncmp(name, "pip", 3) == 0 && name[3] >= '0' && name[3] <= '9') return 1;
+    return 0;
+}
+
+int gjl_application_running(const char *bundle_path, int check_developer_tools) {
+    char bundle[PATH_MAX] = {0};
+    size_t prefix_length = 0;
+    if (check_developer_tools != 2) {
+        if (!bundle_path || bundle_path[0] != '/' || !realpath(bundle_path, bundle)) return -1;
+        prefix_length = strlen(bundle);
+        while (prefix_length > 1 && bundle[prefix_length - 1] == '/') bundle[--prefix_length] = '\0';
+        if (prefix_length <= 1) return -1;
+    }
+
+    int required = proc_listpids(PROC_UID_ONLY, geteuid(), NULL, 0);
+    if (required <= 0 || required > INT_MAX - 64 * (int)sizeof(pid_t)) return -1;
+    int capacity = required + 64 * (int)sizeof(pid_t);
+    pid_t *pids = calloc(1, (size_t)capacity);
+    if (!pids) return -1;
+    int length = proc_listpids(PROC_UID_ONLY, geteuid(), pids, capacity);
+    if (length <= 0 || length >= capacity || length % sizeof(pid_t) != 0) { free(pids); return -1; }
+    int uncertain = 0;
+    for (int i = 0; i < length / (int)sizeof(pid_t); i++) {
+        pid_t pid = pids[i];
+        if (pid <= 0) continue;
+        struct proc_bsdinfo info = {0};
+        if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info)) {
+            if (!gjl_process_is_gone(pid)) uncertain = 1;
+            continue;
+        }
+        // PID reuse can move a process outside the user-only enumeration.
+        if (info.pbi_uid != geteuid()) continue;
+        char executable[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath(pid, executable, sizeof(executable)) <= 0) {
+            if (!gjl_process_is_gone(pid)) uncertain = 1;
+            continue;
+        }
+        if ((prefix_length > 0 && strncmp(executable, bundle, prefix_length) == 0 &&
+             (executable[prefix_length] == '/' || executable[prefix_length] == '\0')) ||
+            (check_developer_tools == 1 && gjl_build_tool_path(executable)) ||
+            (check_developer_tools == 2 && gjl_package_tool_path(executable))) {
+            free(pids);
+            return 1;
+        }
+    }
+    free(pids);
+    return uncertain ? -1 : 0;
+}
+
+int gjl_development_tools_running(void) { return gjl_application_running(NULL, 2); }

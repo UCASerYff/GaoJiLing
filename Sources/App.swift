@@ -53,6 +53,8 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
 
 @MainActor final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var store: MonitorStore!
+    private var cleanup: CleanupController!
+    private var analysis: StorageAnalysisController!
     private var window: NSWindow!
     private var settingsWindow: NSWindow?
     private let settingsNavigation = GLSettingsNavigation()
@@ -85,6 +87,8 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         }
         NSApp.setActivationPolicy(.regular)
         store = MonitorStore()
+        cleanup = CleanupController(dataDirectory: store.dataDirectory)
+        analysis = StorageAnalysisController(dataDirectory: store.dataDirectory)
         signal(SIGTERM, SIG_IGN)
         terminationSignal = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         terminationSignal?.setEventHandler { NSApp.terminate(nil) }
@@ -97,7 +101,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         window.minSize = NSSize(width: 960, height: 690)
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.contentView = NSHostingView(rootView: DashboardView(store: store, openSettings: { [weak self] in self?.showSettings() }))
+        window.contentView = NSHostingView(rootView: DashboardView(store: store, cleanup: cleanup, analysis: analysis, openSettings: { [weak self] in self?.showSettings() }))
         window.setFrameAutosaveName("GaoJiLing.MainWindow")
         if !window.setFrameUsingName("GaoJiLing.MainWindow") { window.center() }
 
@@ -131,12 +135,28 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
             // @Published emits before the stored value changes. Reply on the next
             // main-loop turn, after the data operation's cleanup has completed.
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.pendingTermination, !self.store.dataBusy else { return }
+                guard let self, self.pendingTermination, !self.store.dataBusy, !self.cleanup.isBusy, !self.analysis.isBusy else { return }
+                self.pendingTermination = false
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+        }.store(in: &subscriptions)
+        cleanup.$isBusy.sink { [weak self] busy in
+            guard !busy else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.pendingTermination, !self.store.dataBusy, !self.cleanup.isBusy, !self.analysis.isBusy else { return }
                 self.pendingTermination = false
                 NSApp.reply(toApplicationShouldTerminate: true)
             }
         }.store(in: &subscriptions)
         NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged(_:)), name: .monitorSettingsChanged, object: nil)
+        analysis.$isBusy.sink { [weak self] busy in
+            guard !busy else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.pendingTermination, !self.store.dataBusy, !self.cleanup.isBusy, !self.analysis.isBusy else { return }
+                self.pendingTermination = false
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+        }.store(in: &subscriptions)
         NotificationCenter.default.addObserver(self, selector: #selector(settingsNavigationRequested(_:)), name: .monitorNavigate, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(resetEdgeHandle), name: .monitorResetEdgeHandle, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(dockEdgeHandle), name: .monitorDockEdgeHandle, object: nil)
@@ -243,8 +263,10 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if store?.dataBusy == true {
+        if store?.dataBusy == true || cleanup?.isBusy == true || analysis?.isBusy == true {
             pendingTermination = true
+            cleanup?.cancel()
+            analysis?.cancel()
             return .terminateLater
         }
         return .terminateNow

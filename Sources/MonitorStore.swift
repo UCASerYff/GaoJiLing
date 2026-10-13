@@ -32,6 +32,11 @@ extension Notification.Name {
     private let collector = MetricsCollector()
     private let queue = DispatchQueue(label: "com.gaoseries.GaoJiLing.sampling", qos: .utility)
     private var timer: Timer?
+    private let samplingEnabled: Bool
+    private var metricsVisible = true
+    private var panelVisible = false
+    private var maintenanceRulesEnabled = false
+    private var scheduledInterval: TimeInterval?
     private var sampling = false
     private var lastPersisted = Date.distantPast
     private var lastPruned = Date.distantPast
@@ -41,6 +46,7 @@ extension Notification.Name {
     private let edgePreferenceKeys = ["GaoJiLing.EdgeHandle.verticalRatio", "GaoJiLing.EdgeHandle.displayUUID", "GaoJiLing.EdgeHandle.horizontalRatio"]
 
     init(startSampling: Bool = true, directory: URL? = nil) {
+        samplingEnabled = startSampling
         dataDirectory = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("GaoSeries/GaoJiLing", isDirectory: true)
         do {
             let db = try MonitorDatabase(directory: dataDirectory)
@@ -63,14 +69,22 @@ extension Notification.Name {
         refreshDataSummary()
     }
     private func restartTimer() {
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: settings.sampleInterval, repeats: true) { [weak self] _ in
+        timer?.invalidate(); timer = nil
+        guard samplingEnabled, !isPaused else { scheduledInterval = nil; return }
+        let interval = SamplingDemand.interval(preferred: settings.sampleInterval, visibleMetrics: metricsVisible, panelVisible: panelVisible, recording: activeSession != nil, historyRequired: database != nil, maintenanceRulesEnabled: maintenanceRulesEnabled)
+        scheduledInterval = interval
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.sampleNow() }
         }
         if let timer { RunLoop.main.add(timer, forMode: .common) }
     }
+    func setPresentation(metricsVisible: Bool, panelVisible: Bool, maintenanceRulesEnabled: Bool) {
+        self.metricsVisible = metricsVisible; self.panelVisible = panelVisible; self.maintenanceRulesEnabled = maintenanceRulesEnabled
+        let interval = SamplingDemand.interval(preferred: settings.sampleInterval, visibleMetrics: metricsVisible, panelVisible: panelVisible, recording: activeSession != nil, historyRequired: database != nil, maintenanceRulesEnabled: maintenanceRulesEnabled)
+        if scheduledInterval != interval && !isPaused { restartTimer() }
+    }
     private func sampleNow() {
-        guard !isPaused, !sampling else { return }
+        guard samplingEnabled, !isPaused, !sampling else { return }
         sampling = true
         let collector = self.collector
         let generation = dataGeneration
@@ -129,7 +143,7 @@ extension Notification.Name {
         restartTimer()
         NotificationCenter.default.post(name: .monitorSettingsChanged, object: nil)
     }
-    func togglePause() { guard !dataBusy else { return }; isPaused.toggle(); detector.reset(); if !isPaused { sampleNow() } }
+    func togglePause() { guard !dataBusy else { return }; isPaused.toggle(); detector.reset(); restartTimer(); if !isPaused { sampleNow() } }
     func startSession(name: String) {
         guard activeSession == nil, !dataBusy else { return }
         guard database != nil else { statusMessage = "数据存储不可用，无法开始持久保存的任务记录。请检查数据目录后重新打开应用。"; return }
@@ -362,7 +376,10 @@ extension MonitorStore {
                 } else { statusMessage = "恢复未完成：\(error.localizedDescription)。原数据未改变。" }
             }
             dataBusy = false
-            if let samplingWasPaused, self.database != nil { isPaused = samplingWasPaused; if !isPaused { sampleNow() } }
+            if let samplingWasPaused, self.database != nil {
+                isPaused = samplingWasPaused; restartTimer()
+                if !isPaused { sampleNow() }
+            }
             refreshDataSummary()
         }
     }

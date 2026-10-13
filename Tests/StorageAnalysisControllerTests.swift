@@ -25,7 +25,12 @@ import Darwin
     }
 
     @MainActor private static func scan(_ controller: StorageAnalysisController, directory: URL) async throws {
+        let previousID = controller.operationID
         controller.analyzeDirectory(directory)
+        let operationID = controller.operationID
+        try require(operationID != nil && operationID != previousID, "each started scan has a unique correlation token")
+        controller.analyzeDirectory(directory)
+        try require(controller.operationID == operationID, "busy rejection cannot replace the active token")
         try require(controller.isBusy, "analysis enters busy state synchronously")
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
         while controller.isBusy, ContinuousClock.now < deadline {
@@ -35,6 +40,7 @@ import Darwin
             controller.cancel()
             throw TestFailure(description: "synthetic analysis did not finish within 10 seconds")
         }
+        try require(controller.lastCompletedOperationID == operationID && controller.completion == .completed, "completion belongs to the original operation")
         try require(controller.result?.complete == true, "synthetic analysis returns a complete result")
         try require(controller.result?.root == directory.path, "analysis stays within the selected synthetic directory")
         try require(controller.result?.largestFiles.count == 1, "synthetic file appears in the result")
@@ -90,6 +96,9 @@ import Darwin
         let changedController = StorageAnalysisController(dataDirectory: changedDirectory)
         try require(changedController.history.count == 1 && changedController.exclusions.count == 1,
                     "valid original state loaded before external modification")
+        let migratedBytes = try Data(contentsOf: changedURL)
+        try require(migratedBytes == originalBytes && fm.fileExists(atPath: changedDirectory.appendingPathComponent("Storage.initialized").path),
+                    "legacy valid state receives a sibling initialization marker without rewriting its data")
         let externalBytes = Data("external modification after controller initialization".utf8)
         try externalBytes.write(to: changedURL, options: .atomic)
         try await scan(changedController, directory: scannedDirectory)
@@ -123,6 +132,77 @@ import Darwin
         try require(lstat(newURL.path, &savedInfo) == 0 && savedInfo.st_mode & 0o777 == 0o600,
                     "new state has private file permissions")
         print("PASS: new state persists, updates and reloads with private permissions")
+        var completionSnapshots: [(UUID, StorageAnalysisResult?, StorageScanCompletion)] = []
+        var completionOwnsBusySlot = true
+        reloaded.onScanCompleted = { id, result, outcome in
+            completionSnapshots.append((id, result, outcome))
+            completionOwnsBusySlot = completionOwnsBusySlot && reloaded.isBusy && reloaded.operationID == id
+            reloaded.analyzeDirectory(scannedDirectory)
+            completionOwnsBusySlot = completionOwnsBusySlot && reloaded.operationID == id
+        }
+        reloaded.analyzeDirectory(scannedDirectory)
+        let cancelledID = reloaded.operationID
+        reloaded.cancel()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while reloaded.isBusy, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        try require(!reloaded.isBusy && reloaded.lastCompletedOperationID == cancelledID && reloaded.completion == .cancelled,
+                    "immediate cancellation retains matching operation identity")
+        try require(reloaded.result?.cancelled == true && reloaded.result?.complete == false,
+                    "cancelled result cannot be misreported as ordinary partial or complete")
+        try require(reloaded.history.last?.complete == false, "cancelled result excluded from complete trend")
+        let completedID = reloaded.lastCompletedOperationID
+        try await scan(reloaded, directory: scannedDirectory)
+        try require(reloaded.lastCompletedOperationID != completedID, "next scan cannot be associated with previous cancellation")
+        print("PASS: operation identity, busy rejection, cancellation status and later scan separation")
+        // Missing previously initialized data must not be treated as a first run.
+        let marker = newDirectory.appendingPathComponent("Storage.initialized")
+        try require(fm.fileExists(atPath: marker.path), "successful persistence records initialization")
+        let retainedState = try Data(contentsOf: newURL)
+        try fm.removeItem(at: newURL)
+        let missingController = StorageAnalysisController(dataDirectory: newDirectory)
+        try require(!missingController.canSavePreferences && missingController.persistenceWarning != nil, "missing initialized history is protected")
+        try await scan(missingController, directory: scannedDirectory)
+        try require(!fm.fileExists(atPath: newURL.path), "missing initialized history cannot be replaced with fresh history")
+        try put(retainedState, at: newURL)
+        try fm.removeItem(at: newURL.deletingLastPathComponent())
+        let missingFolderController = StorageAnalysisController(dataDirectory: newDirectory)
+        try require(!missingFolderController.canSavePreferences, "removed entire Storage folder is not a new profile")
+        try await scan(missingFolderController, directory: scannedDirectory)
+        try require(!fm.fileExists(atPath: newURL.deletingLastPathComponent().path), "no fresh Storage folder recreates lost history")
+        try put(retainedState, at: newURL)
+
+        for (name, bytes) in [
+            ("future", Data("{\"version\":2,\"exclusions\":[],\"history\":[]}".utf8)),
+            ("oversized", Data(repeating: 0x20, count: 2 * 1024 * 1024 + 1)),
+            ("bad-exclusion", Data("{\"version\":1,\"exclusions\":[\"/private/tmp/../elsewhere\"],\"history\":[]}".utf8))
+        ] {
+            let directory = base.appendingPathComponent(name)
+            let url = stateURL(directory)
+            try put(bytes, at: url)
+            let controller = StorageAnalysisController(dataDirectory: directory)
+            try require(!controller.canSavePreferences, "future, unbounded or invalid path state disables writes")
+            try await scan(controller, directory: scannedDirectory)
+            let protectedAfter = try Data(contentsOf: url)
+            try require(protectedAfter == bytes, "protected bytes remain unchanged after usable scan")
+            try require(controller.persistenceWarning != nil, "persistence warning stays visible after successful analysis")
+        }
+        let failedIDBefore = reloaded.operationID
+        reloaded.analyzeDirectory(base.appendingPathComponent("not-present"))
+        let failureDeadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while reloaded.isBusy, ContinuousClock.now < failureDeadline { try await Task.sleep(for: .milliseconds(20)) }
+        try require(!reloaded.isBusy && reloaded.completion == .failed && reloaded.result == nil && reloaded.operationID != failedIDBefore,
+                    "invalid scope fails with a separate operation identity and no stale result")
+        try require(completionOwnsBusySlot && completionSnapshots.count == 3,
+                    "each completion is delivered exactly once before another scan can start")
+        try require(completionSnapshots.map { $0.2 } == [.cancelled, .completed, .failed],
+                    "callbacks retain each operation outcome instead of reading later mutable state")
+        try require(completionSnapshots[0].0 == cancelledID && completionSnapshots[0].1?.cancelled == true &&
+                    completionSnapshots[1].1?.complete == true && completionSnapshots[2].1 == nil &&
+                    completionSnapshots[2].0 == reloaded.lastCompletedOperationID,
+                    "callback results and nil failure retain the correct operation identity")
+        reloaded.onScanCompleted = nil
+        print("PASS: immutable completion snapshots, failure/cancel identity and busy-slot ownership")
+        print("PASS: missing initialized data, future/oversized state, unsafe exclusions and failed operation correlation")
     }
 
     @MainActor static func main() async {

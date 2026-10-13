@@ -95,3 +95,7 @@ tokens*.json
 *.provisionprofile
 *.keychain
 *.keychain-db
+
+# Private acceptance evidence and local handoff packages
+/TestResults/
+*.gaoaction/

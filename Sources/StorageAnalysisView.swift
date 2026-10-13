@@ -32,6 +32,11 @@ struct StorageAnalysisView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
+            if let warning = analysis.persistenceWarning {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 11)).foregroundStyle(GLPalette.amber)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let status = analysis.status, !status.isEmpty {
                 HStack(spacing: 9) {
                     if analysis.isBusy { ProgressView().controlSize(.small) }
@@ -43,7 +48,26 @@ struct StorageAnalysisView: View {
                     .accessibilityElement(children: .combine)
             }
             capacityAndActions
+            if analysis.isBusy, let progress = analysis.progress {
+                GLCard {
+                    Text("已检查 \(progress.visitedEntries) 个条目 · \(progress.fileCount) 个文件 · \(progress.directoryCount) 个目录")
+                        .font(.system(size: 12, weight: .medium)).monospacedDigit()
+                    Text("已确认分配空间 \(Format.bytes(Double(progress.allocatedBytes))) · 跳过 \(progress.skippedCount) 项 · 已用 \(Int(progress.elapsedSeconds)) 秒")
+                        .font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit()
+                    if let path = progress.currentPath {
+                        Text(path).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle).help(path)
+                    }
+                    Text("总条目数在扫描前未知；停止请求需等待当前文件系统操作返回。")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+            }
             if let result = analysis.result {
+                if let session = result.session {
+                    DiskMapView(session: session, blocked: blocked,
+                        reveal: { path in analysis.revealPath(path) },
+                        rescan: { node in analysis.analyzeDirectory(URL(fileURLWithPath: node.path, isDirectory: true), expectedIdentity: node.directoryIdentity) })
+                        .id(session.id)
+                }
                 analysisResults(result)
                 if !result.largestFiles.isEmpty { largestItems }
             } else if !analysis.isBusy {
@@ -280,7 +304,7 @@ struct StorageAnalysisView: View {
                 GLSectionTitle(title: "排除目录")
                 Spacer(minLength: 8)
                 Button { analysis.addExclusion() } label: { Label("添加目录…", systemImage: "plus") }
-                    .buttonStyle(.bordered).disabled(blocked)
+                    .buttonStyle(.bordered).disabled(blocked || !analysis.canSavePreferences)
             }
             Text("跳过所选目录及其子目录，下次分析生效。规则只影响存储分析，清理页仍使用独立的保护范围。")
                 .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -294,7 +318,7 @@ struct StorageAnalysisView: View {
                             .textSelection(.enabled).help(url.path)
                         Spacer(minLength: 5)
                         Button { analysis.removeExclusion(url) } label: { Image(systemName: "xmark").frame(width: 22, height: 22) }
-                            .buttonStyle(.borderless).disabled(blocked).help("移除排除规则")
+                            .buttonStyle(.borderless).disabled(blocked || !analysis.canSavePreferences).help("移除排除规则")
                             .accessibilityLabel("移除排除目录 \(url.lastPathComponent)")
                     }.padding(.vertical, 4)
                 }

@@ -23,6 +23,8 @@ struct CleanupReport {
     let skipped: [CleanupIssue]
     let failed: [CleanupIssue]
     let message: String
+    var batchID: String? = nil
+    var cancelled = false
 }
 
 struct CleanupScanResult {
@@ -354,8 +356,11 @@ final class CleanupEngine: @unchecked Sendable {
                 if prepared { failed.append(issue) } else { skipped.append(issue) }
             }
         }
-        return report(removed, bytes, skipped, failed,
-                      "已将 \(removed.count) 项移入废纸篓；这些文件仍占磁盘空间，可使用恢复。")
+        var result = report(removed, bytes, skipped, failed,
+                            "已将 \(removed.count) 项移入废纸篓；这些文件仍占磁盘空间，可使用恢复。")
+        result.batchID = journal.batches[batchIndex].id
+        result.cancelled = cancelled()
+        return result
     }
 
     func restoreLastCleanup() -> CleanupReport {

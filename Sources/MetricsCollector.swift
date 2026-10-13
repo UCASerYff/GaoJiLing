@@ -5,10 +5,12 @@ final class MetricsCollector: @unchecked Sendable {
     private struct ProcessBaseline {
         var start: UInt64
         var cpu: UInt64
+        var uid: UInt32
     }
     private struct AppIdentity {
         var name: String
         var path: String?
+        var bundleID: String?
     }
     private let sensors = Sensors()
     private var previousCores: [GJLCoreTicks] = []
@@ -21,6 +23,7 @@ final class MetricsCollector: @unchecked Sendable {
     private var lastProcessUptime: TimeInterval?
     private var cachedProcesses: [ProcessMetric] = []
     private var cachedProcessCount = 0
+    private var previousReadings: [String: MetricReading<Double>] = [:]
 
     init() {}
 
@@ -104,6 +107,24 @@ final class MetricsCollector: @unchecked Sendable {
         @unknown default: sample.thermalState = "未知"
         }
         sensors.apply(to: &sample, uptime: uptime, force: !usableInterval)
+        var readings = sample.readings ?? [:]
+        func reading(_ key: String, _ value: Double?, _ unit: String, _ source: String, _ reason: String = "本次读取不可用") {
+            let finite = value.flatMap { $0.isFinite ? $0 : nil }
+            readings[key] = MetricReading(value: finite, unit: unit, timestamp: now, source: source,
+                availabilityReason: finite == nil ? reason : nil).retaining(previousReadings[key])
+        }
+        reading("cpu", sample.cpuPercent, "%", "Mach host_processor_info 差值 / 全机 0–100%", "等待有效 CPU 基线；休眠或读取失败后重新计时")
+        reading("memory", raw.memory_valid != 0 ? sample.memoryUsed : nil, "bytes", "Mach host_statistics64：匿名−可清除+有线+压缩")
+        reading("compressed", raw.memory_valid != 0 ? sample.memoryCompressed : nil, "bytes", "Mach compressor_page_count")
+        reading("swap", raw.swap_valid != 0 ? Double(raw.swap_used) : nil, "bytes", "sysctl vm.swapusage")
+        reading("pressure", [1, 2, 4].contains(raw.pressure_level) ? Double(raw.pressure_level) : nil, "level", "sysctl kern.memorystatus_vm_pressure_level")
+        reading("diskFree", raw.disk_total > 0 ? sample.diskFree : nil, "bytes", "statfs /System/Volumes/Data")
+        reading("diskRead", sample.diskRead, "bytes/s", "IOBlockStorageDriver 计数器差值")
+        reading("diskWrite", sample.diskWrite, "bytes/s", "IOBlockStorageDriver 计数器差值")
+        reading("networkDown", sample.networkDown, "bytes/s", "NET_RT_IFLIST2 物理 en 接口计数差值")
+        reading("networkUp", sample.networkUp, "bytes/s", "NET_RT_IFLIST2 物理 en 接口计数差值")
+        for (key, value) in readings where value.value == nil { readings[key] = value.retaining(previousReadings[key]) }
+        sample.readings = readings; previousReadings = readings
         lastUptime = uptime; lastDate = now
         return sample
     }
@@ -153,7 +174,9 @@ final class MetricsCollector: @unchecked Sendable {
         var total: Int32 = 0
         let count = Int(gjl_process_snapshot(&pointer, &total))
         guard count >= 0, let pointer else {
-            cachedProcesses = []; cachedProcessCount = 0
+            cachedProcesses = cachedProcesses.map { value in
+                var old = value; old.availabilityReason = "进程读取失败；保留旧读数，非实时"; return old
+            }
             previousProcesses.removeAll(keepingCapacity: true); lastProcessUptime = nil
             return
         }
@@ -167,16 +190,22 @@ final class MetricsCollector: @unchecked Sendable {
             let rawName = withUnsafePointer(to: &record.name) { p in p.withMemoryRebound(to: CChar.self, capacity: 256) { String(cString: $0) } }
             let identity = appIdentity(path: path, fallback: rawName)
             var cpu = 0.0
-            if let interval, interval >= 0.05, interval <= 30, let old = previousProcesses[record.pid], old.start == record.start_time, record.cpu_nanoseconds >= old.cpu {
+            var cpuAvailable = false
+            if let interval, interval >= 0.05, interval <= 30, let old = previousProcesses[record.pid], old.start == record.start_time, old.uid == record.uid, record.cpu_nanoseconds >= old.cpu {
                 cpu = min(100, Double(record.cpu_nanoseconds - old.cpu) / 1e9 / interval / Double(cores) * 100)
+                cpuAvailable = true
             }
-            baselines[record.pid] = ProcessBaseline(start: record.start_time, cpu: record.cpu_nanoseconds)
-            // The model's ID is the display name, so aggregate equal names to keep IDs unique.
-            var group = groups[identity.name] ?? ProcessMetric(name: identity.name, cpuPercent: 0, memoryBytes: 0, path: identity.path)
+            baselines[record.pid] = ProcessBaseline(start: record.start_time, cpu: record.cpu_nanoseconds, uid: record.uid)
+            let processIdentity = ProcessIdentity(pid: record.pid, startTime: record.start_time, uid: record.uid)
+            let key = Self.groupKey(path: identity.path, bundleID: identity.bundleID, process: processIdentity)
+            var group = groups[key] ?? ProcessMetric(name: identity.name, cpuPercent: 0, memoryBytes: 0, path: identity.path,
+                groupID: key, bundleID: identity.bundleID, identities: [], observedAt: Date(), cpuAvailable: true)
             group.cpuPercent = min(100, group.cpuPercent + cpu)
             group.memoryBytes += Double(record.memory_bytes)
             group.pids.append(record.pid)
-            groups[identity.name] = group
+            group.identities?.append(processIdentity)
+            group.cpuAvailable = group.cpuAvailable == true && cpuAvailable
+            groups[key] = group
         }
         previousProcesses = baselines
         cachedProcesses = groups.values.sorted { a, b in a.cpuPercent == b.cpuPercent ? a.memoryBytes > b.memoryBytes : a.cpuPercent > b.cpuPercent }
@@ -196,11 +225,17 @@ final class MetricsCollector: @unchecked Sendable {
             let title = (bundle?.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
                 ?? (bundle?.object(forInfoDictionaryKey: "CFBundleName") as? String)
                 ?? URL(fileURLWithPath: appPath).deletingPathExtension().lastPathComponent
-            identity = AppIdentity(name: title, path: appPath)
+            identity = AppIdentity(name: title, path: URL(fileURLWithPath: appPath).resolvingSymlinksInPath().path, bundleID: bundle?.bundleIdentifier)
         } else {
-            identity = AppIdentity(name: fallback.isEmpty ? URL(fileURLWithPath: path).lastPathComponent : fallback, path: path.isEmpty ? nil : path)
+            identity = AppIdentity(name: fallback.isEmpty ? URL(fileURLWithPath: path).lastPathComponent : fallback,
+                path: path.isEmpty ? nil : URL(fileURLWithPath: path).resolvingSymlinksInPath().path, bundleID: nil)
         }
         identities[key] = identity
         return identity
+    }
+
+    static func groupKey(path: String?, bundleID: String?, process: ProcessIdentity) -> String {
+        guard let path, !path.isEmpty else { return "pid:\(process.pid):\(process.startTime):uid:\(process.uid)" }
+        return "uid:\(process.uid)|bundle:\(bundleID ?? "")|path:\(path)"
     }
 }

@@ -37,7 +37,7 @@ enum GLPalette {
 }
 
 enum GLPage: String, CaseIterable, Identifiable {
-    case overview = "概览", apps = "应用", history = "回看", sessions = "任务", network = "网络", cleanup = "清理", storage = "存储"
+    case overview = "概览", apps = "应用", history = "回看", sessions = "任务", network = "网络", cleanup = "清理", storage = "存储", maintenance = "维护", appManagement = "应用管理", exchange = "交接"
     var id: String { rawValue }
     var icon: String {
         switch self {
@@ -48,6 +48,9 @@ enum GLPage: String, CaseIterable, Identifiable {
         case .network: return "network"
         case .cleanup: return "sparkles"
         case .storage: return "internaldrive"
+        case .maintenance: return "battery.75percent"
+        case .appManagement: return "app.badge.checkmark"
+        case .exchange: return "arrow.left.arrow.right"
         }
     }
     var subtitle: String {
@@ -59,16 +62,28 @@ enum GLPage: String, CaseIterable, Identifiable {
         case .network: return "按需检查连接，了解网络在哪里遇到问题。"
         case .cleanup: return "先查看，再清理；按需回收内存。"
         case .storage: return "查看开发环境和所选目录的占用。"
+        case .maintenance: return "核对真实指标、电池状态和正常退出规则。"
+        case .appManagement: return "查看应用关联，复核后再卸载。"
+        case .exchange: return "核对跨应用请求，再决定是否继续。"
         }
     }
 }
+
+@MainActor final class GLDashboardNavigation: ObservableObject { @Published var page: GLPage = .overview }
 
 struct DashboardView: View {
     @ObservedObject var store: MonitorStore
     @ObservedObject var cleanup: CleanupController
     @ObservedObject var analysis: StorageAnalysisController
     var openSettings: () -> Void
-    @State private var page: GLPage = .overview
+    @ObservedObject var manager: AppManagementController
+    @ObservedObject var maintenance: MaintenanceController
+    @ObservedObject var exchange: GAExchangeController
+    @ObservedObject var navigation: GLDashboardNavigation
+    private var page: GLPage {
+        get { navigation.page }
+        nonmutating set { navigation.page = newValue }
+    }
     @State private var search = ""
     @State private var appSort = "cpu"
     @State private var historyMinutes = 60
@@ -101,14 +116,18 @@ struct DashboardView: View {
                 }
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
+                        readingNotice
                         switch page {
                         case .overview: overview
                         case .apps: applications
                         case .history: history
                         case .sessions: sessions
                         case .network: network
-                        case .cleanup: CleanupView(cleanup: cleanup, dataBusy: store.dataBusy || analysis.isBusy)
-                        case .storage: StorageAnalysisView(analysis: analysis, dataBusy: store.dataBusy || cleanup.isBusy)
+                        case .cleanup: CleanupView(cleanup: cleanup, dataBusy: store.dataBusy || analysis.isBusy || manager.isBusy || exchange.isBusy)
+                        case .storage: StorageAnalysisView(analysis: analysis, dataBusy: store.dataBusy || cleanup.isBusy || manager.isBusy || exchange.isBusy)
+                        case .maintenance: MaintenanceView(store: store, maintenance: maintenance).disabled(store.dataBusy || cleanup.isBusy || analysis.isBusy || manager.isBusy || exchange.isBusy)
+                        case .appManagement: AppManagementView(manager: manager, dataBusy: store.dataBusy || cleanup.isBusy || analysis.isBusy || exchange.isBusy)
+                        case .exchange: GAExchangeView(exchange: exchange, dataBusy: store.dataBusy || cleanup.isBusy || analysis.isBusy || manager.isBusy)
                         }
                     }
                     .disabled(store.dataBusy)
@@ -149,7 +168,9 @@ struct DashboardView: View {
             }
             .padding(.horizontal, 18).padding(.top, 26).padding(.bottom, 20)
             Text("工作空间").font(.system(size: 10, weight: .medium)).foregroundStyle(.tertiary).padding(.leading, 24).padding(.bottom, 12)
-            ForEach(GLPage.allCases) { item in
+            ScrollView {
+              VStack(spacing: 0) {
+                ForEach(GLPage.allCases) { item in
                 Button { page = item } label: {
                     HStack(spacing: 13) {
                         Image(systemName: item.icon).font(.system(size: 16)).frame(width: 20)
@@ -166,8 +187,10 @@ struct DashboardView: View {
                 }
                 .buttonStyle(.plain).padding(.horizontal, 12).padding(.bottom, 5)
                 .accessibilityAddTraits(page == item ? .isSelected : [])
+                }
+              }
             }
-            Spacer(minLength: 8)
+            .scrollIndicators(.hidden)
             VStack(alignment: .leading, spacing: 9) {
                 HStack(spacing: 7) {
                     Circle().fill(store.isPaused ? GLPalette.amber : GLPalette.accent).frame(width: 6, height: 6)
@@ -199,7 +222,9 @@ struct DashboardView: View {
                 VStack(alignment: .trailing, spacing: 6) {
                     HStack(spacing: 6) {
                         Circle().fill(store.isPaused ? GLPalette.amber : GLPalette.accent).frame(width: 5, height: 5)
-                        Text(store.isPaused ? "已暂停" : hasLiveSample ? "实时采样" : "准备采样").font(.system(size: 11, weight: .medium))
+                        TimelineView(.periodic(from: .now, by: 5)) { context in
+                            Text(store.isPaused ? "已暂停" : hasLiveSample ? (context.date.timeIntervalSince(store.latest.timestamp) > 15 ? "读数过期" : "实时采样") : "准备采样").font(.system(size: 11, weight: .medium))
+                        }
                     }
                     if hasLiveSample {
                         Text(store.latest.timestamp, style: .time).font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
@@ -226,6 +251,20 @@ struct DashboardView: View {
         .padding(.horizontal, 28).padding(.top, 29).padding(.bottom, 24)
     }
 
+    private func readingBytes(_ key: String, fallback: Double?) -> String {
+        if let readings = store.latest.readings {
+            guard let reading = readings[key], let value = reading.value else { return "不可用" }
+            return Format.bytes(value) + (reading.isFresh() && !store.isPaused ? "" : " · 过期")
+        }
+        return fallback.map(Format.bytes) ?? "—"
+    }
+    private var readingNotice: some View {
+        TimelineView(.periodic(from: Date(), by: 5)) { context in
+            let expired = store.latest.readings?.values.filter { $0.value != nil && !$0.isFresh(at: context.date) }.count ?? 0
+            if store.isPaused { Text("采样已暂停；当前数值为上次读数，趋势不会补造暂停期间的数据。").font(.caption).foregroundStyle(GLPalette.amber) }
+            else if expired > 0 { Text("部分指标已过期或暂不可用；维护页可查看每项来源、时间和原因。").font(.caption).foregroundStyle(GLPalette.amber) }
+        }
+    }
     private var overview: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(spacing: 14) {
@@ -248,8 +287,8 @@ struct DashboardView: View {
                         Spacer()
                         GLPill(text: store.latest.memoryPressure, color: GLPalette.pressure(store.latest.memoryPressure))
                     }.font(.system(size: 12))
-                    GLValueRow(label: "压缩内存", value: hasLiveSample ? Format.bytes(store.latest.memoryCompressed) : "—")
-                    GLValueRow(label: "已用 Swap", value: hasLiveSample ? Format.bytes(store.latest.swapUsed) : "—")
+                    GLValueRow(label: "压缩内存", value: readingBytes("compressed", fallback: hasLiveSample ? store.latest.memoryCompressed : nil))
+                    GLValueRow(label: "已用 Swap", value: readingBytes("swap", fallback: hasLiveSample ? store.latest.swapUsed : nil))
                     Divider().opacity(0.5).padding(.vertical, 2)
                     GLValueRow(label: "启动盘可用", value: store.latest.diskTotal > 0 ? Format.bytes(store.latest.diskFree) : "—")
                     if store.latest.diskTotal > 0 {
@@ -334,16 +373,19 @@ struct DashboardView: View {
                             GLProcessColumns {
                                 HStack(spacing: 10) {
                                     GLAppIcon(path: process.path, size: 28).accessibilityHidden(true)
-                                    Text(process.name).font(.system(size: 12, weight: .medium)).lineLimit(1).help(process.path ?? process.name)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(process.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                                        if let reason = GLProcessPresentation.reason(process) { Text(reason).font(.caption2).foregroundStyle(GLPalette.amber).lineLimit(1) }
+                                    }.help(process.path ?? process.name)
                                     Spacer(minLength: 0)
                                 }.frame(maxWidth: .infinity, alignment: .leading)
-                                Text(String(format: "%.1f%%", process.cpuPercent)).frame(maxWidth: .infinity, alignment: .trailing).foregroundStyle(process.cpuPercent > 30 ? GLPalette.amber : Color.primary)
+                                Text(GLProcessPresentation.cpu(process)).frame(maxWidth: .infinity, alignment: .trailing).foregroundStyle(process.cpuPercent > 30 ? GLPalette.amber : Color.primary)
                                 Text(Format.bytes(process.memoryBytes)).frame(maxWidth: .infinity, alignment: .trailing)
                                 Text("\(process.pids.count)").foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .trailing)
                             }.font(.system(size: 11, design: .monospaced)).frame(maxWidth: .infinity).padding(.vertical, 9)
                                 .accessibilityElement(children: .ignore)
                                 .accessibilityLabel(process.name)
-                                .accessibilityValue("CPU \(String(format: "%.1f%%", process.cpuPercent))，内存 \(Format.bytes(process.memoryBytes))，\(process.pids.count) 个进程")
+                                .accessibilityValue("CPU \(GLProcessPresentation.cpu(process))，内存 \(Format.bytes(process.memoryBytes))，\(process.pids.count) 个进程")
                             Divider().opacity(0.3)
                         }
                     }
@@ -804,7 +846,7 @@ struct GLProcessRow: View {
             Text(process.name).font(.system(size: 11)).lineLimit(1)
             Spacer(minLength: 6)
             VStack(alignment: .trailing, spacing: 3) {
-                Text(String(format: "%.1f%%", process.cpuPercent)).font(.system(size: 11, weight: .medium, design: .monospaced))
+                Text(GLProcessPresentation.cpu(process)).font(.system(size: 11, weight: .medium, design: .monospaced))
                 if showMemory { Text(Format.bytes(process.memoryBytes)).font(.system(size: 9)).foregroundStyle(.tertiary) }
             }
         }.padding(.vertical, 4)
@@ -838,5 +880,19 @@ struct GLSettingsRow<Content: View>: View {
             Spacer()
             content
         }.padding(.vertical, 4)
+    }
+}
+
+/// Historic numeric fields remain decodable; availability determines presentation of live rows.
+enum GLProcessPresentation {
+    static func reason(_ process: ProcessMetric, at now: Date = Date()) -> String? {
+        if let reason = process.availabilityReason { return reason }
+        if let observed = process.observedAt, now.timeIntervalSince(observed) > 15 { return "过期读数" }
+        if process.cpuAvailable == false { return "等待 CPU 基线" }
+        return nil
+    }
+    static func cpu(_ process: ProcessMetric) -> String {
+        guard reason(process) == nil else { return "—" }
+        return String(format: "%.1f%%", process.cpuPercent)
     }
 }

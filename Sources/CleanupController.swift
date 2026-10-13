@@ -23,6 +23,8 @@ private final class CleanupCancellation: @unchecked Sendable {
     @Published private(set) var memoryReport: MemoryReleaseReport?
     @Published private(set) var canRestore = false
     @Published private(set) var history: [CleanupHistoryEntry] = []
+    var beforeTrash: ((UUID) -> Bool)?
+    var onTrashCompleted: ((UUID, CleanupReport) -> Void)?
     private let engine: CleanupEngine
     private var cancellation: CleanupCancellation?
     private var operation: Task<Void, Never>?
@@ -31,6 +33,12 @@ private final class CleanupCancellation: @unchecked Sendable {
     init(dataDirectory: URL) {
         engine = CleanupEngine(journalDirectory: dataDirectory.appendingPathComponent("Cleanup", isDirectory: true),
                                appIsRunning: { Self.runningState(for: $0) })
+        canRestore = engine.canRestore
+        history = engine.history
+    }
+
+    init(engine: CleanupEngine) {
+        self.engine = engine
         canRestore = engine.canRestore
         history = engine.history
     }
@@ -76,6 +84,8 @@ private final class CleanupCancellation: @unchecked Sendable {
 
     func trash(ids: Set<String>) {
         guard !isBusy, !ids.isEmpty else { return }
+        let operationID = UUID()
+        guard beforeTrash?(operationID) != false else { status = "前置交接记录未能保存，未开始移动文件。"; return }
         begin(); isCleaning = true; report = nil
         status = "正在复查并移入废纸篓…"
         let token = cancellation!; let engine = engine
@@ -90,9 +100,12 @@ private final class CleanupCancellation: @unchecked Sendable {
                 let removed = Set(result.removedIDs)
                 self.items.removeAll { removed.contains($0.id) }
                 self.finish()
+                self.onTrashCompleted?(operationID, result)
             } catch {
-                self?.status = "清理未完成：\(error.localizedDescription)。已有恢复记录会保留。"
+                let message = "清理未完成：\(error.localizedDescription)。已有恢复记录会保留。"
+                self?.status = message
                 self?.finish()
+                self?.onTrashCompleted?(operationID, CleanupReport(removedIDs: [], movedBytes: 0, skipped: [], failed: [CleanupIssue(itemID: "operation", message: message)], message: message))
             }
         }
     }

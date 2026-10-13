@@ -14,7 +14,7 @@ clang -O2 -arch arm64 -mmacosx-version-min=14.0 -isysroot "$SDK" -c "$PROJECT_DI
 swiftc -swift-version 5 -O -target arm64-apple-macos14.0 -sdk "$SDK" -module-cache-path "$STAGING/cache" \
   -import-objc-header "$PROJECT_DIR/Sources/NativeMetrics.h" \
   "$PROJECT_DIR"/Sources/*.swift "$STAGING/NativeMetrics.o" \
-  -framework AppKit -framework SwiftUI -framework IOKit -framework CoreFoundation -framework Carbon -framework ServiceManagement -framework UserNotifications -framework Network -lsqlite3 \
+  -framework AppKit -framework SwiftUI -framework IOKit -framework CoreFoundation -framework Carbon -framework ServiceManagement -framework UserNotifications -framework Network -framework ApplicationServices -framework Security -framework UniformTypeIdentifiers -lsqlite3 \
   -o "$APP/Contents/MacOS/GaoJiLing"
 if [[ ! -f "$PROJECT_DIR/Assets/AppIcon.icns" || "$PROJECT_DIR/Assets/AppIcon.png" -nt "$PROJECT_DIR/Assets/AppIcon.icns" ]]; then
   swift -module-cache-path "$STAGING/cache" "$PROJECT_DIR/Scripts/MakeIcon.swift" "$PROJECT_DIR/Assets/AppIcon.png" "$PROJECT_DIR/Assets/AppIcon.icns"
@@ -42,6 +42,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>NSSupportsAutomaticTermination</key><false/>
 </dict></plist>
 PLIST
+PYTHONDONTWRITEBYTECODE=1 python3 "$PROJECT_DIR/Scripts/make-capabilities.py" \
+  --version-file "$PROJECT_DIR/VERSION" --info-plist "$APP/Contents/Info.plist" \
+  --output "$APP/Contents/Resources/GaoCapabilities.json"
+plutil -lint "$APP/Contents/Info.plist"
 xattr -cr "$APP"
 codesign --force --sign - --identifier com.gaoseries.GaoJiLing "$APP"
 codesign --verify --strict "$APP"

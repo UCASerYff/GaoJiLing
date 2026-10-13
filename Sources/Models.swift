@@ -1,12 +1,66 @@
 import Foundation
 
+struct ProcessIdentity: Codable, Hashable, Sendable {
+    var pid: Int32
+    var startTime: UInt64
+    var uid: UInt32
+}
+
+struct MetricReading<Value: Codable & Equatable & Sendable>: Codable, Equatable, Sendable {
+    var value: Value?
+    var unit: String
+    var timestamp: Date
+    var source: String
+    var availabilityReason: String? = nil
+    var isStale = false
+    func isFresh(at date: Date = Date(), maximumAge: TimeInterval = 15) -> Bool {
+        value != nil && !isStale && availabilityReason == nil && date.timeIntervalSince(timestamp) >= -1 && date.timeIntervalSince(timestamp) <= maximumAge
+    }
+    func retaining(_ previous: Self?) -> Self {
+        guard value == nil, var previous, previous.value != nil else { return self }
+        previous.isStale = true
+        previous.availabilityReason = availabilityReason ?? "读取失败；保留上次读数"
+        return previous
+    }
+}
+
+struct BatterySnapshot: Codable, Equatable, Sendable {
+    var timestamp: Date
+    var present: MetricReading<Bool>
+    var percent: MetricReading<Double>
+    var externalPower: MetricReading<Bool>
+    var charging: MetricReading<Bool>
+    var healthPercent: MetricReading<Double>
+    var healthCondition: MetricReading<String>
+    var cycles: MetricReading<Int>
+    var temperature: MetricReading<Double>
+    var minutesToEmpty: MetricReading<Double>
+    var minutesToFull: MetricReading<Double>
+}
+
+struct FanDescriptor: Codable, Equatable, Identifiable, Sendable {
+    var id: String
+    var name: String
+    var speed: MetricReading<Double>
+    var minimumRPM: Double? = nil
+    var maximumRPM: Double? = nil
+    var rangeReason = "未验证此机型的可控转速范围；只读"
+}
+
 struct ProcessMetric: Codable, Identifiable, Equatable {
-    var id: String { name }
+    var id: String { groupID ?? path ?? "legacy:\(name)" }
     var name: String
     var cpuPercent: Double
     var memoryBytes: Double
     var pids: [Int32] = []
     var path: String? = nil
+    // Optional additions keep historic V1.09 samples decodable.
+    var groupID: String? = nil
+    var bundleID: String? = nil
+    var identities: [ProcessIdentity]? = nil
+    var observedAt: Date? = nil
+    var availabilityReason: String? = nil
+    var cpuAvailable: Bool? = nil
 }
 
 struct MetricsSample: Codable, Identifiable {
@@ -38,6 +92,9 @@ struct MetricsSample: Codable, Identifiable {
     var processCount: Int = 0
     var thermalState: String = "正常"
     var processes: [ProcessMetric] = []
+    var readings: [String: MetricReading<Double>]? = nil
+    var batterySnapshot: BatterySnapshot? = nil
+    var fanDescriptors: [FanDescriptor]? = nil
     var memoryPercent: Double { memoryTotal > 0 ? memoryUsed / memoryTotal * 100 : 0 }
     static var empty: MetricsSample { MetricsSample() }
 }

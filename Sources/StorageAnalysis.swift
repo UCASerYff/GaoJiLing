@@ -17,12 +17,14 @@ struct StorageAnalysisResult: Sendable {
     let entries: [StorageEntry]
     let largestFiles: [StorageEntry]
     let notes: [String]
-    let complete: Bool
+    var complete: Bool
     let date: Date
     /// Confirmed allocated blocks, not logical file sizes or promised removable bytes.
     /// When complete is false this is only the portion that could be inspected.
     let totalBytes: Int64
     let root: String?
+    var session: ScanSession? = nil
+    var cancelled: Bool = false
 }
 
 struct DiskCapacity: Sendable {
@@ -48,18 +50,20 @@ final class StorageAnalyzer: @unchecked Sendable {
     private let home: URL
     private let maximumEntries: Int
     private let timeBudget: TimeInterval
+    private let maximumNodes: Int
     private let ownerLookup: @Sendable (String) -> Bool?
-    init(home: URL = FileManager.default.homeDirectoryForCurrentUser, maximumEntries: Int = 250_000, timeBudget: TimeInterval = 20,
+    init(home: URL = FileManager.default.homeDirectoryForCurrentUser, maximumEntries: Int = 250_000, timeBudget: TimeInterval = 20, maximumNodes: Int = 20_000,
          ownerLookup: @escaping @Sendable (String) -> Bool? = { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) != nil }) {
         self.home = home
-        self.maximumEntries = max(0, maximumEntries)
+        self.maximumEntries = min(250_000, max(0, maximumEntries))
+        self.maximumNodes = min(20_000, max(1, maximumNodes))
         self.timeBudget = timeBudget.isFinite ? max(0, timeBudget) : 20
         self.ownerLookup = ownerLookup
     }
 
-    func scanEnvironments(exclusions: [URL] = [], cancelled: @Sendable () -> Bool = { false }) throws -> StorageAnalysisResult {
+    func scanEnvironments(exclusions: [URL] = [], progress: @escaping @Sendable (ScanProgress) -> Void = { _ in }, cancelled: @Sendable () -> Bool = { false }) throws -> StorageAnalysisResult {
         try StorageFilesystem.withMaterializationDisabled {
-            let state = ScanState(maximumEntries: maximumEntries, seconds: timeBudget, exclusions: exclusions)
+            let state = ScanState(maximumEntries: maximumEntries, maximumNodes: maximumNodes, seconds: timeBudget, exclusions: exclusions, progress: progress)
             var entries: [StorageEntry] = []
             for location in environmentLocations {
                 if state.shouldStop(cancelled) { break }
@@ -122,42 +126,37 @@ final class StorageAnalyzer: @unchecked Sendable {
                     }
                 }
             }
-            return state.result(entries: entries.sorted(by: Self.larger), root: nil)
+            return state.result(entries: entries.sorted(by: Self.larger), root: nil, cancelled: cancelled)
         }
     }
 
-    func analyze(directory: URL, exclusions: [URL] = [], cancelled: @Sendable () -> Bool = { false }) throws -> StorageAnalysisResult {
+    func analyze(directory: URL, expectedIdentity: StorageDirectoryIdentity? = nil, exclusions: [URL] = [], progress: @escaping @Sendable (ScanProgress) -> Void = { _ in }, cancelled: @Sendable () -> Bool = { false }) throws -> StorageAnalysisResult {
         try StorageFilesystem.withMaterializationDisabled {
             let url = directory
-            let state = ScanState(maximumEntries: maximumEntries, seconds: timeBudget, exclusions: exclusions)
+            let state = ScanState(maximumEntries: maximumEntries, maximumNodes: maximumNodes, seconds: timeBudget, exclusions: exclusions, progress: progress)
             guard !state.isExcluded(url) else { throw StorageAnalysisFailure("所选目录位于排除范围内，未进行分析。") }
+            if state.shouldStop(cancelled) { return state.result(entries: [], root: url.path, cancelled: cancelled) }
             let descriptor = try StorageFilesystem.openDirectory(url)
             defer { close(descriptor) }
             var info = stat()
             guard fstat(descriptor, &info) == 0 else { throw StorageFilesystem.posix() }
-            var entries: [StorageEntry] = []
-            if state.consume(cancelled) {
-                state.visited.insert(FileIdentity(info))
-                guard let rootBytes = state.allocatedBytes(info) else { throw StorageAnalysisFailure("目录分配大小无效，已停止分析。") }
-                state.totalBytes = rootBytes
-                state.enumerate(descriptor, cancelled: cancelled) { name in
-                    let child = url.appendingPathComponent(name)
-                    let amount = state.walkChild(parent: descriptor, name: name, url: child,
-                        device: info.st_dev, category: "所选目录", depth: 1, cancelled: cancelled)
-                    if let amount {
-                        state.totalBytes = state.add(state.totalBytes, amount.bytes)
-                        if amount.directory {
-                            entries.append(entry(child, category: "子目录", amount: amount, risk: "仅分析",
-                                reason: "包含本目录下已确认的本地分配块，不代表可清理空间。"))
-                            entries.sort(by: Self.larger)
-                            if entries.count > 20 { entries.removeLast() }
-                        }
-                    }
+            if let expectedIdentity {
+                guard Int32(info.st_dev) == expectedIdentity.device, UInt64(info.st_ino) == expectedIdentity.inode,
+                      expectedIdentity.ownerUID.map({ $0 == UInt32(info.st_uid) }) ?? true else {
+                    throw StorageAnalysisFailure("目录身份与已复核对象不一致，已停止分析；请重新选择目录。")
                 }
-                var after = stat()
-                if fstat(descriptor, &after) != 0 || !StorageAnalysisPolicy.unchanged(info, after) { state.note(.changed) }
             }
-            return state.result(entries: entries, root: url.path)
+            var entries: [StorageEntry] = []
+            if let amount = state.walkDirectory(descriptor, url: url, info: info, device: info.st_dev,
+                                                category: "所选目录", depth: 0, cancelled: cancelled) {
+                state.totalBytes = amount.bytes
+                entries = state.nodes[url.path]?.childIDs.compactMap { state.nodes[$0] }.filter { $0.kind == .directory && $0.allocatedBytes != nil }.map {
+                    StorageEntry(id: $0.id, name: $0.name, category: "子目录", path: $0.path,
+                                 bytes: $0.allocatedBytes ?? 0, fileCount: $0.fileCount, risk: "仅分析",
+                                 reason: $0.complete ? "已确认的本地分配空间，不代表可清理。" : "仅已读取部分；详见目录树的跳过说明。")
+                }.sorted(by: Self.larger).prefix(20).map { $0 } ?? []
+            }
+            return state.result(entries: entries, root: url.path, cancelled: cancelled)
         }
     }
 
@@ -216,6 +215,7 @@ private struct FileIdentity: Hashable {
 }
 private struct Amount {
     var bytes: Int64
+    var logicalBytes: Int64
     var fileCount: Int
     let directory: Bool
     var complete: Bool
@@ -234,20 +234,35 @@ private enum ScanIssue: String, CaseIterable {
 }
 private final class ScanState {
     let maximumEntries: Int
+    let maximumNodes: Int
+    let startedAt = Date()
+    let startedClock = ProcessInfo.processInfo.systemUptime
     let deadline: TimeInterval
     let exclusions: [[String]]
+    let progressHandler: @Sendable (ScanProgress) -> Void
     var visited = Set<FileIdentity>()
     var totalBytes: Int64 = 0
+    var logicalBytes: Int64 = 0
+    var observedBytes: Int64 = 0
+    var fileCount = 0
+    var directoryCount = 0
+    var currentPath: String?
     var largestFiles: [StorageEntry] = []
+    var nodes: [String: ScanNode] = [:]
+    var rootIDs: [String] = []
     var issues: [ScanIssue: Int] = [:]
     var duplicates = 0
     var entriesSeen = 0
     var stopReason: String?
+    var wasCancelled = false
+    var lastProgress: TimeInterval = 0
     var complete: Bool { issues.isEmpty && stopReason == nil }
-    init(maximumEntries: Int, seconds: TimeInterval, exclusions: [URL]) {
-        self.maximumEntries = maximumEntries
+    init(maximumEntries: Int, maximumNodes: Int, seconds: TimeInterval, exclusions: [URL],
+         progress: @escaping @Sendable (ScanProgress) -> Void) {
+        self.maximumEntries = maximumEntries; self.maximumNodes = maximumNodes
         deadline = ProcessInfo.processInfo.systemUptime + seconds
         self.exclusions = exclusions.filter(\.isFileURL).flatMap { [$0.pathComponents, $0.resolvingSymlinksInPath().pathComponents] }
+        progressHandler = progress
     }
     func isExcluded(_ url: URL) -> Bool {
         let parts = url.pathComponents
@@ -256,7 +271,7 @@ private final class ScanState {
     func note(_ issue: ScanIssue) { issues[issue, default: 0] += 1 }
     func shouldStop(_ cancelled: @Sendable () -> Bool) -> Bool {
         if stopReason != nil { return true }
-        if cancelled() { stopReason = "扫描已取消；仅展示已确认部分。" }
+        if cancelled() { wasCancelled = true; stopReason = "扫描已取消；仅展示已确认部分。" }
         else if entriesSeen >= maximumEntries { stopReason = "达到 \(maximumEntries) 个条目的扫描预算；仅展示已确认部分。" }
         else if ProcessInfo.processInfo.systemUptime >= deadline { stopReason = "达到时间预算；仅展示已确认部分。" }
         return stopReason != nil
@@ -264,7 +279,19 @@ private final class ScanState {
     func consume(_ cancelled: @Sendable () -> Bool) -> Bool {
         guard !shouldStop(cancelled) else { return false }
         entriesSeen += 1
+        emitProgress()
         return true
+    }
+    func progressValue() -> ScanProgress {
+        ScanProgress(visitedEntries: entriesSeen, fileCount: fileCount, directoryCount: directoryCount,
+                     allocatedBytes: observedBytes, logicalBytes: logicalBytes,
+                     skippedCount: issues.values.reduce(0, +) + duplicates, currentPath: currentPath,
+                     elapsedSeconds: max(0, ProcessInfo.processInfo.systemUptime - startedClock))
+    }
+    func emitProgress(force: Bool = false) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard force || now - lastProgress >= 0.2 else { return }
+        lastProgress = now; progressHandler(progressValue())
     }
     func add(_ a: Int64, _ b: Int64) -> Int64 {
         let result = a.addingReportingOverflow(b)
@@ -276,6 +303,34 @@ private final class ScanState {
             note(.overflow); return nil
         }
         return bytes
+    }
+    @discardableResult func insertNode(_ url: URL, info: stat?, category: String) -> Bool {
+        if nodes[url.path] != nil { return true }
+        guard nodes.count < maximumNodes else {
+            stopReason = "达到 \(maximumNodes) 个可浏览节点的内存预算；请另选较小目录继续分析。"
+            return false
+        }
+        let parent = nodes[url.deletingLastPathComponent().path] == nil ? nil : url.deletingLastPathComponent().path
+        let kind: ScanNode.Kind
+        switch info.map({ $0.st_mode & S_IFMT }) {
+        case S_IFDIR: kind = .directory
+        case S_IFREG: kind = .file
+        case S_IFLNK: kind = .symbolicLink
+        case .none: kind = .unknown
+        default: kind = .other
+        }
+        nodes[url.path] = ScanNode(id: url.path, parentID: parent, name: url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent,
+            path: url.path, kind: kind, category: category, device: info.map { Int32($0.st_dev) }, inode: info.map { UInt64($0.st_ino) },
+            ownerUID: info.map { UInt32($0.st_uid) }, logicalBytes: nil, allocatedBytes: nil, fileCount: 0,
+            complete: false, skipReasons: [], childIDs: [])
+        if let parent { nodes[parent]?.childIDs.append(url.path) }
+        else { rootIDs.append(url.path) }
+        return true
+    }
+    func skip(_ url: URL, _ issue: ScanIssue) -> Amount? {
+        note(issue)
+        nodes[url.path]?.skipReasons = [issue.rawValue]
+        return nil
     }
     func enumerate(_ descriptor: Int32, cancelled: @Sendable () -> Bool, visit: (String) -> Void) {
         let copy = dup(descriptor)
@@ -299,61 +354,95 @@ private final class ScanState {
     func walkChild(parent: Int32, name: String, url: URL, device: dev_t, category: String, depth: Int,
                    cancelled: @Sendable () -> Bool) -> Amount? {
         guard consume(cancelled) else { return nil }
-        if isExcluded(url) { note(.excluded); return nil }
+        currentPath = url.path
+        // Exclusions require no metadata access. Preserve their reason as a bounded tree node.
+        if isExcluded(url) {
+            guard insertNode(url, info: nil, category: category) else { return nil }
+            return skip(url, .excluded)
+        }
         var info = stat()
         guard fstatat(parent, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
-            note(errno == EDEADLK ? .placeholder : .unreadable); return nil
+            let issue: ScanIssue = errno == EDEADLK ? .placeholder : .unreadable
+            guard insertNode(url, info: nil, category: category) else { return nil }
+            return skip(url, issue)
         }
+        guard insertNode(url, info: info, category: category) else { return nil }
         let kind = info.st_mode & S_IFMT
-        if kind == S_IFLNK { note(.symlink); return nil }
-        if StorageAnalysisPolicy.isPlaceholder(flags: info.st_flags, name: name) { note(.placeholder); return nil }
-        if info.st_dev != device { note(.mount); return nil }
-        guard kind == S_IFDIR || kind == S_IFREG else { note(.special); return nil }
-        if visited.contains(FileIdentity(info)) { duplicates += 1; return nil }
+        if kind == S_IFLNK { return skip(url, .symlink) }
+        if StorageAnalysisPolicy.isPlaceholder(flags: info.st_flags, name: name) { return skip(url, .placeholder) }
+        if info.st_dev != device { return skip(url, .mount) }
+        guard kind == S_IFDIR || kind == S_IFREG else { return skip(url, .special) }
+        if visited.contains(FileIdentity(info)) {
+            duplicates += 1
+            nodes[url.path]?.allocatedBytes = 0; nodes[url.path]?.logicalBytes = 0
+            nodes[url.path]?.complete = true
+            nodes[url.path]?.skipReasons = ["设备与 inode 相同，已计入首次访问的位置，不重复累计。"]
+            return nil
+        }
         if kind == S_IFDIR {
-            guard depth < 64 else { note(.depth); return nil }
+            guard depth < 64 else { return skip(url, .depth) }
             let descriptor = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-            guard descriptor >= 0 else { note(errno == EDEADLK ? .placeholder : .unreadable); return nil }
+            guard descriptor >= 0 else { return skip(url, errno == EDEADLK ? .placeholder : .unreadable) }
             defer { close(descriptor) }
             var opened = stat()
-            guard fstat(descriptor, &opened) == 0, StorageAnalysisPolicy.unchanged(info, opened) else { note(.changed); return nil }
+            guard fstat(descriptor, &opened) == 0, StorageAnalysisPolicy.unchanged(info, opened) else { return skip(url, .changed) }
             return walkDirectory(descriptor, url: url, info: opened, device: device, category: category,
                                  depth: depth, alreadyCounted: true, cancelled: cancelled)
         }
-        // Never open the file or ask a provider to download its contents.
+        // Only metadata is read; no content opens and no provider downloads.
+        var after = stat()
+        guard fstatat(parent, name, &after, AT_SYMLINK_NOFOLLOW) == 0,
+              StorageAnalysisPolicy.unchanged(info, after) else { return skip(url, .changed) }
         visited.insert(FileIdentity(info))
-        guard let bytes = allocatedBytes(info) else { return nil }
+        guard let bytes = allocatedBytes(info), info.st_size >= 0 else { return skip(url, .overflow) }
+        fileCount += 1; observedBytes = add(observedBytes, bytes); logicalBytes = add(logicalBytes, Int64(info.st_size))
+        nodes[url.path]?.allocatedBytes = bytes; nodes[url.path]?.logicalBytes = Int64(info.st_size)
+        nodes[url.path]?.fileCount = 1; nodes[url.path]?.complete = true
         let entry = StorageEntry(id: url.path, name: name, category: category, path: url.path,
             bytes: bytes, fileCount: 1, risk: "仅分析", reason: "按本地分配块统计，未读取文件内容；不代表可清理。")
         largestFiles.append(entry)
         largestFiles.sort { $0.bytes == $1.bytes ? $0.path < $1.path : $0.bytes > $1.bytes }
         if largestFiles.count > 20 { largestFiles.removeLast() }
-        return Amount(bytes: bytes, fileCount: 1, directory: false, complete: true)
+        return Amount(bytes: bytes, logicalBytes: Int64(info.st_size), fileCount: 1, directory: false, complete: true)
     }
     func walkDirectory(_ descriptor: Int32, url: URL, info: stat, device: dev_t, category: String,
                        depth: Int, alreadyCounted: Bool = false, cancelled: @Sendable () -> Bool) -> Amount? {
         if !alreadyCounted && !consume(cancelled) { return nil }
+        guard insertNode(url, info: info, category: category) else { return nil }
         if visited.contains(FileIdentity(info)) { duplicates += 1; return nil }
         visited.insert(FileIdentity(info))
-        let issuesBefore = issues.values.reduce(0, +)
-        guard let ownBytes = allocatedBytes(info) else { return nil }
-        var amount = Amount(bytes: ownBytes, fileCount: 0, directory: true, complete: true)
+        directoryCount += 1; currentPath = url.path
+        let issuesBefore = issues
+        guard let ownBytes = allocatedBytes(info) else { return skip(url, .overflow) }
+        observedBytes = add(observedBytes, ownBytes)
+        var amount = Amount(bytes: ownBytes, logicalBytes: 0, fileCount: 0, directory: true, complete: true)
         enumerate(descriptor, cancelled: cancelled) { name in
             if let child = walkChild(parent: descriptor, name: name, url: url.appendingPathComponent(name),
                 device: device, category: category, depth: depth + 1, cancelled: cancelled) {
                 amount.bytes = add(amount.bytes, child.bytes)
+                amount.logicalBytes = add(amount.logicalBytes, child.logicalBytes)
                 amount.fileCount += child.fileCount
             }
         }
         var after = stat()
         if fstat(descriptor, &after) != 0 || !StorageAnalysisPolicy.unchanged(info, after) { note(.changed) }
-        amount.complete = stopReason == nil && issues.values.reduce(0, +) == issuesBefore
+        amount.complete = stopReason == nil && issues == issuesBefore
+        nodes[url.path]?.allocatedBytes = amount.bytes; nodes[url.path]?.logicalBytes = amount.logicalBytes
+        nodes[url.path]?.fileCount = amount.fileCount; nodes[url.path]?.complete = amount.complete
+        nodes[url.path]?.skipReasons = ScanIssue.allCases.filter { issues[$0, default: 0] > issuesBefore[$0, default: 0] }.map(\.rawValue)
+        if let stopReason { nodes[url.path]?.skipReasons.append(stopReason) }
         return amount
     }
-    func result(entries: [StorageEntry], root: String?) -> StorageAnalysisResult {
+    func result(entries: [StorageEntry], root: String?, cancelled: @Sendable () -> Bool) -> StorageAnalysisResult {
+        if cancelled() {
+            wasCancelled = true; stopReason = "扫描已取消；仅展示已确认部分。"
+            for rootID in rootIDs { nodes[rootID]?.complete = false }
+        }
         var notes = ["只读取目录和文件元数据，不打开文件内容，不删除文件，也不请求云端下载。",
                      "空间按 st_blocks × 512 估算；APFS 克隆、快照或共享存储可能重复占用统计，数值不等于可释放空间。",
-                     "时间预算和停止请求在系统调用之间检查；若系统权限检查或存储响应尚未返回，不能立即中断该调用。"]
+                     "逻辑字节为已确认普通文件的长度总和；同设备与 inode 的硬链接只累计首次访问。目录自身分配块计入分配字节。",
+                     "时间预算和停止请求在系统调用之间检查；若系统权限检查或存储响应尚未返回，不能立即中断该调用。",
+                     "目录树最多保留 \(maximumNodes) 个节点；达到上限后停止，选择较小目录可重新分析。"]
         if root == nil {
             notes.append("仅检查常见默认目录；自定义环境、项目内虚拟环境和其他模型路径需另选目录分析。")
             notes.append("默认分析不进入 Library/Containers 应用沙盒，包括 Docker 虚拟机数据；这些占用未计入，请在对应软件中查看和管理。")
@@ -364,8 +453,11 @@ private final class ScanState {
         if duplicates > 0 { notes.append("\(duplicates) 个重复 inode 已去重；硬链接占用计入首次访问的目录。") }
         if let stopReason { notes.append(stopReason) }
         if !complete { notes.append("结果不完整：总量与排名仅代表已确认部分，未访问项目不按零占用处理。") }
+        emitProgress(force: true)
+        let session = ScanSession(id: UUID(), scope: root ?? "开发环境", startedAt: startedAt, finishedAt: Date(), rootIDs: rootIDs,
+            nodes: nodes, complete: complete, cancelled: wasCancelled, stopReason: stopReason, maximumNodes: maximumNodes, progress: progressValue())
         return StorageAnalysisResult(entries: entries, largestFiles: largestFiles, notes: notes,
-            complete: complete, date: Date(), totalBytes: totalBytes, root: root)
+            complete: complete, date: Date(), totalBytes: totalBytes, root: root, session: session, cancelled: wasCancelled)
     }
 }
 
@@ -388,7 +480,7 @@ private enum StorageFilesystem {
         return try body()
     }
     static func openDirectory(_ url: URL) throws -> Int32 {
-        guard url.isFileURL, url.path.hasPrefix("/"), !url.pathComponents.contains("."), !url.pathComponents.contains("..") else { throw StorageAnalysisFailure("请选择本地目录。") }
+        guard url.isFileURL, (url.host == nil || url.host == "" || url.host == "localhost"), url.user == nil, url.password == nil, url.port == nil, url.query == nil, url.fragment == nil, !url.path.utf8.contains(0), url.path.hasPrefix("/"), !url.pathComponents.contains("."), !url.pathComponents.contains("..") else { throw StorageAnalysisFailure("请选择本地目录。") }
         var descriptor = Darwin.open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard descriptor >= 0 else { throw posix() }
         do {
@@ -444,6 +536,7 @@ enum StorageAnalysisPolicy {
     }
     static func unchanged(_ before: stat, _ after: stat) -> Bool {
         before.st_dev == after.st_dev && before.st_ino == after.st_ino && before.st_mode == after.st_mode &&
+            before.st_uid == after.st_uid && before.st_gid == after.st_gid && before.st_flags == after.st_flags && before.st_nlink == after.st_nlink &&
             before.st_size == after.st_size && before.st_blocks == after.st_blocks &&
             before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec && before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec &&
             before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec && before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec

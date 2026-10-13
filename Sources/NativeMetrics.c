@@ -63,7 +63,7 @@ void gjl_system_snapshot(GJLSystem *out) {
     }
     mach_port_deallocate(mach_task_self(), host);
     struct xsw_usage swap = {0}; size = sizeof(swap);
-    if (sysctlbyname("vm.swapusage", &swap, &size, NULL, 0) == 0) out->swap_used = swap.xsu_used;
+    if (sysctlbyname("vm.swapusage", &swap, &size, NULL, 0) == 0) { out->swap_used = swap.xsu_used; out->swap_valid = 1; }
     size = sizeof(out->pressure_level);
     if (sysctlbyname("kern.memorystatus_vm_pressure_level", &out->pressure_level, &size, NULL, 0) != 0) out->pressure_level = 0;
     struct timespec uptime = {0};
@@ -151,21 +151,37 @@ int gjl_process_snapshot(GJLProcess **out, int *total_count) {
     for (int i = 0; i < count; i++) {
         if (pids[i] <= 0) continue;
         (*total_count)++;
+        struct proc_bsdinfo bsd = {0}, verified = {0};
+        if (proc_pidinfo(pids[i], PROC_PIDTBSDINFO, 0, &bsd, sizeof(bsd)) != sizeof(bsd)) continue;
         struct rusage_info_v2 usage = {0};
         if (proc_pid_rusage(pids[i], RUSAGE_INFO_V2, (rusage_info_t *)&usage) != 0) continue;
         GJLProcess *p = &records[found];
-        p->pid = pids[i]; p->start_time = usage.ri_proc_start_abstime;
+        p->pid = pids[i]; p->start_time = usage.ri_proc_start_abstime; p->uid = bsd.pbi_uid;
         // rusage CPU times are Mach absolute ticks, not nanoseconds (notably on Apple Silicon).
         p->cpu_nanoseconds = (uint64_t)(((__uint128_t)usage.ri_user_time + usage.ri_system_time) * timebase.numer / (timebase.denom ? timebase.denom : 1));
         p->memory_bytes = usage.ri_phys_footprint;
         proc_name(pids[i], p->name, sizeof(p->name));
         proc_pidpath(pids[i], p->path, sizeof(p->path));
+        if (proc_pidinfo(pids[i], PROC_PIDTBSDINFO, 0, &verified, sizeof(verified)) != sizeof(verified) ||
+            bsd.pbi_uid != verified.pbi_uid || bsd.pbi_start_tvsec != verified.pbi_start_tvsec ||
+            bsd.pbi_start_tvusec != verified.pbi_start_tvusec || !p->start_time) continue;
         if (!p->name[0]) snprintf(p->name, sizeof(p->name), "PID %d", pids[i]);
         found++;
     }
     free(pids); *out = records; return found;
 }
 void gjl_free_processes(GJLProcess *processes) { free(processes); }
+
+int gjl_process_identity(int32_t pid, uint64_t *start_time, uint32_t *uid) {
+    if (pid <= 0 || !start_time || !uid) return 0;
+    struct proc_bsdinfo a = {0}, b = {0}; struct rusage_info_v2 usage = {0};
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &a, sizeof(a)) != sizeof(a) ||
+        proc_pid_rusage(pid, RUSAGE_INFO_V2, (rusage_info_t *)&usage) != 0 ||
+        proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &b, sizeof(b)) != sizeof(b) ||
+        a.pbi_uid != b.pbi_uid || a.pbi_start_tvsec != b.pbi_start_tvsec ||
+        a.pbi_start_tvusec != b.pbi_start_tvusec || !usage.ri_proc_start_abstime) return 0;
+    *start_time = usage.ri_proc_start_abstime; *uid = b.pbi_uid; return 1;
+}
 
 // Read-only AppleSMC protocol. Layout follows the MIT-licensed Glance SMC reader.
 typedef struct { uint8_t major, minor, build, reserved; uint16_t release; } SMCVersion;
@@ -231,20 +247,35 @@ static double hid_cpu_temperature(void) {
 }
 
 void gjl_sensor_snapshot(GJLSensors *out) {
-    *out = (GJLSensors){ .battery_percent = NAN, .battery_health = NAN, .battery_cycles = -1, .gpu_percent = NAN, .cpu_temperature = NAN, .cpu_power = NAN, .gpu_power = NAN, .fan_rpm = NAN };
+    *out = (GJLSensors){ .battery_percent = NAN, .battery_health = NAN, .battery_cycles = -1, .battery_charging = -1,
+        .gpu_percent = NAN, .cpu_temperature = NAN, .cpu_power = NAN, .gpu_power = NAN, .fan_rpm = NAN,
+        .battery_present = -1, .battery_ac_power = -1, .fan_count = -1,
+        .battery_temperature = NAN, .battery_minutes_empty = NAN, .battery_minutes_full = NAN };
+    for (int i = 0; i < 16; i++) out->fan_speeds[i] = NAN;
     CFTypeRef info = IOPSCopyPowerSourcesInfo();
     CFArrayRef sources = info ? IOPSCopyPowerSourcesList(info) : NULL;
     if (sources) {
+        out->battery_present = 0;
         for (CFIndex i = 0; i < CFArrayGetCount(sources); i++) {
             CFDictionaryRef description = IOPSGetPowerSourceDescription(info, CFArrayGetValueAtIndex(sources, i));
-            if (!description) continue;
+            if (!description) { out->battery_present = -1; continue; }
             CFTypeRef type = CFDictionaryGetValue(description, CFSTR(kIOPSTypeKey));
-            if (!type || !CFEqual(type, CFSTR(kIOPSInternalBatteryType))) continue;
+            if (!type || CFGetTypeID(type) != CFStringGetTypeID()) { out->battery_present = -1; continue; }
+            if (!CFEqual(type, CFSTR(kIOPSInternalBatteryType))) continue;
+            out->battery_present = 1;
             double current = dictionary_number(description, CFSTR(kIOPSCurrentCapacityKey));
             double maximum = dictionary_number(description, CFSTR(kIOPSMaxCapacityKey));
             if (current >= 0 && maximum > 0) out->battery_percent = fmin(100, current / maximum * 100);
             CFTypeRef charging = CFDictionaryGetValue(description, CFSTR(kIOPSIsChargingKey));
-            out->battery_charging = charging == kCFBooleanTrue;
+            if (charging && CFGetTypeID(charging) == CFBooleanGetTypeID()) out->battery_charging = charging == kCFBooleanTrue;
+            CFTypeRef state = CFDictionaryGetValue(description, CFSTR(kIOPSPowerSourceStateKey));
+            if (state && CFEqual(state, CFSTR(kIOPSACPowerValue))) out->battery_ac_power = 1;
+            else if (state && CFEqual(state, CFSTR(kIOPSBatteryPowerValue))) out->battery_ac_power = 0;
+            out->battery_temperature = dictionary_number(description, CFSTR(kIOPSTemperatureKey));
+            out->battery_minutes_empty = dictionary_number(description, CFSTR(kIOPSTimeToEmptyKey));
+            out->battery_minutes_full = dictionary_number(description, CFSTR(kIOPSTimeToFullChargeKey));
+            CFTypeRef health = CFDictionaryGetValue(description, CFSTR(kIOPSBatteryHealthKey));
+            if (health && CFGetTypeID(health) == CFStringGetTypeID()) CFStringGetCString(health, out->battery_condition, sizeof(out->battery_condition), kCFStringEncodingUTF8);
             break;
         }
         CFRelease(sources);
@@ -284,6 +315,7 @@ void gjl_sensor_snapshot(GJLSensors *out) {
         IOObjectRelease(iterator);
     }
     out->cpu_temperature = hid_cpu_temperature();
+    if (isfinite(out->cpu_temperature)) out->cpu_temperature_source = 1;
     io_service_t smc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"));
     if (smc) {
         io_connect_t connection = 0;
@@ -303,21 +335,23 @@ void gjl_sensor_snapshot(GJLSensors *out) {
             if (!isfinite(out->cpu_temperature) && cpu_keys) {
                 double total = 0; int found = 0;
                 for (size_t i = 0; i < cpu_key_count; i++) { double t = smc_number(connection, cpu_keys[i]); if (t >= 10 && t < 130) { total += t; found++; } }
-                if (found) out->cpu_temperature = total / found;
+                if (found) { out->cpu_temperature = total / found; out->cpu_temperature_source = 2; }
             }
             const char *keys[] = { "TCAD", "TC0D", "TC0P", "TC0E", "TC0F" };
             if (!isfinite(out->cpu_temperature)) for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
                 double t = smc_number(connection, keys[i]);
-                if (t > 0 && t < 150) { out->cpu_temperature = t; break; }
+                if (t > 0 && t < 150) { out->cpu_temperature = t; out->cpu_temperature_source = 2; break; }
             }
             double fans = smc_number(connection, "FNum");
+            if (isfinite(fans) && fans >= 0 && fans <= 16 && floor(fans) == fans) out->fan_count = (int)fans;
             if (isfinite(fans) && fans >= 1 && fans <= 16) for (int i = 0; i < (int)fans; i++) {
                 char key[5]; snprintf(key, sizeof(key), "F%XAc", i);
                 double rpm = smc_number(connection, key);
+                if (rpm >= 0 && rpm < 30000) out->fan_speeds[i] = rpm;
                 if (rpm >= 0 && rpm < 30000) out->fan_rpm = isnan(out->fan_rpm) ? rpm : fmax(out->fan_rpm, rpm);
             }
             // PCPC is CPU package power on supported Intel SMCs. Never use total-system power as CPU power.
-            double power = smc_number(connection, "PCPC");
+            double power = strstr(chip, "Intel") ? smc_number(connection, "PCPC") : NAN;
             if (power >= 0 && power < 1000) out->cpu_power = power;
             IOServiceClose(connection);
         }

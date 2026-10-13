@@ -8,13 +8,14 @@ typedef struct {
     int core_count;
     GJLCoreTicks cores[256];
     uint64_t memory_total, memory_used, memory_compressed, swap_used;
-    int memory_valid, pressure_level;
+    int memory_valid, swap_valid, pressure_level;
     double uptime;
     uint64_t disk_free, disk_total;
 } GJLSystem;
 typedef struct { uint64_t identifier, received, sent; } GJLCounter;
 typedef struct {
     int32_t pid;
+    uint32_t uid;
     uint64_t start_time, cpu_nanoseconds, memory_bytes;
     char name[256];
     char path[4096];
@@ -23,6 +24,10 @@ typedef struct {
     double battery_percent, battery_health;
     int battery_charging, battery_cycles;
     double gpu_percent, cpu_temperature, cpu_power, gpu_power, fan_rpm;
+    int battery_present, battery_ac_power, cpu_temperature_source, fan_count;
+    double battery_temperature, battery_minutes_empty, battery_minutes_full;
+    double fan_speeds[16];
+    char battery_condition[128];
 } GJLSensors;
 void gjl_system_snapshot(GJLSystem *out);
 int gjl_network_counters(GJLCounter *out, int capacity);
@@ -43,4 +48,6 @@ uint64_t gjl_memory_maintenance_relief(void);
 int gjl_application_running(const char *bundle_path, int check_developer_tools);
 /* Conservative global check for package managers and compilers, no argv read. */
 int gjl_development_tools_running(void);
+/* Fixed PID identity only; never sends a signal or reads process arguments. */
+int gjl_process_identity(int32_t pid, uint64_t *start_time, uint32_t *uid);
 #endif

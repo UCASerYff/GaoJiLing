@@ -55,6 +55,12 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     private var store: MonitorStore!
     private var cleanup: CleanupController!
     private var analysis: StorageAnalysisController!
+    private var manager: AppManagementController!
+    private var maintenance: MaintenanceController!
+    private var exchange: GAExchangeController!
+    private var business: GABusinessCoordinator!
+    private let dashboardNavigation = GLDashboardNavigation()
+    private var pendingPackages: [URL] = []
     private var window: NSWindow!
     private var settingsWindow: NSWindow?
     private let settingsNavigation = GLSettingsNavigation()
@@ -89,6 +95,14 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         store = MonitorStore()
         cleanup = CleanupController(dataDirectory: store.dataDirectory)
         analysis = StorageAnalysisController(dataDirectory: store.dataDirectory)
+        manager = AppManagementController(dataDirectory: store.dataDirectory)
+        maintenance = MaintenanceController(dataDirectory: store.dataDirectory, actionsAllowed: { [weak self] in
+            guard let self else { return false }; return !self.operationsBusy && self.store?.isPaused != true && !self.pendingTermination
+        })
+        exchange = GAExchangeController(dataDirectory: store.dataDirectory)
+        business = GABusinessCoordinator(exchange: exchange, cleanup: cleanup, analysis: analysis, manager: manager,
+            externallyBusy: { [weak self] in self?.store.dataBusy ?? true },
+            navigate: { [weak self] action in self?.showBusiness(action) })
         signal(SIGTERM, SIG_IGN)
         terminationSignal = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         terminationSignal?.setEventHandler { NSApp.terminate(nil) }
@@ -101,7 +115,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         window.minSize = NSSize(width: 960, height: 690)
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.contentView = NSHostingView(rootView: DashboardView(store: store, cleanup: cleanup, analysis: analysis, openSettings: { [weak self] in self?.showSettings() }))
+        window.contentView = NSHostingView(rootView: DashboardView(store: store, cleanup: cleanup, analysis: analysis, openSettings: { [weak self] in self?.showSettings() }, manager: manager, maintenance: maintenance, exchange: exchange, navigation: dashboardNavigation))
         window.setFrameAutosaveName("GaoJiLing.MainWindow")
         if !window.setFrameUsingName("GaoJiLing.MainWindow") { window.center() }
 
@@ -128,35 +142,17 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         statusItem.button?.target = self; statusItem.button?.action = #selector(statusTapped)
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         configurePanelMouseMonitoring()
-        store.$latest.sink { [weak self] sample in self?.updateStatus(sample) }.store(in: &subscriptions)
+        store.$latest.sink { [weak self] sample in self?.updateStatus(sample); self?.maintenance.ingest(sample: sample) }.store(in: &subscriptions)
         store.$isPaused.sink { [weak self] _ in DispatchQueue.main.async { self?.updateStatus(self?.store.latest ?? .empty) } }.store(in: &subscriptions)
-        store.$dataBusy.sink { [weak self] busy in
-            guard let self, !busy, self.pendingTermination else { return }
-            // @Published emits before the stored value changes. Reply on the next
-            // main-loop turn, after the data operation's cleanup has completed.
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.pendingTermination, !self.store.dataBusy, !self.cleanup.isBusy, !self.analysis.isBusy else { return }
-                self.pendingTermination = false
-                NSApp.reply(toApplicationShouldTerminate: true)
-            }
-        }.store(in: &subscriptions)
-        cleanup.$isBusy.sink { [weak self] busy in
-            guard !busy else { return }
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.pendingTermination, !self.store.dataBusy, !self.cleanup.isBusy, !self.analysis.isBusy else { return }
-                self.pendingTermination = false
-                NSApp.reply(toApplicationShouldTerminate: true)
-            }
-        }.store(in: &subscriptions)
+        for publisher in [store.$dataBusy.eraseToAnyPublisher(), cleanup.$isBusy.eraseToAnyPublisher(), analysis.$isBusy.eraseToAnyPublisher(), manager.$isBusy.eraseToAnyPublisher(), exchange.$isBusy.eraseToAnyPublisher(), store.$isPaused.eraseToAnyPublisher()] {
+            publisher.sink { [weak self] _ in
+                DispatchQueue.main.async { self?.maintenanceStateChanged() }
+            }.store(in: &subscriptions)
+        }
+        dashboardNavigation.$page.sink { [weak self] _ in DispatchQueue.main.async { self?.updateSamplingDemand() } }.store(in: &subscriptions)
+        store.$activeSession.map { $0 != nil }.removeDuplicates().sink { [weak self] _ in DispatchQueue.main.async { self?.updateSamplingDemand() } }.store(in: &subscriptions)
+        maintenance.$preferences.sink { [weak self] _ in DispatchQueue.main.async { self?.updateSamplingDemand() } }.store(in: &subscriptions)
         NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged(_:)), name: .monitorSettingsChanged, object: nil)
-        analysis.$isBusy.sink { [weak self] busy in
-            guard !busy else { return }
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.pendingTermination, !self.store.dataBusy, !self.cleanup.isBusy, !self.analysis.isBusy else { return }
-                self.pendingTermination = false
-                NSApp.reply(toApplicationShouldTerminate: true)
-            }
-        }.store(in: &subscriptions)
         NotificationCenter.default.addObserver(self, selector: #selector(settingsNavigationRequested(_:)), name: .monitorNavigate, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(resetEdgeHandle), name: .monitorResetEdgeHandle, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(dockEdgeHandle), name: .monitorDockEdgeHandle, object: nil)
@@ -168,6 +164,9 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         if let edgeTimer { RunLoop.main.add(edgeTimer, forMode: .common) }
         settingsChanged()
         showDashboard()
+        for url in pendingPackages { exchange.receive(url) }
+        if !pendingPackages.isEmpty { dashboardNavigation.page = .exchange }
+        pendingPackages.removeAll()
     }
     private func configureMainMenu() {
         let main = NSMenu(); let appItem = NSMenuItem(); let appMenu = NSMenu()
@@ -176,6 +175,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         appMenu.addItem(withTitle: "设置…", action: #selector(showSettings), keyEquivalent: ",")
         let exportItem = appMenu.addItem(withTitle: "导出与备份…", action: #selector(showData), keyEquivalent: "e")
         exportItem.keyEquivalentModifierMask = [.command, .shift]
+        appMenu.addItem(withTitle: "动作交接…", action: #selector(showExchange), keyEquivalent: "")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "打开搞机灵", action: #selector(showDashboard), keyEquivalent: "0")
         panelMenuItem = appMenu.addItem(withTitle: "显示边缘面板", action: #selector(togglePanel), keyEquivalent: "g")
@@ -184,7 +184,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         appMenu.addItem(withTitle: "隐藏搞机灵", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(withTitle: "退出搞机灵", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu; main.addItem(appItem)
-        for item in appMenu.items where [#selector(showAbout), #selector(showSettings), #selector(showData), #selector(showDashboard), #selector(togglePanel)].contains(item.action) { item.target = self }
+        for item in appMenu.items where [#selector(showAbout), #selector(showSettings), #selector(showData), #selector(showDashboard), #selector(togglePanel), #selector(showExchange)].contains(item.action) { item.target = self }
         let edit = NSMenuItem(); edit.title = "编辑"; let editMenu = NSMenu(title: "编辑")
         editMenu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
         editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
@@ -209,6 +209,45 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         NSApp.activate(ignoringOtherApps: true)
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
+        updateSamplingDemand()
+    }
+    private func updateSamplingDemand() {
+        let pageNeedsMetrics = [GLPage.overview, .apps, .sessions, .network, .maintenance].contains(dashboardNavigation.page)
+        let mainVisible = window?.isVisible == true && window?.isMiniaturized != true && window?.occlusionState.contains(.visible) == true && !NSApp.isHidden
+        let exitRulesActive = maintenance?.writable == true && maintenance?.preferences.appExitEnabled == true && maintenance?.preferences.appExitPaused != true && maintenance?.preferences.rules.contains(where: {
+            $0.enabled && maintenance?.preferences.protectedBundleIDs.contains($0.bundleID) != true
+        }) == true
+        store?.setPresentation(metricsVisible: mainVisible && pageNeedsMetrics, panelVisible: panel?.isVisible == true && !NSApp.isHidden,
+                               maintenanceRulesEnabled: exitRulesActive)
+    }
+    func windowDidMiniaturize(_ notification: Notification) { updateSamplingDemand() }
+    func windowDidDeminiaturize(_ notification: Notification) { updateSamplingDemand() }
+    func windowDidChangeOcclusionState(_ notification: Notification) { updateSamplingDemand() }
+    func applicationDidHide(_ notification: Notification) { updateSamplingDemand() }
+    func applicationDidUnhide(_ notification: Notification) { updateSamplingDemand() }
+    private var operationsBusy: Bool { store?.dataBusy == true || cleanup?.isBusy == true || analysis?.isBusy == true || manager?.isBusy == true || exchange?.isBusy == true }
+    private func maintenanceStateChanged() {
+        updateSamplingDemand()
+        maintenance?.setActionsSuspended(operationsBusy || store?.isPaused == true || pendingTermination)
+        guard pendingTermination, !operationsBusy else { return }
+        pendingTermination = false; NSApp.reply(toApplicationShouldTerminate: true)
+    }
+    private func showBusiness(_ action: String) {
+        switch action { case "storage.inspect": dashboardNavigation.page = .storage
+        case "cleanup.review": dashboardNavigation.page = .cleanup
+        case "apps.uninstall.review": dashboardNavigation.page = .appManagement
+        default: dashboardNavigation.page = .exchange }
+        showDashboard()
+    }
+    @objc private func showExchange() { dashboardNavigation.page = .exchange; showDashboard() }
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard exchange != nil else { pendingPackages.append(contentsOf: urls.prefix(max(0, 16 - pendingPackages.count))); return }
+        dashboardNavigation.page = .exchange; showDashboard()
+        for url in urls.prefix(16) { exchange.receive(url) }
+    }
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        application(sender, open: filenames.map { URL(fileURLWithPath: $0) })
+        sender.reply(toOpenOrPrint: .success)
     }
     @objc private func showAbout() { showSettingsWindow(tab: .about) }
     @objc private func showSettings() { showSettingsWindow(tab: .module) }
@@ -246,6 +285,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if sender === panel { hidePanel() } else { sender.orderOut(nil) }
+        updateSamplingDemand()
         return false
     }
     func windowDidResignKey(_ notification: Notification) {
@@ -263,10 +303,13 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if store?.dataBusy == true || cleanup?.isBusy == true || analysis?.isBusy == true {
+        if operationsBusy {
             pendingTermination = true
             cleanup?.cancel()
             analysis?.cancel()
+            manager?.cancel()
+            exchange?.prepareForTermination()
+            maintenance?.shutdown()
             return .terminateLater
         }
         return .terminateNow
@@ -274,6 +317,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showDashboard(); return true }
     func applicationWillTerminate(_ notification: Notification) {
         finishPanelDrag()
+        maintenance?.shutdown()
         edgeTimer?.invalidate()
         if let localMouseMonitor { NSEvent.removeMonitor(localMouseMonitor) }
         if let globalMouseMonitor { NSEvent.removeMonitor(globalMouseMonitor) }
@@ -419,6 +463,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         panel.alphaValue = 0
         edgeHandle?.setExpanded(true)
         panel.orderFrontRegardless()
+        updateSamplingDemand()
         if manual { panel.makeKeyAndOrderFront(nil) }
         NSAnimationContext.runAnimationGroup { context in context.duration = 0.16; panel.animator().alphaValue = 1 }
     }
@@ -459,6 +504,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
             if didDrag, let screen { edgeHandle?.commitPanelPosition(panel.frame, on: screen, edge: panelExpansionEdge) }
         }
         panelAutoCollapse.closed(); openingStripFrame = nil; panel.orderOut(nil)
+        updateSamplingDemand()
         suppressEdgeUntil = Date().addingTimeInterval(0.8); edgeHandle?.setExpanded(false)
     }
     @objc private func checkEdge() {

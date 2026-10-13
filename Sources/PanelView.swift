@@ -73,7 +73,9 @@ struct PanelView: View {
             HStack {
                 HStack(spacing: 5) {
                     Circle().fill(store.isPaused ? GLPalette.amber : GLPalette.accent).frame(width: 5, height: 5).accessibilityHidden(true)
-                    Text(store.dataBusy ? "处理资料中" : store.isPaused ? "已暂停" : hasSample ? "实时监控" : "等待采样")
+                    TimelineView(.periodic(from: .now, by: 5)) { context in
+                        Text(store.dataBusy ? "处理资料中" : store.isPaused ? "已暂停" : hasSample ? (context.date.timeIntervalSince(store.latest.timestamp) > 15 ? "读数过期" : "实时监控") : "等待采样")
+                    }
                 }.font(.system(size: 11)).foregroundStyle(.secondary)
                     .help(store.isPaused ? "已暂停采样，保留最后一次读数" : "监控数据保存在本机")
                 Button { store.togglePause() } label: {
@@ -147,7 +149,7 @@ struct PanelView: View {
                 Text(hasMemory ? Format.bytes(store.latest.memoryUsed) : "—").font(.system(size: 22, weight: .medium, design: .rounded)).monospacedDigit()
                 Text(hasMemory ? "/ \(Format.bytes(store.latest.memoryTotal))" : "/ —").font(.system(size: 11)).foregroundStyle(.secondary)
                 Spacer()
-                Text(hasMemory ? "Swap \(Format.bytes(store.latest.swapUsed))" : "Swap —").font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(swapText).font(.system(size: 10)).foregroundStyle(.secondary)
             }
             if hasMemory {
                 ProgressView(value: min(max(store.latest.memoryPercent / 100, 0), 1)).tint(GLPalette.blue)
@@ -159,6 +161,13 @@ struct PanelView: View {
     }
 
     private var hasMemory: Bool { store.latest.memoryTotal > 0 }
+    private var swapText: String {
+        if let readings = store.latest.readings {
+            guard let reading = readings["swap"], let value = reading.value else { return "Swap 不可用" }
+            return "Swap \(Format.bytes(value))" + (reading.isFresh() && !store.isPaused ? "" : "（过期）")
+        }
+        return hasMemory ? "Swap \(Format.bytes(store.latest.swapUsed))" : "Swap —"
+    }
     private var hasSample: Bool {
         hasMemory || store.latest.uptime > 0 || store.latest.diskTotal > 0 || store.latest.processCount > 0 || !store.latest.corePercents.isEmpty
     }

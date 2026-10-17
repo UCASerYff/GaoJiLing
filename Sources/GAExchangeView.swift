@@ -33,6 +33,10 @@ struct GAExchangeView: View {
             if let record = exchange.selected {
                 VStack(alignment: .leading, spacing: 12) {
                     Text(actionName(record.manifest.action)).font(.headline)
+                    if record.manifest.parameters["mode"] == .string("duplicates") {
+                        Text("本请求要求读取目录内的文件内容。进入业务仅预填范围；仍须在存储页明确确认内容分析，未授予删除许可。")
+                            .font(.callout).foregroundStyle(GLPalette.amber)
+                    }
                     Text("声明来源：\(record.manifest.sourceBundleID)").font(.caption).textSelection(.enabled)
                     Text("请求：\(record.id)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                     ForEach(record.manifest.references, id: \.id) { reference in

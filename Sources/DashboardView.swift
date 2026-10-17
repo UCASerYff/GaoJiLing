@@ -69,7 +69,10 @@ enum GLPage: String, CaseIterable, Identifiable {
     }
 }
 
-@MainActor final class GLDashboardNavigation: ObservableObject { @Published var page: GLPage = .overview }
+@MainActor final class GLDashboardNavigation: ObservableObject {
+    @Published var page: GLPage = .overview
+    @Published var storageMode = "metadata"
+}
 
 struct DashboardView: View {
     @ObservedObject var store: MonitorStore
@@ -80,6 +83,7 @@ struct DashboardView: View {
     @ObservedObject var maintenance: MaintenanceController
     @ObservedObject var exchange: GAExchangeController
     @ObservedObject var navigation: GLDashboardNavigation
+    @ObservedObject var duplicates: DuplicateAnalysisController
     private var page: GLPage {
         get { navigation.page }
         nonmutating set { navigation.page = newValue }
@@ -123,11 +127,11 @@ struct DashboardView: View {
                         case .history: history
                         case .sessions: sessions
                         case .network: network
-                        case .cleanup: CleanupView(cleanup: cleanup, dataBusy: store.dataBusy || analysis.isBusy || manager.isBusy || exchange.isBusy)
-                        case .storage: StorageAnalysisView(analysis: analysis, dataBusy: store.dataBusy || cleanup.isBusy || manager.isBusy || exchange.isBusy)
-                        case .maintenance: MaintenanceView(store: store, maintenance: maintenance).disabled(store.dataBusy || cleanup.isBusy || analysis.isBusy || manager.isBusy || exchange.isBusy)
-                        case .appManagement: AppManagementView(manager: manager, dataBusy: store.dataBusy || cleanup.isBusy || analysis.isBusy || exchange.isBusy)
-                        case .exchange: GAExchangeView(exchange: exchange, dataBusy: store.dataBusy || cleanup.isBusy || analysis.isBusy || manager.isBusy)
+                        case .cleanup: CleanupView(cleanup: cleanup, dataBusy: store.dataBusy || analysis.isBusy || duplicates.isBusy || manager.isBusy || exchange.isBusy)
+                        case .storage: storageWorkspace
+                        case .maintenance: MaintenanceView(store: store, maintenance: maintenance).disabled(store.dataBusy || cleanup.isBusy || analysis.isBusy || duplicates.isBusy || manager.isBusy || exchange.isBusy)
+                        case .appManagement: AppManagementView(manager: manager, dataBusy: store.dataBusy || cleanup.isBusy || analysis.isBusy || duplicates.isBusy || exchange.isBusy)
+                        case .exchange: GAExchangeView(exchange: exchange, dataBusy: store.dataBusy || cleanup.isBusy || analysis.isBusy || duplicates.isBusy || manager.isBusy)
                         }
                     }
                     .disabled(store.dataBusy)
@@ -144,6 +148,21 @@ struct DashboardView: View {
         .frame(minWidth: 960, minHeight: 650)
         .onChange(of: store.focusedEvent?.id) { _, newValue in
             if newValue != nil { page = .history }
+        }
+        .onReceive(duplicates.$preparedDirectory) { value in if value != nil { navigation.storageMode = "duplicates" } }
+    }
+
+    private var storageWorkspace: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Picker("分析方式", selection: $navigation.storageMode) {
+                Text("占用与磁盘地图").tag("metadata")
+                Text("重复文件内容分析").tag("duplicates")
+            }.pickerStyle(.segmented).disabled(analysis.isBusy || duplicates.isBusy)
+            if navigation.storageMode == "duplicates" {
+                DuplicateAnalysisView(controller: duplicates, dataBusy: store.dataBusy || cleanup.isBusy || analysis.isBusy || manager.isBusy || exchange.isBusy)
+            } else {
+                StorageAnalysisView(analysis: analysis, dataBusy: store.dataBusy || cleanup.isBusy || duplicates.isBusy || manager.isBusy || exchange.isBusy)
+            }
         }
     }
 

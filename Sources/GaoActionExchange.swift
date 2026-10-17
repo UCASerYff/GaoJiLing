@@ -29,7 +29,7 @@ private struct GAInboxLedger: Codable { var version = 1; var records: [GAInboxRe
     static let privateCopyLimit = 1024
     var canCleanCompletedCopies: Bool { records.contains { $0.phase == "finished" && $0.outcome == "completed" && ($0.incomingCopyRemoved != true || !$0.resultFolders.isEmpty) } }
     var onApproved: ((GAInboxRecord, GAResolvedReference?) -> Void)?
-    var onShowBusiness: ((String) -> Void)?
+    var onShowBusiness: ((GAInboxRecord) -> Void)?
     var businessIsBusy: (() -> Bool)?
     private let root: URL, stateURL: URL, markerURL: URL
     private let clock: () -> Date
@@ -184,6 +184,7 @@ private struct GAInboxLedger: Codable { var version = 1; var records: [GAInboxRe
         guard writable, !isBusy, businessIsBusy?() != true, let record = records.first(where: { $0.id == id }), ["received", "approved", "reviewing"].contains(record.phase) else { return }
         isBusy = true
         Task {
+            defer { processNext() }
             do {
                 let package = root.appendingPathComponent("Incoming/" + record.folder)
                 let fd = try GAFile.directory(package)
@@ -229,7 +230,7 @@ private struct GAInboxLedger: Codable { var version = 1; var records: [GAInboxRe
         guard businessIsBusy?() != true, let record = records.first(where: { $0.id == id }), ["received", "approved", "reviewing"].contains(record.phase) else { return }
         outcome(id, status: "cancelled", provenance: ["workflowState": .string("cancelled"), "originalsModifiedByHandoff": .bool(false)])
     }
-    func showBusiness(_ id: String) { if let record = records.first(where: { $0.id == id }) { onShowBusiness?(record.manifest.action) } }
+    func showBusiness(_ id: String) { if let record = records.first(where: { $0.id == id }) { onShowBusiness?(record) } }
     func prepareForTermination() { terminating = true; queue.removeAll() }
     /// Creates a local package only. Transport remains an explicit UI action.
     func prepareResultPackage(_ id: String) throws -> URL {

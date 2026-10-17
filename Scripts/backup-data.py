@@ -27,6 +27,42 @@ DB_FILES = {"monitor.sqlite", "monitor.sqlite-wal", "monitor.sqlite-shm"}
 O_SEARCH = 0x40000000 | os.O_DIRECTORY
 DATALESS = getattr(stat, "SF_DATALESS", 0x40000000)
 UNINSTALL_MARKER = b"GaoJiLing.UninstallJournal.v1\n"
+DUPLICATE_MARKER = b"GaoJiLing.DuplicateJournal.v1\n"
+MISSING_CLEANUP_REASON = "userConfirmedExternalRemoval"
+
+def confirmed_missing_policy(value):
+    """Explicit consent for exact historical Cleanup receipts, never a switch
+    to tolerate unknown or unreadable data. This does not alter their journal.
+    """
+    if value is None: return None
+    if not isinstance(value, dict) or set(value) != {"version", "reason", "receiptIDs"} or type(value["version"]) is not int or value["version"] != 1 or value["reason"] != MISSING_CLEANUP_REASON:
+        raise RuntimeError("已移除清理实物确认文件格式或原因无效")
+    identifiers = value["receiptIDs"]
+    if not isinstance(identifiers, list) or not 0 < len(identifiers) <= 1024:
+        raise RuntimeError("已移除清理实物须提供精确且非空的 UUID 白名单")
+    normalized = []
+    for identifier in identifiers:
+        if not isinstance(identifier, str): raise RuntimeError("已移除清理实物 UUID 无效")
+        try: parsed = str(uuid.UUID(identifier)).upper()
+        except (ValueError, AttributeError): raise RuntimeError("已移除清理实物 UUID 无效") from None
+        if identifier.upper() != parsed or parsed in normalized:
+            raise RuntimeError("已移除清理实物 UUID 不规范或重复")
+        normalized.append(parsed)
+    return {"version": 1, "reason": MISSING_CLEANUP_REASON, "receiptIDs": sorted(normalized)}
+
+def load_confirmed_missing(path):
+    if path is None: return None
+    path = Path(path)
+    info = safe_lstat(path)
+    if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise RuntimeError("清理实物确认文件须属于当前用户且仅本人可读写")
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result: raise RuntimeError("清理实物确认文件含重复字段")
+            result[key] = value
+        return result
+    return confirmed_missing_policy(json.loads(read_regular(path, 64 * 1024), object_pairs_hook=unique_object))
 
 def extended_attributes(fd, output=None):
     # Darwin provides these fd variants; this Python build has no os.*xattr.
@@ -381,12 +417,164 @@ def validated_receipt_shape(receipt, uninstall):
         if footprint["identity"]["kind"] != stat.S_IFDIR or receipt["parentIdentity"]["kind"] != stat.S_IFDIR or receipt["parentIdentity"]["device"] != footprint["identity"]["device"]:
             raise RuntimeError("卸载原父目录身份无效")
 
+def observed_location(path):
+    info = optional_stat(path)
+    if info is None: return {"path": str(path), "exists": False}
+    return {"path": str(path), "exists": True, "device": info.st_dev, "inode": info.st_ino,
+            "uid": info.st_uid, "gid": info.st_gid, "mode": info.st_mode, "linkCount": info.st_nlink,
+            "byteCount": info.st_size, "allocatedBytes": info.st_blocks * 512,
+            "mtimeNanoseconds": info.st_mtime_ns, "ctimeNanoseconds": info.st_ctime_ns,
+            "flags": info.st_flags}
+
+def duplicate_directory_identity(value):
+    if not isinstance(value, dict) or set(value) != {"device", "inode", "uid"} or any(type(value[key]) is not int for key in value):
+        raise RuntimeError("重复文件目录身份格式无效")
+    if not -(2 ** 31) <= value["device"] < 2 ** 31 or not 0 < value["inode"] < 2 ** 64 or value["uid"] != os.getuid():
+        raise RuntimeError("重复文件目录身份或归属无效")
+
+def duplicate_file_identity(value):
+    unsigned = {"inode", "uid", "mode", "linkCount", "byteCount", "allocatedBytes"}
+    signed = {"mtimeSeconds", "ctimeSeconds"}
+    nano = {"mtimeNanoseconds", "ctimeNanoseconds"}
+    keys = unsigned | signed | nano | {"device"}
+    if not isinstance(value, dict) or set(value) != keys or any(type(value[key]) is not int for key in keys):
+        raise RuntimeError("重复文件实物身份结构无效")
+    if any(not 0 <= value[key] < 2 ** 64 for key in unsigned) or any(not -(2 ** 63) <= value[key] < 2 ** 63 for key in signed) or any(not 0 <= value[key] < 1_000_000_000 for key in nano):
+        raise RuntimeError("重复文件实物身份数值无效")
+    if not -(2 ** 31) <= value["device"] < 2 ** 31 or value["uid"] != os.getuid() or not 0 < value["inode"] or value["mode"] >= 2 ** 32 or stat.S_IFMT(value["mode"]) != stat.S_IFREG or not value["mode"] & stat.S_IRUSR or value["linkCount"] != 1:
+        raise RuntimeError("重复文件实物不是本用户独立普通文件")
+
+def duplicate_path(value):
+    path = absolute_path(value)
+    if len(value.encode()) > 4096 or any(part in ("", ".", "..") for part in value.split("/")[1:]):
+        raise RuntimeError("重复文件恢复路径不规范或超过上限")
+    return path
+
+def duplicate_original_allowed(path, scope, home):
+    """Mirror DuplicateFileSafety.movableReason; keep this whitelist narrow.
+    This is validation of a recorded receipt, not permission to move a path.
+    """
+    path, scope = duplicate_path(path), duplicate_path(scope)
+    if path == scope or not path.is_relative_to(scope) or scope == Path("/"):
+        raise RuntimeError("重复文件原路径不在本人确认范围")
+    roots = ("/System", "/Library", "/Applications", "/usr", "/bin", "/sbin", "/dev", "/private/var", "/opt")
+    if any(path == Path(root) or path.is_relative_to(root) for root in roots):
+        raise RuntimeError("受保护系统路径不能作为重复文件恢复原件")
+    parts = [part.lower() for part in path.parts]
+    if any(part in {"gaoseries", "搞app", "library", ".trash", ".git", ".svn"} or part.startswith("com.gaoseries.") for part in parts):
+        raise RuntimeError("应用资料、搞系列或版本库不能作为重复文件恢复原件")
+    packages = {"app", "bundle", "framework", "photoslibrary", "photolibrary", "musiclibrary", "pvm", "vmwarevm", "vmbundle", "sparsebundle", "sparseimage", "band"}
+    if any(Path(part).suffix.removeprefix(".") in packages for part in parts):
+        raise RuntimeError("应用包、资料库或虚拟机不能作为重复文件恢复原件")
+    ext = path.suffix.lower().removeprefix(".")
+    documents = {"txt", "md", "rtf", "rtfd", "doc", "docx", "odt", "pages", "pdf", "xls", "xlsx", "ods", "numbers", "csv", "tsv", "ppt", "pptx", "odp", "key", "tex", "bib", "ris", "enw", "nbib", "psd", "ai", "sketch", "fig", "xcodeproj", "xcworkspace"}
+    if ext in documents | {"sqlite", "sqlite3", "db", "db3", "keychain", "keychain-db", "wal", "shm"} or path.name.lower().endswith(("-wal", "-shm")):
+        raise RuntimeError("文稿、工程、业务库或凭据不能作为重复文件恢复原件")
+    if any(path == home / name or path.is_relative_to(home / name) for name in ("Documents", "Downloads", "Desktop")):
+        raise RuntimeError("个人文稿、下载或桌面不能作为重复文件恢复原件")
+    return path
+
+def duplicate_info_matches(info, identity):
+    return (info.st_dev == identity["device"] and info.st_ino == identity["inode"] and info.st_uid == identity["uid"] and
+            info.st_mode == identity["mode"] and info.st_nlink == identity["linkCount"] and info.st_size == identity["byteCount"] and
+            info.st_blocks * 512 == identity["allocatedBytes"] and
+            info.st_mtime_ns == identity["mtimeSeconds"] * 1_000_000_000 + identity["mtimeNanoseconds"])
+
+def duplicate_recovery_objects(source, home):
+    ledger = validated_state(source, "Duplicates/journal.json", "version", "Duplicates.initialized", DUPLICATE_MARKER,
+                             maximum=32 * 1024 * 1024)
+    journal_root = source / "Duplicates"
+    stage_root = home / "Library/Caches/.GaoJiLing-DuplicateStage"
+    if ledger is None:
+        for root in (journal_root, stage_root):
+            if optional_stat(root) is not None:
+                with directory_fd(root, read=True) as fd:
+                    if os.listdir(fd): raise RuntimeError("重复文件记录缺失但存在未归档资料或暂存实物")
+        return {}
+    if set(ledger) != {"version", "batches"} or not isinstance(ledger["batches"], list) or len(ledger["batches"]) > 1024:
+        raise RuntimeError("重复文件恢复记录结构或上限无效")
+    objects, receipt_ids, batch_ids = {}, set(), set()
+    count = 0
+    for batch in ledger["batches"]:
+        if not isinstance(batch, dict) or set(batch) != {"id", "date", "scope", "scopeIdentity", "receipts"}:
+            raise RuntimeError("重复文件恢复批次格式无效")
+        batch_id = str(uuid.UUID(batch["id"])).upper()
+        if batch_id in batch_ids: raise RuntimeError("重复文件恢复批次 UUID 重复")
+        batch_ids.add(batch_id)
+        if type(batch["date"]) not in (int, float) or not math.isfinite(batch["date"]): raise RuntimeError("重复文件恢复日期无效")
+        scope = duplicate_path(batch["scope"])
+        duplicate_directory_identity(batch["scopeIdentity"])
+        if not isinstance(batch["receipts"], list): raise RuntimeError("重复文件恢复项目格式无效")
+        item_ids = set()
+        for receipt in batch["receipts"]:
+            count += 1
+            required = {"id", "itemID", "original", "keeper", "stage", "identity", "sha256", "parentIdentity", "state"}
+            if count > 10_000 or not isinstance(receipt, dict) or set(receipt) not in (required, required | {"trash"}):
+                raise RuntimeError("重复文件恢复项目结构或上限无效")
+            identifier = str(uuid.UUID(receipt["id"])).upper()
+            if identifier in receipt_ids: raise RuntimeError("重复文件恢复项目 UUID 重复")
+            receipt_ids.add(identifier)
+            item = receipt["itemID"]
+            if not isinstance(item, str) or not 0 < len(item.encode()) <= 256 or item in item_ids: raise RuntimeError("重复文件项目标识无效")
+            item_ids.add(item)
+            original = duplicate_original_allowed(receipt["original"], str(scope), home)
+            keeper = duplicate_path(receipt["keeper"])
+            if original == keeper or keeper == scope or not keeper.is_relative_to(scope):
+                raise RuntimeError("重复文件保留项不在确认范围")
+            duplicate_file_identity(receipt["identity"]); duplicate_directory_identity(receipt["parentIdentity"])
+            identity = receipt["identity"]
+            if identity["device"] != batch["scopeIdentity"]["device"] or identity["device"] != receipt["parentIdentity"]["device"]:
+                raise RuntimeError("重复文件恢复记录含跨卷身份")
+            if not isinstance(receipt["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", receipt["sha256"]): raise RuntimeError("重复文件完整摘要无效")
+            name = "GaoJiLing-Duplicate-" + identifier
+            stage = absolute_path(receipt["stage"])
+            if stage != stage_root / name: raise RuntimeError("重复文件暂存路径无效")
+            paths = [stage]
+            if receipt.get("trash") is not None:
+                trash = absolute_path(receipt["trash"])
+                # This engine only moves within the home volume, so its current
+                # native user Trash is exactly HOME/.Trash. Do not list Trash.
+                if trash.parent != home / ".Trash" or not trash.name.startswith(name): raise RuntimeError("重复文件废纸篓路径无效")
+                paths.append(trash)
+            if receipt["state"] not in {"prepared", "staged", "trashing", "trashed", "restored", "untouched"}: raise RuntimeError("重复文件恢复状态无效")
+            if receipt["state"] in {"restored", "untouched"}: continue
+            matches = []
+            for path in paths:
+                info = optional_stat(path)
+                if info is None: continue
+                if not duplicate_info_matches(info, identity): raise RuntimeError("重复文件恢复实物身份或内容元数据改变")
+                matches.append((path, info))
+            if not matches:
+                info = optional_stat(original)
+                if info is not None and (info.st_dev, info.st_ino, info.st_uid) == (identity["device"], identity["inode"], identity["uid"]):
+                    if not duplicate_info_matches(info, identity): raise RuntimeError("重复文件原处实物元数据改变")
+                    matches.append((original, info))
+            if len(matches) != 1: raise RuntimeError("重复文件待恢复实物缺失或存在多个位置；未标记备份完成")
+            path, info = matches[0]
+            if info.st_dev != safe_lstat(home).st_dev: raise RuntimeError("重复文件实物与用户暂存区跨卷")
+            tree = tree_manifest(path)
+            if tree[""]["sha256"] != receipt["sha256"] or signature(safe_lstat(path)) != signature(info):
+                raise RuntimeError("重复文件恢复实物完整摘要不符或在核验中改变")
+            if str(path) in objects: raise RuntimeError("多个重复文件恢复回执指向同一实物")
+            objects[str(path)] = {"format": 2, "module": "Duplicates", "allowLinks": False,
+                                  "identity": {"device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid}, "tree": tree}
+    if optional_stat(stage_root) is not None:
+        with directory_fd(stage_root, read=True) as fd:
+            names = os.listdir(fd)
+            known = {"GaoJiLing-Duplicate-" + identifier for identifier in receipt_ids}
+            if len(names) > 10_000 or any(name not in known for name in names):
+                raise RuntimeError("重复文件私有暂存区含未知实物；未忽略或删除")
+    return objects
+
 @no_materialization
-def recovery_objects(source, home):
+def recovery_objects(source, home, confirmed_missing_cleanup=None, missing_cleanup=None):
     """Every pending receipt must resolve to an identity-checked entity.
     Missing data is a blocking error, never an empty successful backup.
     """
     source, home = Path(source), Path(home)
+    policy = confirmed_missing_policy(confirmed_missing_cleanup)
+    allowed_missing = set(policy["receiptIDs"]) if policy else set()
+    observed_missing = []
     objects = {}
     storage = validated_state(source, "Storage/analysis-state.json", "version", "Storage.initialized", b"GaoJiLing.StorageAnalysis.1\n")
     if storage is not None: storage_state(storage)
@@ -464,7 +652,13 @@ def recovery_objects(source, home):
                     if info is not None and (info.st_dev, info.st_ino, info.st_uid) == (identity["device"], identity["inode"], expected_uid):
                         matches.append((original, info))
                 if not matches:
-                    if module == "Cleanup":
+                    if module == "Cleanup" and identifier in allowed_missing:
+                        observed_missing.append({"module": "Cleanup", "reason": MISSING_CLEANUP_REASON,
+                            "recoverable": False, "batchID": batch_id, "batch": {key: value for key, value in batch.items() if key != "receipts"},
+                            "receiptID": identifier, "receipt": receipt,
+                            "journalSHA256": file_digest(source / "Cleanup/journal.json"),
+                            "expectedIdentity": dict(identity, uid=expected_uid),
+                            "locations": [observed_location(path) for path in paths + [original]]})
                         continue
                     raise RuntimeError("待恢复实物缺失或原路径冲突；请先在应用内恢复/核对 Finder 废纸篓，未标记备份完成")
                 if len(matches) != 1: raise RuntimeError("恢复实物出现多个位置，停止升级")
@@ -475,6 +669,12 @@ def recovery_objects(source, home):
                 if info.st_dev != safe_lstat(home).st_dev: raise RuntimeError("恢复项目不在当前用户暂存区所在卷")
                 objects[str(path)] = {"format": 2, "allowLinks": allow_links, "identity": {"device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid},
                                       "tree": tree_manifest(path, allow_links=allow_links)}
+    if {item["receiptID"] for item in observed_missing} != allowed_missing:
+        raise RuntimeError("清理实物确认白名单与实际缺失记录不完全一致，停止升级")
+    additional = duplicate_recovery_objects(source, home)
+    if objects.keys() & additional.keys(): raise RuntimeError("不同恢复模块指向同一实物")
+    objects.update(additional)
+    if missing_cleanup is not None: missing_cleanup.extend(sorted(observed_missing, key=lambda item: item["receiptID"]))
     return objects
 
 def sqlite_snapshot(source, destination):
@@ -496,12 +696,14 @@ def sqlite_snapshot(source, destination):
         finally: os.close(fd)
 
 @no_materialization
-def make_backup(source, destination, preferences, home=None):
+def make_backup(source, destination, preferences, home=None, confirmed_missing_cleanup=None):
     started_at = time.time()
     plistlib.loads(preferences)
     baseline = records(source)
     before = manifest(source, exclude=DB_FILES)
-    recovery = recovery_objects(source, home or Path.home())
+    policy = confirmed_missing_policy(confirmed_missing_cleanup)
+    missing_cleanup = []
+    recovery = recovery_objects(source, home or Path.home(), policy, missing_cleanup)
     destination.mkdir(mode=0o700, parents=True, exist_ok=False)
     data_tree = tree_manifest(source, exclude=DB_FILES)
     copied_tree = tree_manifest(source, copy_to=destination / "Data", exclude=DB_FILES)
@@ -517,22 +719,29 @@ def make_backup(source, destination, preferences, home=None):
         copied = tree_manifest(path, allow_links=content["allowLinks"], copy_to=target)
         if copied != content["tree"] or tree_manifest(path, allow_links=content["allowLinks"]) != content["tree"] or tree_manifest(target, allow_links=content["allowLinks"]) != content["tree"]:
             raise RuntimeError("清理恢复实物备份校验失败，停止安装")
-    if manifest(source, exclude=DB_FILES) != before or recovery_objects(source, home or Path.home()) != recovery:
+    checked_missing = []
+    checked_recovery = recovery_objects(source, home or Path.home(), policy, checked_missing)
+    if manifest(source, exclude=DB_FILES) != before or checked_recovery != recovery or checked_missing != missing_cleanup:
         raise RuntimeError("资料或恢复记录在备份期间变化，停止安装")
     (destination / "preferences.plist").write_bytes(preferences)
-    (destination / "baseline.json").write_text(json.dumps({"data": baseline, "files": before, "recovery": recovery, "startedAt": started_at}, ensure_ascii=False))
+    (destination / "baseline.json").write_text(json.dumps({"data": baseline, "files": before, "recovery": recovery, "startedAt": started_at,
+        "confirmedMissingCleanup": policy, "missingCleanup": missing_cleanup}, ensure_ascii=False))
     for path in destination.iterdir():
         if path.is_file():
             path.chmod(0o600)
-    (destination / "VERIFIED").write_text("Complete data, attachments, database integrity and preferences verified.\n")
+    (destination / "VERIFIED").write_text("Existing data, attachments, database integrity, preferences and present recovery objects verified.\n" +
+        "User-confirmed externally removed Cleanup receipts: " + str(len(missing_cleanup)) + "; original journals and missing-object details retained; these objects are not recoverable from this backup.\n")
     (destination / "VERIFIED").chmod(0o600)
-    return destination
+    return destination, missing_cleanup
 
 @no_materialization
-def verify_update(backup, source, preferences):
+def verify_update(backup, source, preferences, home=None, confirmed_missing_cleanup=None):
     if not (backup / "VERIFIED").is_file():
         raise RuntimeError("未找到已核验备份，停止清理旧程序")
     old = json.loads((backup / "baseline.json").read_text())
+    policy = confirmed_missing_policy(confirmed_missing_cleanup)
+    if confirmed_missing_policy(old.get("confirmedMissingCleanup")) != policy:
+        raise RuntimeError("须显式提供与此备份一致的清理实物移除确认白名单")
     current = records(source)
     baseline = old["data"]
     if current["schema"] != baseline["schema"] or current["retention"] != baseline["retention"]:
@@ -574,24 +783,37 @@ def verify_update(backup, source, preferences):
             info = safe_lstat(Path(name)); identity = content["identity"]
             valid = (info.st_dev, info.st_ino, info.st_uid) == (identity["device"], identity["inode"], identity["uid"])
             valid = valid and tree_manifest(Path(name), allow_links=content["allowLinks"]) == content["tree"]
+            copied = backup / "RecoveryObjects" / hashlib.sha256(name.encode()).hexdigest()
+            valid = valid and tree_manifest(copied, allow_links=content["allowLinks"]) == content["tree"]
         else: valid = object_manifest(Path(name)) == content  # pre-V1.10 backups
         if not valid:
             raise RuntimeError("原清理恢复实物未通过保留核验")
+    observed_missing = []
+    observed_recovery = recovery_objects(source, home or Path.home(), policy, observed_missing)
+    if observed_missing != old.get("missingCleanup", []):
+        raise RuntimeError("用户确认外部移除的原记录、身份或位置状态改变，停止升级核验")
+    for name, content in old.get("recovery", {}).items():
+        if content.get("format") == 2 and observed_recovery.get(name) != content:
+            raise RuntimeError("原待恢复记录与精确实物状态不一致")
     previous = plistlib.loads((backup / "preferences.plist").read_bytes())
     current_defaults = plistlib.loads(preferences)
     for key, value in previous.items():
         if key.startswith("GaoJiLing.EdgeHandle.") and current_defaults.get(key) != value:
             raise RuntimeError("原唤起条设置未通过保留核验")
+    return observed_missing
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--from-version")
     parser.add_argument("--to-version")
     parser.add_argument("--verify", type=Path)
+    parser.add_argument("--confirmed-missing-cleanup", type=Path,
+        help="本人明确确认已外部移除的历史 Cleanup receipt UUID 私有 JSON；其他缺失仍停止")
     args = parser.parse_args()
+    policy = load_confirmed_missing(args.confirmed_missing_cleanup)
     if args.verify:
-        verify_update(args.verify, DATA, defaults())
-        print("PASS: 原资料、全部附件、历史、任务、设置与数据库完整性核验通过；安全备份保留。")
+        missing = verify_update(args.verify, DATA, defaults(), confirmed_missing_cleanup=policy)
+        print("PASS: 原现存资料、全部附件、历史、任务、设置与数据库完整性核验通过；安全备份保留。本人确认外部移除且不可恢复的历史清理项目：" + str(len(missing)) + "。")
     else:
         if subprocess.run(["pgrep", "-x", "GaoJiLing"], stdout=subprocess.DEVNULL).returncode == 0:
             raise RuntimeError("请先正常退出搞机灵，再建立稳定备份")
@@ -603,7 +825,7 @@ def main():
         if BACKUPS.is_symlink():
             raise RuntimeError("备份目录不能是符号链接")
         name = "V" + args.from_version + "-before-V" + args.to_version + "-" + time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
-        target = make_backup(DATA, BACKUPS / name, defaults())
+        target, missing = make_backup(DATA, BACKUPS / name, defaults(), confirmed_missing_cleanup=policy)
         print(str(target))
 
 if __name__ == "__main__":

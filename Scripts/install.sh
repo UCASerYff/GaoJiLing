@@ -9,7 +9,20 @@ OLD_APP="/Applications/.GaoJiLing-previous.app"
 IDENTIFIER='com.gaoseries.GaoJiLing'
 UPGRADE_BACKUP=''
 DEFER_CLEANUP=false
-[[ "${1:-}" != '--defer-cleanup' ]] || DEFER_CLEANUP=true
+RUN_SMOKE=false
+BACKUP_EXTRA=()
+while (( $# )); do
+  case "$1" in
+    --defer-cleanup) DEFER_CLEANUP=true ;;
+    --smoke-test) RUN_SMOKE=true ;;
+    --no-launch) RUN_SMOKE=false; DEFER_CLEANUP=true ;;
+    --confirmed-missing-cleanup)
+      (( $# >= 2 )) || { print -u2 '缺少本人确认的旧清理记录清单路径'; exit 1; }
+      BACKUP_EXTRA=(--confirmed-missing-cleanup "$2"); shift ;;
+    *) print -u2 '参数仅支持 --no-launch、--defer-cleanup、--confirmed-missing-cleanup 路径或本人明确要求的 --smoke-test'; exit 1 ;;
+  esac
+  shift
+done
 LSREGISTER='/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
 MOUNT="$(mktemp -d /private/tmp/gaojiling-install.XXXXXX)"
 trap 'hdiutil detach -quiet "$MOUNT" 2>/dev/null || true; rmdir "$MOUNT" 2>/dev/null || true' EXIT
@@ -36,7 +49,7 @@ if pgrep -x GaoJiLing >/dev/null; then print -u2 '旧程序仍在退出，请稍
 if [[ -e "$DESTINATION" || -d "$HOME/Library/Application Support/GaoSeries/GaoJiLing" ]]; then
   PREVIOUS_VERSION="$APP_VERSION"
   [[ ! -e "$DESTINATION" ]] || PREVIOUS_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$DESTINATION/Contents/Info.plist")"
-  UPGRADE_BACKUP="$(python3 "$PROJECT_DIR/Scripts/backup-data.py" --from-version "$PREVIOUS_VERSION" --to-version "$APP_VERSION")"
+  UPGRADE_BACKUP="$(python3 "$PROJECT_DIR/Scripts/backup-data.py" --from-version "$PREVIOUS_VERSION" --to-version "$APP_VERSION" "${BACKUP_EXTRA[@]}")"
   [[ -f "$UPGRADE_BACKUP/VERIFIED" ]] || { print -u2 '安全备份未通过核验，未替换旧程序'; exit 1; }
   print "已核验并保留更新前安全备份：$UPGRADE_BACKUP"
 fi
@@ -47,9 +60,24 @@ rollback() {
   for ATTEMPT in {1..20}; do pgrep -x GaoJiLing >/dev/null || break; sleep 0.2; done
   if pgrep -x GaoJiLing >/dev/null; then print -u2 '程序仍在退出，旧程序与安全备份均保留，请勿删除'; return 1; fi
   rm -rf "$DESTINATION"
-  if [[ -e "$OLD_APP" ]]; then mv "$OLD_APP" "$DESTINATION"; [[ "${1:-}" == '--keep-stopped' ]] || open "$DESTINATION"; fi
+  if [[ -e "$OLD_APP" ]]; then
+    mv "$OLD_APP" "$DESTINATION"
+    if $RUN_SMOKE && [[ "${1:-}" != '--keep-stopped' ]]; then open "$DESTINATION"; fi
+  fi
 }
 if ! validate "$DESTINATION"; then rollback; exit 1; fi
+if ! $RUN_SMOKE; then
+  if [[ -n "$UPGRADE_BACKUP" ]] && ! python3 "$PROJECT_DIR/Scripts/backup-data.py" --verify "$UPGRADE_BACKUP" "${BACKUP_EXTRA[@]}"; then
+    rollback --keep-stopped; exit 1
+  fi
+  if [[ -x "$LSREGISTER" ]]; then
+    [[ ! -e "$OLD_APP" ]] || "$LSREGISTER" -u "$OLD_APP" >/dev/null 2>&1 || true
+    "$LSREGISTER" -f "$DESTINATION" >/dev/null 2>&1 || true
+  fi
+  print "搞机灵 V$APP_VERSION 已安装，签名与原资料保留核验通过；未自动启动或运行冒烟。"
+  print '旧程序与旧安装包保留，待本人完成主要业务验收后再精确清理。'
+  exit 0
+fi
 if ! open "$DESTINATION"; then
   print -u2 '新版启动请求失败，恢复上一版。'
   rollback
@@ -61,7 +89,7 @@ if ! pgrep -x GaoJiLing >/dev/null; then
   rollback
   exit 1
 fi
-if [[ -n "$UPGRADE_BACKUP" ]] && ! python3 "$PROJECT_DIR/Scripts/backup-data.py" --verify "$UPGRADE_BACKUP"; then
+if [[ -n "$UPGRADE_BACKUP" ]] && ! python3 "$PROJECT_DIR/Scripts/backup-data.py" --verify "$UPGRADE_BACKUP" "${BACKUP_EXTRA[@]}"; then
   print -u2 '升级后资料核验失败，恢复旧程序；原资料与安全备份保留。'
   rollback --keep-stopped
   exit 1

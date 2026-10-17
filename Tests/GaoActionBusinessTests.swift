@@ -43,10 +43,11 @@ private final class MoveBoundary: @unchecked Sendable {
 @MainActor private final class BusinessFixture {
     let home: URL, data: URL, boundary = MoveBoundary()
     let cleanup: CleanupController, analysis: StorageAnalysisController, manager: AppManagementController
+    let duplicates: DuplicateAnalysisController
     var exchange: GAExchangeController
     var coordinator: GABusinessCoordinator!
     var externalBusy = false
-    var navigations: [String] = []
+    var navigations: [GAInboxRecord] = []
     private var sequence = 100
     static let bundle = "com.example.gabusinessfixture"
     init() throws {
@@ -60,6 +61,8 @@ private final class MoveBoundary: @unchecked Sendable {
             appIsRunning: { _ in false }, trash: { try boundary.trash($0, home: home) }, ownerLookup: { $0 == bundle || $0 == bundle + ".second" })
         cleanup = CleanupController(engine: cleanupEngine)
         analysis = StorageAnalysisController(dataDirectory: data)
+        duplicates = DuplicateAnalysisController(analyzer: DuplicateAnalyzer(), recovery: DuplicateRecovery(home: home,
+            journalDirectory: data.appendingPathComponent("Duplicates"), trash: { try boundary.trash($0, home: home) }))
         manager = AppManagementController(engine: UninstallEngine(home: home, journalDirectory: data.appendingPathComponent("Uninstall"),
             applicationRoots: [home.appendingPathComponent("Applications")], appIsRunning: { _ in false }, trash: { try boundary.trash($0, home: home) }))
         exchange = GAExchangeController(dataDirectory: data, clock: { GAFixtures.clock })
@@ -67,7 +70,7 @@ private final class MoveBoundary: @unchecked Sendable {
         try check(exchange.writable, "Private exchange fixture must initialize")
     }
     func bind() {
-        coordinator = GABusinessCoordinator(exchange: exchange, cleanup: cleanup, analysis: analysis, manager: manager,
+        coordinator = GABusinessCoordinator(exchange: exchange, cleanup: cleanup, analysis: analysis, manager: manager, duplicates: duplicates,
             externallyBusy: { [weak self] in self?.externalBusy ?? true }, navigate: { [weak self] in self?.navigations.append($0) })
     }
     func restartExchange() {
@@ -76,12 +79,12 @@ private final class MoveBoundary: @unchecked Sendable {
         bind()
     }
     func close() async {
-        boundary.resume(); cleanup.cancel(); analysis.cancel(); manager.cancel(); exchange.prepareForTermination()
+        boundary.resume(); cleanup.cancel(); analysis.cancel(); duplicates.cancel(); manager.cancel(); exchange.prepareForTermination()
         try? await settle()
         try? FileManager.default.removeItem(at: home)
     }
     func settle() async throws {
-        try await until("All private controllers must settle") { !self.exchange.isBusy && !self.cleanup.isBusy && !self.analysis.isBusy && !self.manager.isBusy }
+        try await until("All private controllers must settle") { !self.exchange.isBusy && !self.cleanup.isBusy && !self.analysis.isBusy && !self.duplicates.isBusy && !self.manager.isBusy }
     }
     func until(_ reason: String, _ condition: () -> Bool) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(15))
@@ -109,9 +112,10 @@ private final class MoveBoundary: @unchecked Sendable {
         try GAFixtures.put(try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0), at: app.appendingPathComponent("Contents/Info.plist"))
         return app
     }
-    func request(_ action: String, reference: URL? = nil) async throws -> (String, URL) {
+    func request(_ action: String, reference: URL? = nil, parameters: [String: GAValue] = [:]) async throws -> (String, URL) {
         sequence += 1
         var request = GAFixtures.request(sequence, action: action)
+        request.parameters = parameters
         if let reference {
             var ref = try GAFixtures.reference(reference, kind: action == "storage.inspect" ? "directory" : "application")
             ref.displayName = reference.lastPathComponent
@@ -154,7 +158,12 @@ private final class MoveBoundary: @unchecked Sendable {
             try await run("storage completion starting another request cannot cross-wire results", storageCorrelation)
             try await run("relaunch of an executing request never replays its engine", interruptedRestart)
             try await run("application disappearing after approval reports failed review without moving files", failedReview)
-            print("PASS: 10 GaoAction business integration groups; production coordinators/controllers/engines, synthetic private fixtures only")
+            try await run("duplicate content handoff stays pending until separate local content consent", duplicates)
+            try await run("duplicate durable execution gate blocks content scan", duplicateGate)
+            try await run("duplicate changed scope fails with honest result and no file movement", duplicateChangedScope)
+            try await run("handoff navigation retains the approved record when picker selection changes", navigationAssociation)
+            try await run("local selection cannot replace the approved reference identity", localSelectionAssociation)
+            print("PASS: 15 GaoAction business integration groups; production coordinators/controllers/engines, synthetic private fixtures only")
         } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
     }
     @MainActor private static func storage(_ f: BusinessFixture) async throws {
@@ -318,5 +327,64 @@ private final class MoveBoundary: @unchecked Sendable {
         try await f.approve(id)
         try check(try f.record(id).outcome == "failed" && f.manager.plan == nil && f.boundary.callCount == 0,
                   "A failed asynchronous review must not remain awaitingUser or claim an uninstall")
+    }
+    @MainActor private static func duplicates(_ f: BusinessFixture) async throws {
+        let scope = try f.scope("content-scope")
+        try GAFixtures.put(Data(repeating: 7, count: 4096), at: scope.appendingPathComponent("second.bin"))
+        let (id, _) = try await f.request("storage.inspect", reference: scope, parameters: ["mode": .string("duplicates")])
+        try await f.approve(id)
+        try check(try f.record(id).outcome == "pending" && f.record(id).phase == "approved" && f.duplicates.operationID == nil,
+                  "External approval must only prepare the content scope")
+        try check(!f.duplicates.scanPreparedDirectory(contentReadConfirmed: false) && f.duplicates.operationID == nil, "No content read without explicit local consent")
+        try check(f.duplicates.scanPreparedDirectory(contentReadConfirmed: true), "Locally confirmed content scan starts")
+        try await f.settle()
+        let record = try f.record(id)
+        try check(record.outcome == "completed" && record.provenance["mode"] == .string("duplicates") && record.provenance["complete"] == .bool(true), "Only real complete content scan completes handoff")
+        guard case .object(let statistics) = record.provenance["statistics"] else { throw BusinessFailure(description: "Missing duplicate statistics") }
+        try check(statistics["duplicateGroups"] == .integer(1) && statistics["duplicateFiles"] == .integer(1) && f.duplicates.result?.groups.count == 1,
+                  "Duplicate statistics must come from actual complete matches")
+        try check(f.boundary.callCount == 0 && f.exists(scope.appendingPathComponent("fixture.bin")) && f.exists(scope.appendingPathComponent("second.bin")),
+                  "Storage handoff cannot move any original or preselect a removal")
+        let package = try f.exchange.prepareResultPackage(id)
+        let manifest = try GaoActionV1.validate(Data(contentsOf: package.appendingPathComponent("manifest.json")), target: GAFixtures.source, now: GAFixtures.clock)
+        try check(manifest.inReplyTo == id && manifest.status == "completed" && manifest.items.isEmpty && manifest.references.isEmpty, "Actual result is correlated and contains no private path report")
+    }
+    @MainActor private static func duplicateGate(_ f: BusinessFixture) async throws {
+        let scope = try f.scope("scope"), (id, _) = try await f.request("storage.inspect", reference: scope, parameters: ["mode": .string("duplicates")])
+        try await f.approve(id); try f.breakLedger()
+        try check(!f.duplicates.scanPreparedDirectory(contentReadConfirmed: true), "Durable executing failure stops content read")
+        try check(!f.exchange.writable && f.duplicates.operationID == nil && f.boundary.callCount == 0, "Failed journal gate cannot create a scan or movement")
+    }
+    @MainActor private static func duplicateChangedScope(_ f: BusinessFixture) async throws {
+        let scope = try f.scope("scope"), (id, _) = try await f.request("storage.inspect", reference: scope, parameters: ["mode": .string("duplicates")])
+        try await f.approve(id)
+        try FileManager.default.moveItem(at: scope, to: f.home.appendingPathComponent("original-scope"))
+        _ = try f.scope("scope")
+        try check(f.duplicates.scanPreparedDirectory(contentReadConfirmed: true), "Controller records an attempt before the engine identity check")
+        try await f.settle()
+        try check(try f.record(id).outcome == "failed" && f.record(id).provenance["complete"] == .bool(false) && f.boundary.callCount == 0,
+                  "Replaced scope cannot be scanned using an old approval")
+    }
+    @MainActor private static func navigationAssociation(_ f: BusinessFixture) async throws {
+        let first = try f.scope("first"), second = try f.scope("second")
+        let (firstID, _) = try await f.request("storage.inspect", reference: first, parameters: ["mode": .string("duplicates")])
+        let (secondID, _) = try await f.request("storage.inspect", reference: second)
+        f.exchange.approve(firstID); f.exchange.selectedID = secondID
+        try await f.settle()
+        try check(f.navigations.last?.id == firstID && f.navigations.last?.manifest.parameters["mode"] == .string("duplicates"),
+                  "Asynchronous approval must navigate using the approved record, never a mutable picker selection")
+        f.exchange.showBusiness(firstID)
+        try check(f.navigations.last?.id == firstID, "Show business by ID must retain that same record")
+    }
+    @MainActor private static func localSelectionAssociation(_ f: BusinessFixture) async throws {
+        let scope = try f.scope("scope"), (id, _) = try await f.request("storage.inspect", reference: scope, parameters: ["mode": .string("duplicates")])
+        try await f.approve(id)
+        try FileManager.default.moveItem(at: scope, to: f.home.appendingPathComponent("old-scope"))
+        _ = try f.scope("scope")
+        try check(f.duplicates.prepareDirectory(scope), "A new local selection is independent context")
+        try check(f.duplicates.scanPreparedDirectory(contentReadConfirmed: true), "Explicit local content consent may start its own scan")
+        try await f.settle()
+        try check(try f.record(id).outcome == "cancelled" && f.record(id).provenance["statistics"] == nil && f.duplicates.completion == .completed,
+                  "Replacement local scan must not complete the old external request")
     }
 }

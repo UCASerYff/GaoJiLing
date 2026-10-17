@@ -20,7 +20,8 @@ def resources(version, original_info):
         raise ValueError("Info.plist 的应用标识或版本与构建输入不一致")
     actions = []
     for action, kind in [("storage.inspect", "directory"), ("cleanup.review", None), ("apps.uninstall.review", "application")]:
-        properties = {"mode": {"type": "string", "enum": ["metadata"], "default": "metadata"}} if action == "storage.inspect" else {}
+        properties = {"mode": {"type": "string", "enum": ["metadata", "duplicates"], "default": "metadata",
+                              "description": "duplicates 仅预填范围；须本人另行确认本机内容读取，不自动移动文件"}} if action == "storage.inspect" else {}
         actions.append({
             "action": action,
             "parametersSchema": {"type": "object", "properties": properties, "required": [], "additionalProperties": False},

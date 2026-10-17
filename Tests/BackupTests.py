@@ -40,11 +40,61 @@ class BackupTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def make(self):
-        return backup.make_backup(self.data, self.target, self.preferences, home=self.root)
+    def make(self, confirmed=None):
+        return backup.make_backup(self.data, self.target, self.preferences, home=self.root, confirmed_missing_cleanup=confirmed)
 
-    def verify(self):
-        backup.verify_update(self.target, self.data, self.preferences)
+    def verify(self, confirmed=None):
+        return backup.verify_update(self.target, self.data, self.preferences, home=self.root, confirmed_missing_cleanup=confirmed)
+
+    def write_private(self, path, value):
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_text(json.dumps(value)); path.chmod(0o600)
+
+    def cleanup_fixture(self, missing=True, identifier=None):
+        identifier = identifier or str(uuid.uuid4()).upper()
+        stage = self.root / "Library/Caches/.GaoJiLing-CleanupStage" / ("GaoJiLing-" + identifier)
+        stage.parent.mkdir(parents=True, exist_ok=True)
+        stage.write_bytes(b"synthetic pending log")
+        info = stage.stat()
+        receipt = {"id": identifier, "itemID": str(uuid.uuid4()), "state": "staged", "stage": str(stage),
+            "original": str(self.root / "Library/Logs/com.example.backup/old.log.1"), "owner": "com.example.backup", "category": "旧轮转日志",
+            "footprint": {"identity": {"device": info.st_dev, "inode": info.st_ino, "kind": 32768}, "digest": "a" * 64,
+                          "bytes": info.st_blocks * 512, "newest": info.st_mtime, "entries": 1}}
+        ledger = {"version": 1, "batches": [{"id": str(uuid.uuid4()), "receipts": [receipt]}]}
+        self.write_private(self.data / "Cleanup/journal.json", ledger)
+        if missing: stage.unlink()
+        policy = {"version": 1, "reason": "userConfirmedExternalRemoval", "receiptIDs": [identifier]}
+        return stage, receipt, ledger, policy
+
+    def duplicate_fixture(self, location="trash"):
+        scope = self.root / "Samples"
+        scope.mkdir()
+        original, keeper = scope / "candidate.bin", scope / "keeper.bin"
+        original.write_bytes(b"exact duplicate fixture" * 40); keeper.write_bytes(original.read_bytes())
+        info = original.stat(); parent = scope.stat()
+        def directory_identity(value): return {"device": value.st_dev, "inode": value.st_ino, "uid": value.st_uid}
+        identity = {"device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid, "mode": info.st_mode,
+            "linkCount": info.st_nlink, "byteCount": info.st_size, "allocatedBytes": info.st_blocks * 512,
+            "mtimeSeconds": info.st_mtime_ns // 1_000_000_000, "mtimeNanoseconds": info.st_mtime_ns % 1_000_000_000,
+            "ctimeSeconds": info.st_ctime_ns // 1_000_000_000, "ctimeNanoseconds": info.st_ctime_ns % 1_000_000_000}
+        identifier = str(uuid.uuid4()).upper()
+        stage = self.root / "Library/Caches/.GaoJiLing-DuplicateStage" / ("GaoJiLing-Duplicate-" + identifier)
+        trash = self.root / ".Trash" / stage.name
+        receipt = {"id": identifier, "itemID": "synthetic-file-identity", "original": str(original), "keeper": str(keeper),
+            "stage": str(stage), "identity": identity, "sha256": hashlib.sha256(original.read_bytes()).hexdigest(),
+            "parentIdentity": directory_identity(parent), "state": "prepared"}
+        actual = original
+        if location in ("stage", "trash"):
+            actual = stage if location == "stage" else trash
+            actual.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            original.rename(actual); receipt["state"] = "staged" if location == "stage" else "trashed"
+            if location == "trash": receipt["trash"] = str(trash)
+        ledger = {"version": 1, "batches": [{"id": str(uuid.uuid4()), "date": self.now - 978307200,
+            "scope": str(scope), "scopeIdentity": directory_identity(parent), "receipts": [receipt]}]}
+        self.write_private(self.data / "Duplicates/journal.json", ledger)
+        marker = self.data / "Duplicates.initialized"
+        marker.write_bytes(backup.DUPLICATE_MARKER); marker.chmod(0o600)
+        return actual, receipt, ledger
 
     def test_full_backup_integrity_and_new_observations(self):
         self.make()
@@ -210,6 +260,24 @@ class BackupTests(unittest.TestCase):
         with self.assertRaises(RuntimeError): self.make()
         self.assertFalse(self.target.exists())
 
+    def test_missing_cleanup_entity_also_blocks_upgrade(self):
+        identifier = str(uuid.uuid4()).upper()
+        stage = self.root / "Library/Caches/.GaoJiLing-CleanupStage" / ("GaoJiLing-" + identifier)
+        stage.parent.mkdir(parents=True)
+        stage.write_bytes(b"synthetic pending log")
+        info = stage.stat()
+        (self.data / "Cleanup").mkdir()
+        journal = {"version": 1, "batches": [{"id": str(uuid.uuid4()), "receipts": [{"id": identifier,
+            "itemID": str(uuid.uuid4()), "state": "staged", "stage": str(stage),
+            "original": str(self.root / "Library/Logs/com.example.backup/old.log.1"), "owner": "com.example.backup", "category": "旧轮转日志",
+            "footprint": {"identity": {"device": info.st_dev, "inode": info.st_ino, "kind": 32768}, "digest": "a" * 64,
+                          "bytes": info.st_blocks * 512, "newest": info.st_mtime, "entries": 1}}]}]}
+        (self.data / "Cleanup/journal.json").write_text(json.dumps(journal))
+        (self.data / "Cleanup/journal.json").chmod(0o600)
+        stage.unlink()
+        with self.assertRaises(RuntimeError): self.make()
+        self.assertFalse(self.target.exists())
+
     def test_initialized_uninstall_missing_journal_blocks_upgrade(self):
         _, _, _ = self.uninstall_fixture()
         (self.data / "Uninstall/journal.json").unlink()
@@ -319,6 +387,268 @@ class BackupTests(unittest.TestCase):
         with patch.object(backup.os, "write", side_effect=OSError(errno.ENOSPC, "synthetic full disk")):
             with self.assertRaises(OSError): self.make()
         self.assertFalse((self.target / "VERIFIED").exists())
+
+    def test_exact_confirmed_cleanup_missing_is_retained_as_unrecoverable(self):
+        _, receipt, _, policy = self.cleanup_fixture()
+        journal = (self.data / "Cleanup/journal.json").read_bytes()
+        destination, missing = self.make(policy)
+        self.assertEqual(destination, self.target)
+        self.assertEqual(len(missing), 1)
+        self.assertFalse(missing[0]["recoverable"])
+        self.assertEqual(missing[0]["receipt"], receipt)
+        self.assertEqual(missing[0]["expectedIdentity"]["inode"], receipt["footprint"]["identity"]["inode"])
+        self.assertTrue(all(not item["exists"] for item in missing[0]["locations"]))
+        baseline = json.loads((self.target / "baseline.json").read_text())
+        self.assertEqual(baseline["missingCleanup"], missing)
+        self.assertEqual((self.target / "Data/Cleanup/journal.json").read_bytes(), journal)
+        self.assertEqual((self.data / "Cleanup/journal.json").read_bytes(), journal)
+        self.assertIn("externally removed Cleanup receipts: 1", (self.target / "VERIFIED").read_text())
+        self.assertEqual(self.verify(policy), missing)
+        with self.assertRaises(RuntimeError): self.verify()
+
+    def test_confirmation_requires_exact_missing_receipt_set(self):
+        stage, _, _, policy = self.cleanup_fixture()
+        unknown = dict(policy, receiptIDs=[str(uuid.uuid4()).upper()])
+        extra = dict(policy, receiptIDs=policy["receiptIDs"] + [str(uuid.uuid4()).upper()])
+        for altered in (unknown, extra):
+            with self.subTest(kind=altered):
+                with self.assertRaises(RuntimeError): self.make(altered)
+                self.assertFalse(self.target.exists())
+        # A confirmation cannot convert a replacement at the exact stage path
+        # into a missing original, even if it contains identical bytes.
+        stage.write_bytes(b"synthetic pending log")
+        with self.assertRaises(RuntimeError): self.make(policy)
+        self.assertFalse(self.target.exists())
+
+    def test_confirmation_schema_and_private_file_are_strict(self):
+        _, _, _, policy = self.cleanup_fixture()
+        path = self.root / "consent.json"
+        self.write_private(path, policy)
+        self.assertEqual(backup.load_confirmed_missing(path), backup.confirmed_missing_policy(policy))
+        malformed = [dict(policy, version=True), dict(policy, version=2), dict(policy, reason="ignore"),
+            dict(policy, receiptIDs=[]), dict(policy, receiptIDs=["not-a-uuid"]),
+            dict(policy, receiptIDs=policy["receiptIDs"] * 2), dict(policy, extra=True)]
+        for value in malformed:
+            self.write_private(path, value)
+            with self.assertRaises(RuntimeError): backup.load_confirmed_missing(path)
+        self.write_private(path, policy); path.chmod(0o644)
+        with self.assertRaises(RuntimeError): backup.load_confirmed_missing(path)
+        path.chmod(0o600)
+        alias = self.root / "consent-link.json"; alias.symlink_to(path)
+        with self.assertRaises(RuntimeError): backup.load_confirmed_missing(alias)
+        path.write_text('{"version":1,"version":1,"reason":"userConfirmedExternalRemoval","receiptIDs":[]}')
+        with self.assertRaises(RuntimeError): backup.load_confirmed_missing(path)
+
+    def test_confirmation_does_not_allow_other_modules_or_new_missing(self):
+        _, _, ledger, policy = self.cleanup_fixture()
+        trash, _, _ = self.uninstall_fixture(linked=False)
+        backup.shutil.rmtree(trash)
+        with self.assertRaises(RuntimeError): self.make(policy)
+        self.assertFalse(self.target.exists())
+        backup.shutil.rmtree(self.data / "Uninstall"); (self.data / "Uninstall.initialized").unlink()
+        another = dict(ledger["batches"][0]["receipts"][0])
+        another["id"] = str(uuid.uuid4()).upper(); another["itemID"] = str(uuid.uuid4())
+        another["stage"] = str(self.root / "Library/Caches/.GaoJiLing-CleanupStage" / ("GaoJiLing-" + another["id"]))
+        ledger["batches"][0]["receipts"].append(another)
+        self.write_private(self.data / "Cleanup/journal.json", ledger)
+        with self.assertRaises(RuntimeError): self.make(policy)
+        self.assertFalse(self.target.exists())
+
+    def test_missing_confirmation_never_adopts_new_original_object(self):
+        _, receipt, _, policy = self.cleanup_fixture()
+        original = Path(receipt["original"])
+        original.parent.mkdir(parents=True); original.write_bytes(b"new unrelated original")
+        _, missing = self.make(policy)
+        observation = next(item for item in missing[0]["locations"] if item["path"] == str(original))
+        self.assertTrue(observation["exists"])
+        self.assertNotEqual(observation["inode"], receipt["footprint"]["identity"]["inode"])
+        self.assertFalse((self.target / "RecoveryObjects").exists())
+        self.verify(policy)
+        original.write_bytes(b"changed unrelated original")
+        with self.assertRaises(RuntimeError): self.verify(policy)
+
+    def test_missing_receipt_or_location_change_after_backup_blocks_verify(self):
+        stage, _, ledger, policy = self.cleanup_fixture()
+        self.make(policy)
+        ledger["batches"][0]["receipts"][0]["state"] = "restored"
+        self.write_private(self.data / "Cleanup/journal.json", ledger)
+        with self.assertRaises(RuntimeError): self.verify(policy)
+        ledger["batches"][0]["receipts"][0]["state"] = "staged"
+        self.write_private(self.data / "Cleanup/journal.json", ledger)
+        stage.write_bytes(b"new unrelated stage")
+        with self.assertRaises(RuntimeError): self.verify(policy)
+
+    def test_missing_location_change_during_copy_never_marks_verified(self):
+        _, receipt, _, policy = self.cleanup_fixture()
+        original = Path(receipt["original"])
+        walk = backup.tree_manifest
+        def copy_and_change(*args, **kwargs):
+            result = walk(*args, **kwargs)
+            if kwargs.get("copy_to") == self.target / "Data":
+                original.parent.mkdir(parents=True); original.write_bytes(b"new object")
+            return result
+        with patch.object(backup, "tree_manifest", side_effect=copy_and_change):
+            with self.assertRaises(RuntimeError): self.make(policy)
+        self.assertFalse((self.target / "VERIFIED").exists())
+
+    def test_duplicate_recovery_file_and_marker_are_copied_verified(self):
+        actual, receipt, _ = self.duplicate_fixture()
+        journal = (self.data / "Duplicates/journal.json").read_bytes()
+        _, missing = self.make()
+        self.assertEqual(missing, [])
+        copied = next((self.target / "RecoveryObjects").iterdir())
+        self.assertEqual(hashlib.sha256(copied.read_bytes()).hexdigest(), receipt["sha256"])
+        self.assertEqual((self.target / "Data/Duplicates.initialized").read_bytes(), backup.DUPLICATE_MARKER)
+        self.assertEqual((self.target / "Data/Duplicates/journal.json").read_bytes(), journal)
+        self.verify()
+        copied.write_bytes(b"backup corrupted")
+        with self.assertRaises(RuntimeError): self.verify()
+        self.assertTrue(actual.exists())
+
+    def test_duplicate_prepared_original_is_backed_without_moving_it(self):
+        actual, _, _ = self.duplicate_fixture(location="original")
+        identity = actual.stat().st_ino
+        self.make(); self.verify()
+        self.assertEqual(actual.stat().st_ino, identity)
+        self.assertEqual(len(list((self.target / "RecoveryObjects").iterdir())), 1)
+
+    def test_duplicate_missing_entity_and_orphan_stage_block_backup(self):
+        actual, _, _ = self.duplicate_fixture(location="stage")
+        contents = actual.read_bytes(); actual.unlink()
+        with self.assertRaises(RuntimeError): self.make()
+        self.assertFalse(self.target.exists())
+        actual.write_bytes(contents)
+        (self.data / "Duplicates/journal.json").unlink()
+        with self.assertRaises(RuntimeError): self.make()
+        (self.data / "Duplicates.initialized").unlink()
+        with self.assertRaises(RuntimeError): self.make()
+        self.assertFalse(self.target.exists())
+
+    def test_duplicate_marker_bad_future_and_incomplete_schema_fail_closed(self):
+        _, _, ledger = self.duplicate_fixture()
+        path, marker = self.data / "Duplicates/journal.json", self.data / "Duplicates.initialized"
+        for value in (dict(ledger, version=2), dict(ledger, unexpected=True), {"version": 1}, {"version": True, "batches": []}):
+            self.write_private(path, value)
+            with self.assertRaises(RuntimeError): self.make()
+        self.write_private(path, ledger)
+        marker.write_bytes(b"wrong marker")
+        with self.assertRaises(RuntimeError): self.make()
+        marker.write_bytes(backup.DUPLICATE_MARKER); marker.chmod(0o644)
+        with self.assertRaises(RuntimeError): self.make()
+        marker.chmod(0o600); path.unlink()
+        with self.assertRaises(RuntimeError): self.make()
+        self.assertFalse(self.target.exists())
+
+    def test_duplicate_receipt_paths_types_and_identity_are_strict(self):
+        _, receipt, ledger = self.duplicate_fixture()
+        path = self.data / "Duplicates/journal.json"
+        original = json.loads(json.dumps(receipt))
+        changes = [dict(original, original=str(self.root / "outside.bin")),
+            dict(original, keeper=str(self.root / "outside-keeper.bin")),
+            dict(original, keeper="/" + original["keeper"]),
+            dict(original, stage=str(self.root / "wrong-stage")),
+            dict(original, trash=str(self.root / ".Trash/not-a-receipt")),
+            dict(original, state="unknown"), dict(original, sha256="a" * 63),
+            dict(original, identity=dict(original["identity"], linkCount=2)),
+            dict(original, identity=dict(original["identity"], uid=os.getuid() + 1)),
+            dict(original, identity=dict(original["identity"], mode=16384)),
+            dict(original, identity=dict(original["identity"], mtimeNanoseconds=1_000_000_000)),
+            dict(original, parentIdentity=dict(original["parentIdentity"], uid=os.getuid() + 1)),
+            dict(original, extra=True)]
+        for changed in changes:
+            ledger["batches"][0]["receipts"] = [changed]; self.write_private(path, ledger)
+            with self.assertRaises(RuntimeError): self.make()
+            self.assertFalse(self.target.exists())
+
+    def test_duplicate_protected_document_database_and_app_paths_block(self):
+        _, receipt, ledger = self.duplicate_fixture()
+        scope = Path(ledger["batches"][0]["scope"])
+        for protected in (scope / "notes.txt", scope / "data.sqlite", scope / "Foo.app/file.bin", scope / ".git/data.bin",
+                          scope / "Library/data.bin", scope / "GaoSeries/data.bin", scope / "搞app/data.bin",
+                          self.root / "Documents/data.bin", self.root / "Desktop/data.bin", self.root / "Downloads/data.bin"):
+            receipt["original"] = str(protected)
+            ledger["batches"][0]["scope"] = str(self.root)
+            self.write_private(self.data / "Duplicates/journal.json", ledger)
+            with self.assertRaises(RuntimeError): self.make()
+        self.assertFalse(self.target.exists())
+
+    def test_duplicate_replacement_hardlink_and_metadata_change_block(self):
+        actual, _, _ = self.duplicate_fixture(location="stage")
+        moved = actual.with_name("moved-away")
+        actual.rename(moved); actual.write_bytes(moved.read_bytes())
+        with self.assertRaises(RuntimeError): self.make()
+        actual.unlink(); moved.rename(actual)
+        hardlink = self.root / "hardlink"; os.link(actual, hardlink)
+        with self.assertRaises(RuntimeError): self.make()
+        hardlink.unlink()
+        actual.chmod(0o400)
+        with self.assertRaises(RuntimeError): self.make()
+        self.assertFalse(self.target.exists())
+
+    def test_duplicate_same_inode_same_metadata_wrong_content_is_rejected(self):
+        actual, receipt, _ = self.duplicate_fixture(location="stage")
+        before = actual.stat()
+        with actual.open("r+b") as output: output.write(b"x")
+        os.utime(actual, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(actual.stat().st_ino, receipt["identity"]["inode"])
+        self.assertEqual(actual.stat().st_size, receipt["identity"]["byteCount"])
+        with self.assertRaises(RuntimeError): self.make()
+        self.assertFalse(self.target.exists())
+
+    def test_duplicate_cloud_cross_volume_and_linked_parent_are_rejected(self):
+        actual, receipt, ledger = self.duplicate_fixture(location="stage")
+        real_stat = backup.os.stat
+        class CloudInfo:
+            st_flags = backup.DATALESS
+        def cloud_stat(name, *args, **kwargs):
+            if str(name) == actual.name: return CloudInfo()
+            return real_stat(name, *args, **kwargs)
+        with patch.object(backup.os, "stat", side_effect=cloud_stat):
+            with self.assertRaises(RuntimeError): self.make()
+        fake_device = receipt["identity"]["device"] + 1
+        receipt["identity"]["device"] = fake_device
+        receipt["parentIdentity"]["device"] = fake_device
+        ledger["batches"][0]["scopeIdentity"]["device"] = fake_device
+        self.write_private(self.data / "Duplicates/journal.json", ledger)
+        with self.assertRaises(RuntimeError): self.make()
+        receipt["identity"]["device"] -= 1; receipt["parentIdentity"]["device"] -= 1; ledger["batches"][0]["scopeIdentity"]["device"] -= 1
+        self.write_private(self.data / "Duplicates/journal.json", ledger)
+        real = actual.parent.with_name("real-stage")
+        actual.parent.rename(real); actual.parent.symlink_to(real)
+        with self.assertRaises(RuntimeError): self.make()
+        self.assertFalse(self.target.exists())
+
+    def test_duplicate_record_changes_and_new_missing_after_backup_block_verify(self):
+        actual, receipt, ledger = self.duplicate_fixture()
+        self.make(); self.verify()
+        actual.unlink()
+        with self.assertRaises((RuntimeError, FileNotFoundError)): self.verify()
+        receipt["state"] = "restored"
+        self.write_private(self.data / "Duplicates/journal.json", ledger)
+        with self.assertRaises(RuntimeError): self.verify()
+
+    def test_cleanup_confirmation_never_exempts_duplicate_missing_entity(self):
+        actual, duplicate, _ = self.duplicate_fixture()
+        _, _, _, policy = self.cleanup_fixture(identifier=duplicate["id"])
+        actual.unlink()
+        with self.assertRaises(RuntimeError): self.make(policy)
+        self.assertFalse(self.target.exists())
+
+    def test_duplicate_completed_records_preserve_journal_without_claiming_recovery(self):
+        actual, receipt, ledger = self.duplicate_fixture()
+        actual.unlink(); receipt["state"] = "restored"
+        self.write_private(self.data / "Duplicates/journal.json", ledger)
+        self.make(); self.verify()
+        self.assertFalse((self.target / "RecoveryObjects").exists())
+        self.assertEqual(json.loads((self.target / "Data/Duplicates/journal.json").read_text()), ledger)
+
+    def test_duplicate_unknown_stage_entity_is_preserved_and_blocks_backup(self):
+        actual, _, _ = self.duplicate_fixture(location="stage")
+        orphan = actual.with_name("GaoJiLing-Duplicate-" + str(uuid.uuid4()).upper())
+        orphan.write_bytes(b"unarchived object")
+        with self.assertRaises(RuntimeError): self.make()
+        self.assertEqual(orphan.read_bytes(), b"unarchived object")
+        self.assertFalse(self.target.exists())
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 export CLANG_MODULE_CACHE_PATH="$TEST_TEMP/module-cache"
 export PYTHONDONTWRITEBYTECODE=1
+# A stale caller environment must never start applications or move real files.
+# GUI/native acceptance is a separate, explicitly requested manual operation.
+unset GJL_RUN_APP_EXIT_PROTOTYPE GJL_RUN_UNINSTALL_NATIVE GJL_REQUIRE_LIVE
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 cd "$PROJECT_DIR"
 # Keep Swift assertions enabled; several regression executables use assert.
@@ -16,6 +19,7 @@ HEADER=(-import-objc-header Sources/NativeMetrics.h)
 METRICS=(Sources/Models.swift Sources/MetricsCollector.swift Sources/Sensors.swift)
 STORAGE=(Sources/StorageAnalysis.swift Sources/StorageTree.swift)
 UNINSTALL=(Sources/UninstallFileSafety.swift Sources/UninstallEngine.swift)
+DUPLICATES=(Sources/DuplicateAnalysis.swift Sources/DuplicateRecovery.swift Sources/DuplicateAnalysisController.swift)
 MAINTENANCE=(Sources/Models.swift Sources/AppExitRules.swift Sources/BatteryCapabilities.swift Sources/MaintenanceMetricsState.swift)
 TEST_SUITES=0
 
@@ -51,6 +55,9 @@ run_swift_test StorageTreeTests "${STORAGE[@]}" -framework AppKit
 run_swift_test FloatingGeometryTests Sources/FloatingGeometry.swift
 run_swift_test PanelInteractionTests Sources/PanelInteraction.swift
 run_swift_test SamplingDemandTests Sources/SamplingDemand.swift
+run_swift_test DuplicateAnalysisTests Sources/DuplicateAnalysis.swift
+run_swift_test DuplicateRecoveryTests Sources/DuplicateAnalysis.swift Sources/DuplicateRecovery.swift Sources/UninstallFileSafety.swift -framework AppKit
+run_swift_test DuplicateAnalysisControllerTests "${DUPLICATES[@]}" Sources/UninstallFileSafety.swift -framework AppKit
 "${SWIFT[@]}" Sources/Models.swift Sources/Storage.swift Tests/StoreTests.swift -lsqlite3 -o "$TEST_TEMP/StoreTests"
 "$TEST_TEMP/StoreTests" "$TEST_TEMP/databases"
 ((++TEST_SUITES))
@@ -59,6 +66,7 @@ run_swift_test ExportTests Sources/Models.swift Sources/DataExport.swift
 run_swift_test UninstallEngineTests "${UNINSTALL[@]}" -framework AppKit
 # This test supplies its own native process symbol. Do not link NativeMetrics.o.
 run_swift_test UninstallControllerTests "${HEADER[@]}" "${UNINSTALL[@]}" Sources/AppManagementController.swift -framework AppKit
+run_swift_test UninstallNativeTests "${UNINSTALL[@]}" -framework AppKit
 "${SWIFT[@]}" Sources/GaoActionV1.swift Tests/GaoActionTests.swift -framework Security -o "$TEST_TEMP/GaoActionTests"
 "$TEST_TEMP/GaoActionTests" "$TEST_TEMP/gaoaction-fixtures"
 ((++TEST_SUITES))
@@ -70,6 +78,7 @@ run_swift_test GaoActionBusinessTests "${HEADER[@]}" \
   Sources/GaoActionV1.swift Sources/GaoActionExchange.swift Sources/GaoActionBusiness.swift \
   Sources/CleanupEngine.swift Sources/CleanupController.swift "${UNINSTALL[@]}" Sources/AppManagementController.swift \
   "${STORAGE[@]}" Sources/StorageAnalysisController.swift Sources/MemoryMaintenance.swift Sources/Models.swift Sources/DataExport.swift \
+  "${DUPLICATES[@]}" \
   Tests/GaoActionFixtures.swift -framework AppKit -framework Security
 
 run_swift_test MemoryMaintenanceTests "${NATIVE[@]}" Sources/MemoryMaintenance.swift

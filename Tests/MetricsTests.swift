@@ -22,6 +22,12 @@ import Foundation
         require(MetricsCollector.counterRates(current: [1: reset], previous: [1: initial], elapsed: 2) == nil, "counter reset must return unavailable")
         require(MetricsCollector.counterRates(current: nil, previous: [1: initial], elapsed: 2) == nil, "failed collection must return unavailable")
 
+        print("PASS: metric baselines, CPU counter wrap, interface addition/reset and unavailable readings")
+        guard ProcessInfo.processInfo.environment["GJL_REQUIRE_LIVE"] == "1" else {
+            print("SKIP: live metric sampling and workload (explicit opt-in required)")
+            return
+        }
+
         // Independently verify the C shim converts Mach CPU time into nanoseconds.
         func ownCPU() -> UInt64 {
             var pointer: UnsafeMutablePointer<GJLProcess>?

@@ -7,17 +7,22 @@ import Darwin
     private let cleanup: CleanupController
     private let analysis: StorageAnalysisController
     private let manager: AppManagementController
-    private let navigate: (String) -> Void
+    private let duplicates: DuplicateAnalysisController?
+    private let navigate: (GAInboxRecord) -> Void
     private let externallyBusy: () -> Bool
     private var cleanupReview: String?
     private var cleanupOperations: [UUID: String] = [:]
     private var uninstallReview: (id: String, reference: GAResolvedReference)?
     private var uninstallOperations: [String: String] = [:]
     private var storageOperation: (id: String, operationID: UUID, referenceID: String, displayName: String)?
+    private var duplicateReview: (id: String, referenceID: String, displayName: String, url: URL, identity: DuplicateDirectoryIdentity)?
+    private var duplicateOperation: (id: String, operationID: UUID, referenceID: String, displayName: String)?
 
     init(exchange: GAExchangeController, cleanup: CleanupController, analysis: StorageAnalysisController,
-         manager: AppManagementController, externallyBusy: @escaping () -> Bool, navigate: @escaping (String) -> Void) {
+         manager: AppManagementController, duplicates: DuplicateAnalysisController? = nil,
+         externallyBusy: @escaping () -> Bool, navigate: @escaping (GAInboxRecord) -> Void) {
         self.exchange = exchange; self.cleanup = cleanup; self.analysis = analysis; self.manager = manager
+        self.duplicates = duplicates
         self.externallyBusy = externallyBusy; self.navigate = navigate
         exchange.businessIsBusy = { [weak self] in self?.busy ?? true }
         exchange.onApproved = { [weak self] record, resolved in self?.approved(record, resolved) }
@@ -36,8 +41,22 @@ import Darwin
         analysis.onScanCompleted = { [weak self] id, result, completion in
             self?.finishedStorage(operationID: id, result: result, completion: completion)
         }
+        duplicates?.onBeforeScan = { [weak self] operationID, scope in
+            guard let self, !self.externallyBusy(), !self.cleanup.isBusy, !self.analysis.isBusy, !self.manager.isBusy else { return false }
+            guard let context = self.duplicateReview else { return true }
+            guard self.current(context.id)?.phase == "approved" else { self.duplicateReview = nil; return true }
+            guard scope.path == context.url.path, self.duplicates?.preparedExpectedIdentity == context.identity else {
+                self.abandon(context.id); self.duplicateReview = nil; return true
+            }
+            guard self.exchange.markExecuting(context.id) else { return false }
+            self.duplicateOperation = (context.id, operationID, context.referenceID, context.displayName)
+            return true
+        }
+        duplicates?.onScanCompleted = { [weak self] id, result, completion in
+            self?.finishedDuplicates(operationID: id, result: result, completion: completion)
+        }
     }
-    private var busy: Bool { externallyBusy() || cleanup.isBusy || analysis.isBusy || manager.isBusy }
+    private var busy: Bool { externallyBusy() || cleanup.isBusy || analysis.isBusy || manager.isBusy || duplicates?.isBusy == true }
     private func current(_ id: String) -> GAInboxRecord? { exchange.records.first { $0.id == id } }
     private func finish(_ id: String, _ status: String, _ state: String, _ extra: [String: GAValue] = [:]) {
         var provenance = extra; provenance["workflowState"] = .string(state)
@@ -52,6 +71,17 @@ import Darwin
         switch record.manifest.action {
         case "storage.inspect":
             guard let reference, let device = reference.identity.device, let inode = reference.identity.inode else { finish(record.id, "failed", "failed", ["reason": .string("目录身份未核验")]); return }
+            if record.manifest.parameters["mode"] == .string("duplicates") {
+                guard let duplicates else { finish(record.id, "unsupported", "failed", ["reason": .string("内容分析控制器未接入")]); return }
+                if duplicateReview?.id != record.id { abandon(duplicateReview?.id) }
+                let identity = DuplicateDirectoryIdentity(device: device, inode: inode, uid: reference.ownerUID)
+                guard duplicates.prepareDirectory(reference.url, expectedIdentity: identity) else {
+                    finish(record.id, "failed", "failed", ["reason": .string("所选范围无法进入内容扫描确认")]); return
+                }
+                duplicateReview = (record.id, record.manifest.references[0].id, record.manifest.references[0].displayName, reference.url, identity)
+                navigate(record); return
+            }
+            abandon(duplicateReview?.id); duplicateReview = nil
             guard exchange.markExecuting(record.id) else { return }
             analysis.analyzeDirectory(reference.url, expectedIdentity: StorageDirectoryIdentity(device: device, inode: inode, ownerUID: reference.ownerUID))
             guard let operationID = analysis.operationID else { finish(record.id, "failed", "failed"); return }
@@ -67,10 +97,10 @@ import Darwin
             guard manager.review(appURL: reference.url, expectedBundleID: record.manifest.references.first?.applicationID, expectedIdentity: expected) else { finish(record.id, "failed", "failed"); uninstallReview = nil; return }
         default: finish(record.id, "unsupported", "failed"); return
         }
-        navigate(record.manifest.action)
+        navigate(record)
     }
     private func beforeCleanup(_ operationID: UUID) -> Bool {
-        guard !externallyBusy(), !analysis.isBusy, !manager.isBusy else { return false }
+        guard !externallyBusy(), !analysis.isBusy, !manager.isBusy, duplicates?.isBusy != true else { return false }
         guard let id = cleanupReview else { return true }
         guard let record = current(id), record.phase != "finished" else { cleanupReview = nil; return true }
         guard exchange.markExecuting(id) else { return false }
@@ -88,7 +118,7 @@ import Darwin
         else { finish(id, "partial", report.removedIDs.isEmpty ? "reviewedNoChanges" : "partial", provenance) }
     }
     private func beforeUninstall(_ plan: UninstallPlan) -> Bool {
-        guard !externallyBusy(), !cleanup.isBusy, !analysis.isBusy else { return false }
+        guard !externallyBusy(), !cleanup.isBusy, !analysis.isBusy, duplicates?.isBusy != true else { return false }
         guard let context = uninstallReview else { return true }
         guard current(context.id)?.phase != "finished" else { uninstallReview = nil; return true }
         guard plan.app.path == context.reference.url.path,
@@ -127,6 +157,27 @@ import Darwin
             }
             provenance["statistics"] = .object(statistics)
         } else { provenance["complete"] = .bool(false) }
+        finish(context.id, completion.rawValue, completion.rawValue, provenance)
+    }
+    private func finishedDuplicates(operationID: UUID, result: DuplicateScanResult?, completion: DuplicateScanCompletion) {
+        guard let context = duplicateOperation, context.operationID == operationID else { return }
+        duplicateOperation = nil; duplicateReview = nil
+        var provenance: [String: GAValue] = ["mode": .string("duplicates"), "scope": .object([
+            "referenceID": .string(context.referenceID), "displayName": .string(context.displayName), "kind": .string("directory")])]
+        provenance["complete"] = .bool(result?.complete == true && completion == .completed)
+        if let result {
+            let candidates = result.groups.flatMap { group in group.files.filter { $0.id != group.suggestedKeeperID } }
+            func sum(_ values: [UInt64]) -> Int64 { values.reduce(0) { sum, value in let n = sum.addingReportingOverflow(Int64(clamping: value)); return n.overflow ? Int64.max : n.partialValue } }
+            provenance["statistics"] = .object([
+                "allocatedBytes": .integer(Int64(clamping: result.progress.allocatedBytes)),
+                "logicalBytes": .integer(Int64(clamping: result.progress.logicalBytes)),
+                "files": .integer(Int64(result.progress.uniqueFiles)), "entries": .integer(Int64(result.progress.visitedEntries)),
+                "skippedCount": .integer(Int64(result.progress.skippedEntries)),
+                "duplicateGroups": .integer(Int64(result.groups.count)), "duplicateFiles": .integer(Int64(candidates.count)),
+                "duplicateLogicalBytes": .integer(sum(candidates.map { $0.identity.byteCount })),
+                "duplicateAllocatedBytes": .integer(sum(candidates.map { $0.identity.allocatedBytes })),
+                "contentBytesRead": .integer(Int64(clamping: result.progress.contentBytesRead))])
+        }
         finish(context.id, completion.rawValue, completion.rawValue, provenance)
     }
 }

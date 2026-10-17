@@ -80,6 +80,25 @@ import Darwin
             try GAFixtures.require(controller.records.count == 1 && controller.records[0].digest == digest && controller.status?.contains("内容不同") == true,
                                   "same-ID changed request replaced durable record")
         }
+        for invalidStage in [false, true] {
+            await check(invalidStage ? "failed approval resumes queued receive" : "successful approval resumes queued receive") {
+                let data = try dataDirectory(invalidStage ? "QueuedFailure" : "QueuedApproval")
+                let controller = GAExchangeController(dataDirectory: data, clock: { GAFixtures.clock })
+                var approvals = 0; controller.onApproved = { _, _ in approvals += 1 }
+                controller.receive(duplicate); try await idle(controller)
+                if invalidStage {
+                    let staged = data.appendingPathComponent("Exchange/Incoming/" + controller.records[0].folder + "/manifest.json")
+                    try FileManager.default.removeItem(at: staged)
+                }
+                let queued = GAFixtures.request(invalidStage ? 91 : 90)
+                let package = try GAFixtures.package(.init(name: "queued", manifest: queued), in: sourceRoot, name: invalidStage ? "queued-failure" : "queued-approval")
+                controller.approve(GAFixtures.id(4))
+                controller.receive(package)
+                try await idle(controller)
+                try GAFixtures.require(controller.records.count == 2 && controller.records.contains(where: { $0.id == queued.requestID }) && approvals == (invalidStage ? 0 : 1),
+                                      "A queued package cannot require another receive event to resume after approval")
+            }
+        }
         await check("approved long job survives original envelope expiry") {
             let data = try dataDirectory("LongJob")
             var now = GAFixtures.clock

@@ -320,7 +320,7 @@ enum GaoActionV1 {
         switch m.action {
         case "storage.inspect":
             guard m.items.isEmpty, m.references.count == 1, m.references[0].kind == "directory", Set(m.parameters.keys).isSubset(of: ["mode"]) else { throw GAError.invalid("存储分析只接受一个目录引用") }
-            if let mode = m.parameters["mode"] { guard mode.text == "metadata" else { throw GAError.invalid("本版未提供内容重复扫描", code: "unsupportedMode") } }
+            if let mode = m.parameters["mode"] { guard ["metadata", "duplicates"].contains(mode.text) else { throw GAError.invalid("不支持此存储分析模式", code: "unsupportedMode") } }
         case "cleanup.review":
             guard m.items.isEmpty, m.references.isEmpty, m.parameters.isEmpty else { throw GAError.invalid("缓存复核不能接受任意路径或参数") }
         case "apps.uninstall.review":
@@ -360,7 +360,8 @@ enum GaoActionV1 {
             }
         }
         if action == "storage.inspect" {
-            guard Set(p.keys).isSubset(of: common.union(["scope", "complete", "statistics"])) else { throw GAError.invalid("存储结果含未定义字段") }
+            guard Set(p.keys).isSubset(of: common.union(["scope", "complete", "statistics", "mode"])) else { throw GAError.invalid("存储结果含未定义字段") }
+            if let mode = p["mode"] { guard ["metadata", "duplicates"].contains(mode.text) else { throw GAError.invalid("存储结果模式无效") } }
             if let scope = p["scope"] {
                 guard case .object(let value) = scope, Set(value.keys) == ["referenceID", "displayName", "kind"],
                       let id = value["referenceID"]?.text, !id.isEmpty, id.utf8.count <= 4096,
@@ -372,10 +373,14 @@ enum GaoActionV1 {
             }
             if let statistics = p["statistics"] {
                 guard case .object(let values) = statistics,
-                      Set(values.keys).isSubset(of: ["allocatedBytes", "logicalBytes", "files", "directories", "entries", "skippedCount"]),
+                      Set(values.keys).isSubset(of: ["allocatedBytes", "logicalBytes", "files", "directories", "entries", "skippedCount", "duplicateGroups", "duplicateFiles", "duplicateLogicalBytes", "duplicateAllocatedBytes", "contentBytesRead"]),
                       number("allocatedBytes", in: values) != nil,
                       values.keys.allSatisfy({ number($0, in: values) != nil }), p["scope"] != nil, p["complete"] != nil else {
                     throw GAError.invalid("存储统计必须是实际非负整数，不能携带路径或指令")
+                }
+                let duplicateKeys: Set<String> = ["duplicateGroups", "duplicateFiles", "duplicateLogicalBytes", "duplicateAllocatedBytes", "contentBytesRead"]
+                if p["mode"] == .string("duplicates") || !Set(values.keys).isDisjoint(with: duplicateKeys) {
+                    guard p["mode"] == .string("duplicates"), duplicateKeys.allSatisfy({ number($0, in: values) != nil }) else { throw GAError.invalid("重复分析统计缺少模式或实际计数") }
                 }
             }
             if ["completed", "partial"].contains(status) {

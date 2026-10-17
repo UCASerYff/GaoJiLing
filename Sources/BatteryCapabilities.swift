@@ -13,13 +13,21 @@ struct BatteryCapability: Identifiable, Sendable {
     var capability: BatteryControlCapability
     var detail: String
     var evidenceURL: String
+    static var systemChargeLimitAvailable: Bool {
+        #if arch(arm64)
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        return v.majorVersion > 26 || (v.majorVersion == 26 && v.minorVersion >= 4)
+        #else
+        return false
+        #endif
+    }
     static let current: [Self] = [
         Self(id: "read", title: "电源与电量", capability: .readOnly,
              detail: "公开 IOPowerSources；缺项保持不可用。健康百分比与循环来自已适配的只读 IORegistry 字段。",
              evidenceURL: "https://developer.apple.com/documentation/iokit/1523856-iopscopypowersourceslist"),
         Self(id: "limits", title: "充电上限与低电量阈值", capability: .unsupported,
-             detail: "Battery 官方支持上限控制及低电量提醒。本应用可通知，未提供已验证的充电写入引擎，不能设置硬件上下限。",
-             evidenceURL: "https://aodo365.com/sys-nd/212.html"),
+             detail: "Apple Silicon 配合 macOS 26.4 或更新系统，可由本人在系统电池设置选择 80–100% 充电上限。本应用未取得公开写入或设定读回接口，不代替系统设置，也不把低电量提醒当作硬件下限。",
+             evidenceURL: "https://support.apple.com/en-us/102338"),
         Self(id: "heat", title: "高温暂停充电", capability: .unsupported,
              detail: "仅对实际可读的电池温度发提醒；热状态不是摄氏温度，不会冒充温度或暂停充电。",
              evidenceURL: "https://aodo365.com/battery1.html"),

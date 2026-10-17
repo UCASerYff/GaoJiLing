@@ -112,6 +112,16 @@ struct MaintenanceView: View {
                     Button("允许系统通知") { maintenance.requestNotificationAccess() }.disabled(blocked)
                 }
                 Text("仅通知，不改变充电。电池温度缺失或过期时不触发温度提醒。").font(.caption).foregroundStyle(.secondary)
+                if BatteryCapability.systemChargeLimitAvailable, store.latest.batterySnapshot?.present.value == true {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("此系统版本提供原生充电上限设置，可由你在系统设置中选择。本应用不读取或更改该设定，未确认硬件控制生效。")
+                            .font(.caption).foregroundStyle(.secondary)
+                        HStack {
+                            Button("打开系统电池设置…") { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.battery")!) }
+                            Link("Apple 充电上限说明", destination: URL(string: "https://support.apple.com/en-us/102338")!)
+                        }.font(.caption)
+                    }
+                }
                 ForEach(Array(maintenance.batteryNotices.enumerated()), id: \.offset) { _, notice in Text(notice.title + "：" + notice.detail).font(.caption) }
                 DisclosureGroup("充电控制能力与依据") {
                     ForEach(BatteryCapability.current) { value in

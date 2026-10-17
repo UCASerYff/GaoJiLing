@@ -44,7 +44,7 @@ class CapabilitiesTests(unittest.TestCase):
             self.assertIs(schema["additionalProperties"], False)
             self.assertEqual(schema["required"], [])
             self.assertEqual(set(schema["properties"]), {"mode"} if name == "storage.inspect" else set())
-        self.assertEqual(actions["storage.inspect"]["parametersSchema"]["properties"]["mode"]["enum"], ["metadata"])
+        self.assertEqual(actions["storage.inspect"]["parametersSchema"]["properties"]["mode"]["enum"], ["metadata", "duplicates"])
         self.assertEqual(actions["storage.inspect"]["referencesSchema"]["items"]["properties"]["kind"]["const"], "directory")
         self.assertEqual(actions["apps.uninstall.review"]["referencesSchema"]["items"]["properties"]["kind"]["const"], "application")
         self.assertEqual(actions["cleanup.review"]["referencesSchema"]["maxItems"], 0)

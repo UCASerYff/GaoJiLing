@@ -55,6 +55,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     private var store: MonitorStore!
     private var cleanup: CleanupController!
     private var analysis: StorageAnalysisController!
+    private var duplicates: DuplicateAnalysisController!
     private var manager: AppManagementController!
     private var maintenance: MaintenanceController!
     private var exchange: GAExchangeController!
@@ -95,12 +96,17 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         store = MonitorStore()
         cleanup = CleanupController(dataDirectory: store.dataDirectory)
         analysis = StorageAnalysisController(dataDirectory: store.dataDirectory)
+        duplicates = DuplicateAnalysisController(dataDirectory: store.dataDirectory)
         manager = AppManagementController(dataDirectory: store.dataDirectory)
         maintenance = MaintenanceController(dataDirectory: store.dataDirectory, actionsAllowed: { [weak self] in
             guard let self else { return false }; return !self.operationsBusy && self.store?.isPaused != true && !self.pendingTermination
         })
         exchange = GAExchangeController(dataDirectory: store.dataDirectory)
-        business = GABusinessCoordinator(exchange: exchange, cleanup: cleanup, analysis: analysis, manager: manager,
+        duplicates.actionsAllowed = { [weak self] in
+            guard let self else { return false }
+            return !self.pendingTermination && !self.store.dataBusy && !self.cleanup.isBusy && !self.analysis.isBusy && !self.manager.isBusy && !self.exchange.isBusy
+        }
+        business = GABusinessCoordinator(exchange: exchange, cleanup: cleanup, analysis: analysis, manager: manager, duplicates: duplicates,
             externallyBusy: { [weak self] in self?.store.dataBusy ?? true },
             navigate: { [weak self] action in self?.showBusiness(action) })
         signal(SIGTERM, SIG_IGN)
@@ -115,7 +121,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         window.minSize = NSSize(width: 960, height: 690)
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.contentView = NSHostingView(rootView: DashboardView(store: store, cleanup: cleanup, analysis: analysis, openSettings: { [weak self] in self?.showSettings() }, manager: manager, maintenance: maintenance, exchange: exchange, navigation: dashboardNavigation))
+        window.contentView = NSHostingView(rootView: DashboardView(store: store, cleanup: cleanup, analysis: analysis, openSettings: { [weak self] in self?.showSettings() }, manager: manager, maintenance: maintenance, exchange: exchange, navigation: dashboardNavigation, duplicates: duplicates))
         window.setFrameAutosaveName("GaoJiLing.MainWindow")
         if !window.setFrameUsingName("GaoJiLing.MainWindow") { window.center() }
 
@@ -144,7 +150,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         configurePanelMouseMonitoring()
         store.$latest.sink { [weak self] sample in self?.updateStatus(sample); self?.maintenance.ingest(sample: sample) }.store(in: &subscriptions)
         store.$isPaused.sink { [weak self] _ in DispatchQueue.main.async { self?.updateStatus(self?.store.latest ?? .empty) } }.store(in: &subscriptions)
-        for publisher in [store.$dataBusy.eraseToAnyPublisher(), cleanup.$isBusy.eraseToAnyPublisher(), analysis.$isBusy.eraseToAnyPublisher(), manager.$isBusy.eraseToAnyPublisher(), exchange.$isBusy.eraseToAnyPublisher(), store.$isPaused.eraseToAnyPublisher()] {
+        for publisher in [store.$dataBusy.eraseToAnyPublisher(), cleanup.$isBusy.eraseToAnyPublisher(), analysis.$isBusy.eraseToAnyPublisher(), duplicates.$isBusy.eraseToAnyPublisher(), manager.$isBusy.eraseToAnyPublisher(), exchange.$isBusy.eraseToAnyPublisher(), store.$isPaused.eraseToAnyPublisher()] {
             publisher.sink { [weak self] _ in
                 DispatchQueue.main.async { self?.maintenanceStateChanged() }
             }.store(in: &subscriptions)
@@ -225,15 +231,17 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     func windowDidChangeOcclusionState(_ notification: Notification) { updateSamplingDemand() }
     func applicationDidHide(_ notification: Notification) { updateSamplingDemand() }
     func applicationDidUnhide(_ notification: Notification) { updateSamplingDemand() }
-    private var operationsBusy: Bool { store?.dataBusy == true || cleanup?.isBusy == true || analysis?.isBusy == true || manager?.isBusy == true || exchange?.isBusy == true }
+    private var operationsBusy: Bool { store?.dataBusy == true || cleanup?.isBusy == true || analysis?.isBusy == true || duplicates?.isBusy == true || manager?.isBusy == true || exchange?.isBusy == true }
     private func maintenanceStateChanged() {
         updateSamplingDemand()
         maintenance?.setActionsSuspended(operationsBusy || store?.isPaused == true || pendingTermination)
         guard pendingTermination, !operationsBusy else { return }
         pendingTermination = false; NSApp.reply(toApplicationShouldTerminate: true)
     }
-    private func showBusiness(_ action: String) {
-        switch action { case "storage.inspect": dashboardNavigation.page = .storage
+    private func showBusiness(_ record: GAInboxRecord) {
+        switch record.manifest.action { case "storage.inspect":
+            dashboardNavigation.storageMode = record.manifest.parameters["mode"] == .string("duplicates") ? "duplicates" : "metadata"
+            dashboardNavigation.page = .storage
         case "cleanup.review": dashboardNavigation.page = .cleanup
         case "apps.uninstall.review": dashboardNavigation.page = .appManagement
         default: dashboardNavigation.page = .exchange }
@@ -307,6 +315,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
             pendingTermination = true
             cleanup?.cancel()
             analysis?.cancel()
+            duplicates?.cancel()
             manager?.cancel()
             exchange?.prepareForTermination()
             maintenance?.shutdown()

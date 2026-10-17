@@ -85,11 +85,27 @@ import Darwin
         check("manifest byte limit") {
             try GAFixtures.rejects("manifest larger than 1 MiB") { _ = try GaoActionV1.validate(Data(repeating: 32, count: 1024 * 1024 + 1), now: GAFixtures.clock) }
         }
-        check("unsupported duplicate-content mode and unsafe cleanup parameters") {
+        check("explicit duplicate-content mode and unsafe cleanup parameters") {
             var storage = fixtures[1].manifest; storage.parameters["mode"] = .string("duplicates")
-            try GAFixtures.rejects("duplicates not implemented") { _ = try GaoActionV1.validate(GAFixtures.encode(storage), now: GAFixtures.clock) }
+            let validated = try GaoActionV1.validate(GAFixtures.encode(storage), now: GAFixtures.clock)
+            try GAFixtures.require(validated.parameters["mode"] == .string("duplicates"), "duplicates requests retain explicit content mode")
             var cleanup = GAFixtures.request(40); cleanup.parameters["path"] = .string(scope.path)
             try GAFixtures.rejects("arbitrary cleanup path") { _ = try GaoActionV1.validate(GAFixtures.encode(cleanup), now: GAFixtures.clock) }
+        }
+        check("duplicate result requires actual complete counts and explicit mode") {
+            let counts: [String: GAValue] = ["allocatedBytes": .integer(8192), "duplicateGroups": .integer(1), "duplicateFiles": .integer(1),
+                "duplicateLogicalBytes": .integer(4096), "duplicateAllocatedBytes": .integer(4096), "contentBytesRead": .integer(16384)]
+            let outcome: [String: GAValue] = ["workflowState": .string("completed"), "mode": .string("duplicates"), "complete": .bool(true),
+                "scope": .object(["referenceID": .string("scope"), "displayName": .string("Synthetic"), "kind": .string("directory")]), "statistics": .object(counts)]
+            try GaoActionV1.validateOutcome(action: "storage.inspect", status: "completed", provenance: outcome)
+            for missing in ["duplicateGroups", "contentBytesRead"] {
+                var changed = outcome, statistics = counts; statistics.removeValue(forKey: missing); changed["statistics"] = .object(statistics)
+                try GAFixtures.rejects("missing duplicate count") { try GaoActionV1.validateOutcome(action: "storage.inspect", status: "completed", provenance: changed) }
+            }
+            var wrongMode = outcome; wrongMode["mode"] = .string("metadata")
+            try GAFixtures.rejects("duplicate statistics must retain content mode") { try GaoActionV1.validateOutcome(action: "storage.inspect", status: "completed", provenance: wrongMode) }
+            var negative = outcome, badCounts = counts; badCounts["duplicateFiles"] = .integer(-1); negative["statistics"] = .object(badCounts)
+            try GAFixtures.rejects("negative duplicate count") { try GaoActionV1.validateOutcome(action: "storage.inspect", status: "completed", provenance: negative) }
         }
         for (name, url) in [
             ("https source URL", URL(string: "https://example.invalid" + validDocument.path)!),

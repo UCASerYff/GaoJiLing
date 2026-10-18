@@ -85,6 +85,37 @@ import Darwin
         check("manifest byte limit") {
             try GAFixtures.rejects("manifest larger than 1 MiB") { _ = try GaoActionV1.validate(Data(repeating: 32, count: 1024 * 1024 + 1), now: GAFixtures.clock) }
         }
+        check("legacy result formatting reproduces upward rounding without relaxing future rejection") {
+            var roundedFuture = 0
+            for fraction in [0.0001, 0.00049, 0.00051, 0.0009, 0.00149, 0.00151, 0.12349, 0.12351, 0.99949, 0.99951, 0.9999] {
+                let instant = GAFixtures.clock.addingTimeInterval(fraction)
+                var legacy = GAFixtures.request(50)
+                legacy.createdAt = GaoActionV1.timestamp(instant)
+                legacy.expiresAt = GaoActionV1.timestamp(instant.addingTimeInterval(120))
+                let created = GaoActionV1.date(legacy.createdAt)!
+                if created > instant {
+                    roundedFuture += 1
+                    try GAFixtures.rejects("legacy rounded-up createdAt") {
+                        _ = try GaoActionV1.validate(GAFixtures.encode(legacy), now: instant)
+                    }
+                }
+            }
+            try GAFixtures.require(roundedFuture >= 5, "fixture did not reproduce the legacy fractional clock defect")
+            print("PASS: legacy formatter produced \(roundedFuture) future-created envelopes across 11 clock phases")
+        }
+        check("submillisecond future and overlong TTL remain rejected") {
+            var envelope = GAFixtures.request(51)
+            envelope.createdAt = "2026-10-12T12:00:00.001Z"
+            envelope.expiresAt = "2026-10-12T12:02:00.001Z"
+            try GAFixtures.rejects("createdAt one microsecond ahead") {
+                _ = try GaoActionV1.validate(GAFixtures.encode(envelope), now: GAFixtures.clock.addingTimeInterval(0.000999))
+            }
+            _ = try GaoActionV1.validate(GAFixtures.encode(envelope), now: GAFixtures.clock.addingTimeInterval(0.001))
+            envelope.expiresAt = "2026-10-12T12:02:00.003Z"
+            try GAFixtures.rejects("TTL beyond existing precision tolerance") {
+                _ = try GaoActionV1.validate(GAFixtures.encode(envelope), now: GAFixtures.clock.addingTimeInterval(0.001))
+            }
+        }
         check("explicit duplicate-content mode and unsafe cleanup parameters") {
             var storage = fixtures[1].manifest; storage.parameters["mode"] = .string("duplicates")
             let validated = try GaoActionV1.validate(GAFixtures.encode(storage), now: GAFixtures.clock)

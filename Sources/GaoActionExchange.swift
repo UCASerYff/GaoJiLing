@@ -241,9 +241,13 @@ private struct GAInboxLedger: Codable { var version = 1; var records: [GAInboxRe
         guard record.resultFolders.count < 64 else { throw GAError.invalid("本请求已有 64 份结果副本；已完成请求可清理副本后再生成，未完成或失败副本继续保留") }
         try requireCopyCapacity()
         let now = clock(), id = UUID().uuidString
+        // ISO8601DateFormatter rounds fractions to milliseconds and can put a
+        // fresh createdAt after now. Align only this envelope downward, keeping
+        // its expiry at or before the real now plus 120 seconds.
+        let issuedAt = Date(timeIntervalSince1970: floor(now.timeIntervalSince1970))
         let manifest = GAManifest(kind: "result", requestID: id, sourceBundleID: GaoActionV1.bundleID,
                                   targetBundleID: record.manifest.sourceBundleID, action: record.manifest.action,
-                                  createdAt: GaoActionV1.timestamp(now), expiresAt: GaoActionV1.timestamp(now.addingTimeInterval(120)),
+                                  createdAt: GaoActionV1.timestamp(issuedAt), expiresAt: GaoActionV1.timestamp(issuedAt.addingTimeInterval(120)),
                                   nonce: try GaoActionV1.nonce(), inReplyTo: record.id, status: record.outcome, errorCode: record.errorCode, provenance: record.provenance)
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(manifest)

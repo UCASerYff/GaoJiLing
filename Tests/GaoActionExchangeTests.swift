@@ -69,6 +69,40 @@ import Darwin
             let sourceAfter = try Data(contentsOf: duplicate.appendingPathComponent("manifest.json"))
             try GAFixtures.require(sourceAfter == originalManifest, "original sender package changed")
         }
+        await check("result envelope remains valid across fractional clock and calendar boundaries") {
+            let data = try dataDirectory("ResultClock")
+            var instant = GAFixtures.clock
+            let controller = GAExchangeController(dataDirectory: data, clock: { instant })
+            controller.receive(duplicate); try await idle(controller)
+            controller.approve(GAFixtures.id(4)); try await idle(controller)
+            try GAFixtures.require(controller.markExecuting(GAFixtures.id(4)), "clock fixture did not enter its synthetic operation")
+            controller.outcome(GAFixtures.id(4), status: "completed", provenance: completedCleanup)
+            let offsets: [TimeInterval] = [0, 0.000001, 0.0001, 0.00049, 0.0005, 0.00051, 0.0009,
+                0.00149, 0.0015, 0.00151, 0.1231, 0.12349, 0.12351, 0.49949, 0.49951,
+                0.99849, 0.99851, 0.99949, 0.99951, 0.9999, 0.999999,
+                59.99951, 60.00051, 43199.99951, 86399.99951, 86400.00051,
+                6_955_199.99951, 6_955_200.00051]
+            for offset in offsets {
+                instant = GAFixtures.clock.addingTimeInterval(offset)
+                let package = try controller.prepareResultPackage(GAFixtures.id(4))
+                let bytes = try Data(contentsOf: package.appendingPathComponent("manifest.json"))
+                let result = try GaoActionV1.validate(bytes, target: GAFixtures.source, now: instant)
+                let created = GaoActionV1.date(result.createdAt)!, expires = GaoActionV1.date(result.expiresAt)!
+                try GAFixtures.require(created <= instant && instant.timeIntervalSince(created) < 1,
+                                      "createdAt was future-dated or lost more than subsecond precision")
+                try GAFixtures.require(expires.timeIntervalSince(created) == 120 && expires <= instant.addingTimeInterval(120),
+                                      "result validity was extended beyond its declared or actual 120 seconds")
+                try GAFixtures.require(result.inReplyTo == GAFixtures.id(4) && result.provenance?["receiptID"] == completedCleanup["receiptID"],
+                                      "fractional clock changed business correlation or receipt")
+                try GAFixtures.rejects("future creation remains rejected") {
+                    _ = try GaoActionV1.validate(bytes, target: GAFixtures.source, now: created.addingTimeInterval(-0.0001))
+                }
+                try GAFixtures.rejects("expiry remains exclusive") {
+                    _ = try GaoActionV1.validate(bytes, target: GAFixtures.source, now: expires)
+                }
+            }
+            print("PASS: \(offsets.count) result clock phases, including rounded-up milliseconds, day and year boundaries")
+        }
         await check("same request ID with different contents is rejected") {
             let data = try dataDirectory("DifferentBytes")
             let controller = GAExchangeController(dataDirectory: data, clock: { GAFixtures.clock })

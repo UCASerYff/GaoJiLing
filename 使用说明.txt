@@ -1,15 +1,15 @@
-搞机灵 V1.11（构建 111）
+搞机灵 V1.12（构建 112）
 电脑的小动静，一眼就知道。
 
 支持：Apple Silicon Mac，macOS 14 或更新版本；当前安装包不包含 Intel 版本。
 图标：黑底白字，竖排“机灵”。
 源码：https://github.com/UCASerYff/GaoJiLing
 下载：https://github.com/UCASerYff/GaoJiLing/releases/latest
-本版发布：https://github.com/UCASerYff/GaoJiLing/releases/tag/v1.11
+本版发布：https://github.com/UCASerYff/GaoJiLing/releases/tag/v1.12
 
 安装与更新
 
-从发布页下载 GaoJiLing-1.11.dmg，打开后将“搞机灵.app”拖入“Applications”。发布页同时提供 SHA-256 校验文件。当前公开安装包使用本地 ad-hoc 签名，未作 Apple Developer ID 签名或公证，会受到 Gatekeeper 检查。
+从发布页下载 GaoJiLing-1.12.dmg，打开后将“搞机灵.app”拖入“Applications”。发布页同时提供 SHA-256 校验文件。当前公开安装包使用本地 ad-hoc 签名，未作 Apple Developer ID 签名或公证，会受到 Gatekeeper 检查。
 更新时先退出旧版，再替换应用。应用程序与监控数据分别保存，正常升级会保留历史、任务和设置。手动拖入安装前，可先在设置的“数据”页导出监控备份。
 使用源码中的 Scripts/install.sh 升级时，脚本会在替换旧程序前备份并核验本应用资料目录的全部文件、数据库、目录内附件和偏好设置。私有备份保存在同级 GaoJiLing-Backups 目录，长期保留，不随旧安装包清理，也不会上传 GitHub；资料缺失、无法读取或校验失败会停止替换，安装失败保留旧程序与安全备份。
 
@@ -108,3 +108,6 @@ V1.11 重复内容模式与验收边界
 GaoAction duplicates 请求批准后只预填目录，仍待本人确认内容读取；结果返回真实范围引用、完整性与统计，不默认输出个人路径报告。外部请求不授予删除许可。打开复核页仍为pending，不把测试样例或成功打开窗口当真实业务完成。
 当前系统可由本人在系统电池设置使用原生充电上限；本应用不代写、不确认控制生效。电池/风扇逐项边界、其他机型与安全手机配对方案见 HARDWARE-AND-PAIRING.md。
 默认不运行冒烟或自动打开测试窗口。安装脚本静态安装并核验资料，保留旧程序和安全备份，待本人按人工验收计划验证主要业务后再清理旧版本。未执行的真实操作会在VALIDATION.md明确标未验收。
+
+V1.12 交接结果发送修复
+结果包签发时刻向下对齐，避免毫秒舍入使新包被未来时间校验拒绝；最长120秒有效期和严格校验保持。只为已保存的真实结果建立新信封，不重放业务、不沿用原请求的截止时间。

@@ -1,4 +1,4 @@
-# 搞机灵 V1.11
+# 搞机灵 V1.12
 
 <img src="Assets/AppIcon.png" width="96" alt="搞机灵：黑底白字的机灵图标">
 
@@ -6,7 +6,7 @@
 
 搞机灵是一款原生 macOS 边缘系统监控工具，使用 SwiftUI、AppKit、Mach/IOKit/libproc 和 SQLite。监控记录保存在本机，无第三方运行时，无 AI 和账号。
 
-[下载最新版](https://github.com/UCASerYff/GaoJiLing/releases/latest) · [V1.11 发布页](https://github.com/UCASerYff/GaoJiLing/releases/tag/v1.11) · [使用说明](使用说明.txt) · [验证范围](VALIDATION.md) · [功能覆盖与限制](FEATURE-COVERAGE.md)
+[下载最新版](https://github.com/UCASerYff/GaoJiLing/releases/latest) · [V1.12 发布页](https://github.com/UCASerYff/GaoJiLing/releases/tag/v1.12) · [使用说明](使用说明.txt) · [验证范围](VALIDATION.md) · [功能覆盖与限制](FEATURE-COVERAGE.md)
 
 ## 安装
 
@@ -120,7 +120,7 @@ CPU 与应用 CPU 统一采用全机 0–100% 口径，与活动监视器的单�
     ./Scripts/test.sh
     ./Scripts/build.sh
 
-构建输出为 Release/GaoJiLing-1.11.dmg 及对应的 .sha256 文件。构建使用专属临时目录，并在退出时清理。
+构建输出为 Release/GaoJiLing-1.12.dmg 及对应的 .sha256 文件。构建使用专属临时目录，并在退出时清理。
 
 项目安装脚本默认不自动启动或冒烟，静态核验后保留旧程序等待本人业务验收。运行：
 
@@ -135,6 +135,10 @@ CPU 与应用 CPU 统一采用全机 0–100% 口径，与活动监视器的单�
     python3 Scripts/bump-version.py
 
 每次正式更新版本号准确增加 0.01、构建号增加 1；同一未交付版本的修复和重新构建不递增版本。正式发布均需核对更新前后的历史、任务与设置保留情况，安装替换并验证新版启动，再清理本项目旧应用、旧安装包及中间构建产物，不删除用户数据或安全备份。源码同步 GitHub，DMG 与 SHA-256 校验文件发布到对应版本的 GitHub Release；DMG 不提交到 Git 历史。
+
+## V1.12
+
+版本 1.12，构建 112。修复发送交接结果时，新信封的毫秒舍入可能被严格未来时间校验拒绝的问题。结果签发时刻向下对齐，截止时刻从同一时刻计算；保留未来时间拒绝与最长120秒有效期，不延长请求或放宽接收校验。原数据格式、浮窗与业务结果状态保持不变。
 
 ## V1.11
 

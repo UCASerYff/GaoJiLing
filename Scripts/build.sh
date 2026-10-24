@@ -1,11 +1,28 @@
 #!/bin/zsh
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+export PYTHONDONTWRITEBYTECODE=1
+SAFETY="$PROJECT_DIR/Scripts/release-safety.py"
+APP_ONLY=''
+if (( $# )); then
+  [[ "${1:-}" == '--app-only' && $# == 2 ]] || { print -u2 '使用 build.sh 或 build.sh --app-only .noindex容器/搞机灵.app'; exit 1; }
+  APP_ONLY="$2"
+  python3 "$SAFETY" check-noindex "$APP_ONLY"
+  [[ ! -e "$APP_ONLY" && ! -L "$APP_ONLY" ]] || { print -u2 '目标已存在，请先检查再移除'; exit 1; }
+fi
 APP_VERSION="$(tr -d '\n' < "$PROJECT_DIR/VERSION")"
 if [[ ! "$APP_VERSION" =~ '^[0-9]+\.[0-9]{2}$' ]]; then print -u2 'VERSION 必须为 1.00 格式'; exit 1; fi
 BUILD_NUMBER="${APP_VERSION//./}"
-STAGING="$(mktemp -d /private/tmp/gaojiling-build.XXXXXX)"
-trap 'rm -rf "$STAGING"' EXIT
+STAGING="$(python3 "$SAFETY" workdir --parent /private/tmp --prefix gaojiling-build-)"
+OUTPUT_CREATED=false
+OUTPUT_COMPLETE=false
+cleanup() {
+  local result=$?
+  if $OUTPUT_CREATED && ! $OUTPUT_COMPLETE; then rm -rf "$APP_ONLY"; fi
+  rm -rf "$STAGING"
+  return "$result"
+}
+trap cleanup EXIT
 APP="$STAGING/搞机灵.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 export CLANG_MODULE_CACHE_PATH="$STAGING/cache"
@@ -49,11 +66,14 @@ plutil -lint "$APP/Contents/Info.plist"
 xattr -cr "$APP"
 codesign --force --sign - --identifier com.gaoseries.GaoJiLing "$APP"
 codesign --verify --strict "$APP"
-if [[ "${1:-}" == "--app-only" ]]; then
-  [[ $# == 2 ]] || { print -u2 '使用 --app-only 目标路径'; exit 1; }
-  [[ ! -e "$2" ]] || { print -u2 '目标已存在，请先检查再移除'; exit 1; }
-  ditto "$APP" "$2"
-  print "APP=$2"
+if [[ -n "$APP_ONLY" ]]; then
+  mkdir "$APP_ONLY"
+  OUTPUT_CREATED=true
+  ditto "$APP" "$APP_ONLY"
+  codesign --verify --strict "$APP_ONLY"
+  OUTPUT_COMPLETE=true
+  print "APP=$APP_ONLY"
+  print '展开程序仅供当前步骤使用；使用结束后须精确注销可能的本应用登记并删除此 .noindex 副本。'
   exit 0
 fi
 mkdir -p "$STAGING/disk" "$PROJECT_DIR/Release"

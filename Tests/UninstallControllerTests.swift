@@ -5,6 +5,10 @@ import Darwin
 // controller's unused default lookup still requires the native link symbol.
 @_cdecl("gjl_application_running")
 func uninstallFixtureRunning(_ path: UnsafePointer<CChar>?, _ flag: Int32) -> Int32 { 0 }
+@_cdecl("gjl_application_running_at_locations")
+func uninstallFixtureMovedRunning(_ original: UnsafePointer<CChar>?, _ current: UnsafePointer<CChar>?, _ device: UInt64, _ inode: UInt64, _ uid: UInt32) -> Int32 {
+    fatalError("Injected controller test must not enumerate real processes")
+}
 
 private struct ControllerFailure: Error { let description: String }
 @MainActor private func expect(_ value: @autoclosure () -> Bool, _ message: String) throws {
@@ -25,7 +29,7 @@ private struct ControllerFailure: Error { let description: String }
             try Data("Synthetic, never executable.".utf8).write(to: contents.appendingPathComponent("MacOS/Fixture"))
             let info = ["CFBundleIdentifier": "com.example.controllerfixture", "CFBundleName": "Fixture", "CFBundlePackageType": "APPL", "CFBundleExecutable": "Fixture"]
             try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: contents.appendingPathComponent("Info.plist"))
-            let engine = UninstallEngine(home: root, journalDirectory: root.appendingPathComponent("Data/Uninstall"), applicationRoots: [apps], appIsRunning: { _ in false }, trash: { source in
+            let engine = UninstallEngine(home: root, journalDirectory: root.appendingPathComponent("Data/Uninstall"), applicationRoots: [apps], appIsRunning: { _ in false }, appIsRunningAtLocation: { _, _ in false }, trash: { source in
                 let destination = trash.appendingPathComponent(source.lastPathComponent)
                 try FileManager.default.moveItem(at: source, to: destination)
                 return destination

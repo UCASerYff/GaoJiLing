@@ -47,6 +47,16 @@ python3 Tests/BackupTests.py
 python3 Tests/CapabilitiesTests.py
 ((TEST_SUITES += 2))
 xcrun clang -O2 -Wall -Wextra -isysroot "$SDK" -c Sources/NativeMetrics.c -o "$TEST_TEMP/NativeMetrics.o"
+mkdir -m 700 "$TEST_TEMP/native-process.noindex"
+xcrun clang -O2 -Wall -Wextra -isysroot "$SDK" Tests/NativeProcessStateTests.c \
+  -framework IOKit -framework CoreFoundation -o "$TEST_TEMP/native-process.noindex/NativeProcessStateTests"
+"$TEST_TEMP/native-process.noindex/NativeProcessStateTests"
+((++TEST_SUITES))
+mkdir -m 700 "$TEST_TEMP/native-moved.noindex"
+xcrun clang -O2 -Wall -Wextra -isysroot "$SDK" Tests/NativeMovedApplicationTests.c \
+  -framework IOKit -framework CoreFoundation -o "$TEST_TEMP/native-moved.noindex/NativeMovedApplicationTests"
+"$TEST_TEMP/native-moved.noindex/NativeMovedApplicationTests" "$TEST_TEMP/native-moved.noindex"
+((++TEST_SUITES))
 
 run_swift_test CleanupEngineTests Sources/CleanupEngine.swift
 run_swift_test StorageAnalysisTests "${STORAGE[@]}" -framework AppKit
@@ -66,6 +76,13 @@ run_swift_test ExportTests Sources/Models.swift Sources/DataExport.swift
 run_swift_test UninstallEngineTests "${UNINSTALL[@]}" -framework AppKit
 # This test supplies its own native process symbol. Do not link NativeMetrics.o.
 run_swift_test UninstallControllerTests "${HEADER[@]}" "${UNINSTALL[@]}" Sources/AppManagementController.swift -framework AppKit
+# Controlled CLI children and fixture Trash only; stdin EOF ends each child.
+# This never launches an App, opens UI, or uses the real system Trash.
+xcrun clang -O2 -Wall -Wextra -isysroot "$SDK" Tests/UninstallProcessFixture.c -o "$TEST_TEMP/UninstallProcessFixture"
+"${SWIFT[@]}" "${NATIVE[@]}" "${UNINSTALL[@]}" Tests/UninstallMovedProcessTests.swift \
+  -framework AppKit -o "$TEST_TEMP/UninstallMovedProcessTests"
+"$TEST_TEMP/UninstallMovedProcessTests" "$TEST_TEMP/uninstall-moved-run.noindex" "$TEST_TEMP/UninstallProcessFixture"
+((++TEST_SUITES))
 run_swift_test UninstallNativeTests "${UNINSTALL[@]}" -framework AppKit
 "${SWIFT[@]}" Sources/GaoActionV1.swift Tests/GaoActionTests.swift -framework Security -o "$TEST_TEMP/GaoActionTests"
 "$TEST_TEMP/GaoActionTests" "$TEST_TEMP/gaoaction-fixtures"

@@ -9,6 +9,7 @@
 #include <sys/sysctl.h>
 #include <sys/resource.h>
 #include <sys/mount.h>
+#include <sys/proc.h>
 #include <libproc.h>
 #include <net/if.h>
 #include <net/if_dl.h>
@@ -26,6 +27,8 @@
 #include <signal.h>
 #include <unistd.h>
 #include <limits.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 int gjl_sysctl_string(const char *name, char *out, size_t capacity) {
     if (!capacity) return 0;
@@ -406,8 +409,18 @@ uint64_t gjl_memory_maintenance_relief(void) {
     return (uint64_t)malloc_zone_pressure_relief(NULL, 0);
 }
 
-static int gjl_process_is_gone(pid_t pid) {
-    return kill(pid, 0) != 0 && errno == ESRCH;
+static int gjl_process_is_inactive(pid_t pid) {
+    if (kill(pid, 0) != 0 && errno == ESRCH) return 1;
+    // XNU's BSD-info arg=1 includes zombies; arg=0 can return ESRCH while
+    // signal 0 still sees their PID. Only a verified terminal state is safe.
+    struct proc_bsdinfo first = {0}, confirmed = {0};
+    uid_t uid = geteuid();
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 1, &first, sizeof(first)) != sizeof(first) ||
+        first.pbi_pid != (uint32_t)pid || first.pbi_uid != uid || first.pbi_status != SZOMB) return 0;
+    // Revalidate start time as well as PID/UID/state in case the PID was reused.
+    return proc_pidinfo(pid, PROC_PIDTBSDINFO, 1, &confirmed, sizeof(confirmed)) == sizeof(confirmed) &&
+        confirmed.pbi_pid == (uint32_t)pid && confirmed.pbi_uid == uid && confirmed.pbi_status == SZOMB &&
+        confirmed.pbi_start_tvsec == first.pbi_start_tvsec && confirmed.pbi_start_tvusec == first.pbi_start_tvusec;
 }
 
 static int gjl_build_tool_path(const char *path) {
@@ -434,16 +447,8 @@ static int gjl_package_tool_path(const char *path) {
     return 0;
 }
 
-int gjl_application_running(const char *bundle_path, int check_developer_tools) {
-    char bundle[PATH_MAX] = {0};
-    size_t prefix_length = 0;
-    if (check_developer_tools != 2) {
-        if (!bundle_path || bundle_path[0] != '/' || !realpath(bundle_path, bundle)) return -1;
-        prefix_length = strlen(bundle);
-        while (prefix_length > 1 && bundle[prefix_length - 1] == '/') bundle[--prefix_length] = '\0';
-        if (prefix_length <= 1) return -1;
-    }
-
+static int gjl_scan_application_paths(const char *bundle, const char *moved, int check_developer_tools, int verify_identity) {
+    size_t prefix_length = bundle ? strlen(bundle) : 0, moved_length = moved ? strlen(moved) : 0;
     int required = proc_listpids(PROC_UID_ONLY, geteuid(), NULL, 0);
     if (required <= 0 || required > INT_MAX - 64 * (int)sizeof(pid_t)) return -1;
     int capacity = required + 64 * (int)sizeof(pid_t);
@@ -457,18 +462,29 @@ int gjl_application_running(const char *bundle_path, int check_developer_tools) 
         if (pid <= 0) continue;
         struct proc_bsdinfo info = {0};
         if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info)) {
-            if (!gjl_process_is_gone(pid)) uncertain = 1;
+            if (!gjl_process_is_inactive(pid)) uncertain = 1;
             continue;
         }
         // PID reuse can move a process outside the user-only enumeration.
-        if (info.pbi_uid != geteuid()) continue;
+        if (info.pbi_uid != geteuid()) { if (verify_identity) uncertain = 1; continue; }
         char executable[PROC_PIDPATHINFO_MAXSIZE] = {0};
         if (proc_pidpath(pid, executable, sizeof(executable)) <= 0) {
-            if (!gjl_process_is_gone(pid)) uncertain = 1;
+            if (!gjl_process_is_inactive(pid)) uncertain = 1;
             continue;
+        }
+        if (verify_identity) {
+            struct proc_bsdinfo confirmed = {0};
+            if (info.pbi_pid != (uint32_t)pid ||
+                proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &confirmed, sizeof(confirmed)) != sizeof(confirmed) ||
+                confirmed.pbi_pid != (uint32_t)pid || confirmed.pbi_uid != info.pbi_uid ||
+                confirmed.pbi_start_tvsec != info.pbi_start_tvsec || confirmed.pbi_start_tvusec != info.pbi_start_tvusec) {
+                uncertain = 1; continue;
+            }
         }
         if ((prefix_length > 0 && strncmp(executable, bundle, prefix_length) == 0 &&
              (executable[prefix_length] == '/' || executable[prefix_length] == '\0')) ||
+            (moved_length > 0 && strncmp(executable, moved, moved_length) == 0 &&
+             (executable[moved_length] == '/' || executable[moved_length] == '\0')) ||
             (check_developer_tools == 1 && gjl_build_tool_path(executable)) ||
             (check_developer_tools == 2 && gjl_package_tool_path(executable))) {
             free(pids);
@@ -477,6 +493,80 @@ int gjl_application_running(const char *bundle_path, int check_developer_tools) 
     }
     free(pids);
     return uncertain ? -1 : 0;
+}
+
+int gjl_application_running(const char *bundle_path, int check_developer_tools) {
+    char bundle[PATH_MAX] = {0};
+    if (check_developer_tools != 2) {
+        if (!bundle_path || bundle_path[0] != '/' || !realpath(bundle_path, bundle)) return -1;
+        size_t length = strlen(bundle);
+        while (length > 1 && bundle[length - 1] == '/') bundle[--length] = '\0';
+        if (length <= 1) return -1;
+    }
+    return gjl_scan_application_paths(check_developer_tools == 2 ? NULL : bundle, NULL, check_developer_tools, 0);
+}
+
+typedef struct {
+    int parent;
+    struct stat parent_identity;
+    char parent_path[PATH_MAX], name[NAME_MAX + 1];
+} GJLApplicationLocation;
+
+/* A historical original may be absent, but its parent must still be a real,
+ * unchanged canonical directory. Never turn arbitrary lexical paths or links
+ * into trusted process prefixes. The caller separately verifies the footprint. */
+static int gjl_pin_application_location(const char *path, GJLApplicationLocation *location) {
+    location->parent = -1;
+    if (!path || path[0] != '/' || strnlen(path, PATH_MAX) >= PATH_MAX) return 0;
+    char parent[PATH_MAX] = {0};
+    strcpy(parent, path);
+    char *last = strrchr(parent, '/');
+    if (!last || !last[1] || strlen(last + 1) > NAME_MAX || !strcmp(last + 1, ".") || !strcmp(last + 1, "..")) return 0;
+    strcpy(location->name, last + 1); *last = '\0';
+    int fd = open("/", O_SEARCH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char *cursor = parent + 1, *component;
+    if (parent[0]) while ((component = strsep(&cursor, "/")) != NULL) {
+        if (!component[0] || !strcmp(component, ".") || !strcmp(component, "..")) { close(fd); return 0; }
+        int next = openat(fd, component, O_SEARCH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        close(fd); if (next < 0) return 0; fd = next;
+        struct stat info = {0};
+        if (fstat(fd, &info) != 0 || !S_ISDIR(info.st_mode) || (info.st_flags & SF_DATALESS)) { close(fd); return 0; }
+    }
+    if (fstat(fd, &location->parent_identity) != 0 || fcntl(fd, F_GETPATH, location->parent_path) != 0) { close(fd); return 0; }
+    char canonical[PATH_MAX] = {0};
+    int count = snprintf(canonical, sizeof(canonical), "%s%s%s", location->parent_path,
+        !strcmp(location->parent_path, "/") ? "" : "/", location->name);
+    if (count <= 0 || count >= (int)sizeof(canonical) || strcmp(canonical, path)) { close(fd); return 0; }
+    location->parent = fd; return 1;
+}
+
+static int gjl_application_location_matches(const GJLApplicationLocation *location, int missing_allowed,
+    uint64_t device, uint64_t inode, uint32_t uid) {
+    struct stat parent = {0}, info = {0}; char parent_path[PATH_MAX] = {0};
+    if (fstat(location->parent, &parent) != 0 || parent.st_dev != location->parent_identity.st_dev ||
+        parent.st_ino != location->parent_identity.st_ino || parent.st_uid != location->parent_identity.st_uid ||
+        fcntl(location->parent, F_GETPATH, parent_path) != 0 || strcmp(parent_path, location->parent_path)) return 0;
+    if (fstatat(location->parent, location->name, &info, AT_SYMLINK_NOFOLLOW) != 0) return missing_allowed && errno == ENOENT;
+    return S_ISDIR(info.st_mode) && !(info.st_flags & SF_DATALESS) &&
+        (uint64_t)(int64_t)info.st_dev == device && (uint64_t)info.st_ino == inode && info.st_uid == uid;
+}
+
+int gjl_application_running_at_locations(const char *original, const char *current,
+    uint64_t device, uint64_t inode, uint32_t uid) {
+    GJLApplicationLocation origin = {.parent = -1}, present = {.parent = -1};
+    int result = -1;
+    if (!inode || (uid != geteuid() && uid != 0) || !gjl_pin_application_location(original, &origin) ||
+        !gjl_pin_application_location(current, &present)) goto finish;
+    if (!gjl_application_location_matches(&origin, 1, device, inode, uid) ||
+        !gjl_application_location_matches(&present, 0, device, inode, uid)) goto finish;
+    result = gjl_scan_application_paths(original, current, 0, 1);
+    if (result == 0 && (!gjl_application_location_matches(&origin, 1, device, inode, uid) ||
+        !gjl_application_location_matches(&present, 0, device, inode, uid))) result = -1;
+finish:
+    if (origin.parent >= 0) close(origin.parent);
+    if (present.parent >= 0) close(present.parent);
+    return result;
 }
 
 int gjl_development_tools_running(void) { return gjl_application_running(NULL, 2); }

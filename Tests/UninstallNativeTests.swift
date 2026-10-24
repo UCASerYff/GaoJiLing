@@ -69,6 +69,12 @@ private final class NativeFixture {
         return UninstallEngine(home: home, applicationRoots: [apps], appIsRunning: { candidate in
             // This never-executed bundle is the only identity allowed as inactive.
             candidate.path == path && candidate.bundleID == identifier && candidate.identity == appIdentity ? false : nil
+        }, appIsRunningAtLocation: { candidate, current in
+            // This opt-in fixture is never executed. The separate moved-process
+            // regression uses the real native lookup and controlled children.
+            guard candidate.path == path, candidate.bundleID == identifier, candidate.identity == appIdentity,
+                  let identity = try? FS.info(current) else { return nil }
+            return UninstallIdentity(identity) == appIdentity ? false : nil
         }) // No injected trash, rename, journal writer or fake recovery path.
     }
 

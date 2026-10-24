@@ -6,6 +6,7 @@ import ApplicationServices
 /// It does not claim that an AX-denied/unknown app is eligible for AppOFF.
 @main struct AppExitLivePrototypeTests {
     private static let identifier = "org.example.GaoJiLingExitFixture"
+    private static func canonicalPath(_ url: URL) -> String { url.resolvingSymlinksInPath().path }
     struct Failure: Error { var message: String }
     @MainActor final class Delegate: NSObject, NSApplicationDelegate {
         func applicationDidFinishLaunching(_ notification: Notification) {
@@ -18,7 +19,7 @@ import ApplicationServices
     @MainActor static func main() async throws {
         if CommandLine.arguments.contains("--fixture-mode") {
             guard Bundle.main.bundleIdentifier == identifier,
-                  Bundle.main.bundleURL.resolvingSymlinksInPath().path.hasPrefix("/private/tmp/gaojiling-app-exit-live-") else {
+                  canonicalPath(Bundle.main.bundleURL).hasPrefix(canonicalPath(URL(fileURLWithPath: "/private/tmp")) + "/gaojiling-app-exit-live-") else {
                 throw Failure(message: "fixture role is limited to its self-created temporary app bundle")
             }
             let app = NSApplication.shared; let delegate = Delegate()
@@ -49,11 +50,11 @@ import ApplicationServices
         let app = try await NSWorkspace.shared.openApplication(at: bundle, configuration: configuration)
         target = app
         try await Task.sleep(nanoseconds: 400_000_000)
-        guard app.bundleIdentifier == identifier, app.bundleURL?.resolvingSymlinksInPath() == bundle.resolvingSymlinksInPath(),
+        guard app.bundleIdentifier == identifier, app.bundleURL.map(canonicalPath) == canonicalPath(bundle),
               let identity = AppExitRuntime.identity(pid: app.processIdentifier), !app.isActive else {
             throw Failure(message: "self-created background application identity could not be confirmed; fixture expires itself")
         }
-        let observation = AppExitObservation(identity: identity, bundleID: identifier, path: bundle.resolvingSymlinksInPath().path,
+        let observation = AppExitObservation(identity: identity, bundleID: identifier, path: canonicalPath(bundle),
             name: "ExitFixture", observedAt: Date(), isFrontmost: false, memoryBytes: nil, windowCount: nil, saveState: .unknown, idleSeconds: nil)
         let driver = AppExitDriver.live, inspect = driver.inspect
         let inspection = await Task.detached { inspect(observation) }.value

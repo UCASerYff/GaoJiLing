@@ -56,6 +56,7 @@ struct UninstallHistoryEntry: Identifiable, Sendable {
 /// The controller serializes every call, including history reads.
 final class UninstallEngine: @unchecked Sendable {
     typealias RunningLookup = @Sendable (InstalledApp) -> Bool?
+    typealias MovedRunningLookup = @Sendable (InstalledApp, URL) -> Bool?
     typealias TrashAction = @Sendable (URL) throws -> URL
     typealias JournalWriter = @Sendable (Data, Int32) throws -> Void
     typealias RenameAction = @Sendable (Int32, String, Int32, String) throws -> Void
@@ -96,6 +97,7 @@ final class UninstallEngine: @unchecked Sendable {
     let initializationMarkerURL: URL
     private let applicationRoots: [URL]
     private let running: RunningLookup
+    private let runningAtLocation: MovedRunningLookup?
     private let trashAction: TrashAction
     private let injectedTrash: Bool
     private let journalWriter: JournalWriter
@@ -109,7 +111,8 @@ final class UninstallEngine: @unchecked Sendable {
     private static let marker = Data("GaoJiLing.UninstallJournal.v1\n".utf8)
 
     init(home: URL = FileManager.default.homeDirectoryForCurrentUser, journalDirectory: URL? = nil,
-         applicationRoots: [URL]? = nil, appIsRunning: @escaping RunningLookup, trash: TrashAction? = nil,
+         applicationRoots: [URL]? = nil, appIsRunning: @escaping RunningLookup,
+         appIsRunningAtLocation: MovedRunningLookup? = nil, trash: TrashAction? = nil,
          journalWriter: JournalWriter? = nil, rename: RenameAction? = nil) {
         self.home = home
         self.journalDirectory = journalDirectory ?? home.appendingPathComponent("Library/Application Support/GaoSeries/GaoJiLing/Uninstall", isDirectory: true)
@@ -117,6 +120,7 @@ final class UninstallEngine: @unchecked Sendable {
         stageDirectory = home.appendingPathComponent("Library/Caches/.GaoJiLing-UninstallStage", isDirectory: true)
         self.applicationRoots = applicationRoots ?? [URL(fileURLWithPath: "/Applications", isDirectory: true), home.appendingPathComponent("Applications", isDirectory: true)]
         running = appIsRunning
+        runningAtLocation = appIsRunningAtLocation
         injectedTrash = trash != nil
         self.journalWriter = journalWriter ?? { data, fd in try FS.atomicData(data, directory: fd, name: "journal.json") }
         renameAction = rename ?? { from, name, to, destination in try FS.rename(from: from, name: name, to: to, destination: destination) }
@@ -289,14 +293,14 @@ final class UninstallEngine: @unchecked Sendable {
                 if let journalFailure { throw journalFailure }
                 try verifyJournal()
                 guard let index = journal.batches.firstIndex(where: { $0.id == batchID }) else { throw UninstallFailure(message: "未找到卸载批次。") }
-                try requireInactive(journal.batches[index].app)
+                try requireInactive(journal.batches[index].app, batch: index)
                 var restored: [String] = [], issues: [UninstallIssue] = [], bytes: Int64 = 0
                 for r in journal.batches[index].receipts.indices {
                     let receipt = journal.batches[index].receipts[r]
                     if receipt.state == .restored || receipt.state == .untouched { continue }
                     if cancelled() { issues.append(UninstallIssue(itemID: receipt.itemID, message: "恢复已取消，未覆盖任何文件。")); break }
                     do {
-                        try requireInactive(journal.batches[index].app)
+                        try requireInactive(journal.batches[index].app, batch: index)
                         let original = URL(fileURLWithPath: receipt.original)
                         guard let source = try recoverySource(receipt) else {
                             if let footprint = try? FS.snapshot(original, appBundle: receipt.itemKind == .application), footprint == receipt.footprint {
@@ -311,7 +315,7 @@ final class UninstallEngine: @unchecked Sendable {
                         let sourceFD = try FS.directory(source.deletingLastPathComponent()); defer { close(sourceFD) }
                         let destinationFD = try FS.directory(original.deletingLastPathComponent()); defer { close(destinationFD) }
                         guard try FS.identity(destinationFD) == receipt.parentIdentity else { throw UninstallFailure(message: "原父目录身份已变化，停止恢复。") }
-                        try requireInactive(journal.batches[index].app)
+                        try requireInactive(journal.batches[index].app, batch: index)
                         guard UninstallIdentity(try FS.info(parent: sourceFD, name: source.lastPathComponent)) == receipt.footprint.identity else {
                             throw UninstallFailure(message: "恢复实物被替换。")
                         }
@@ -324,7 +328,9 @@ final class UninstallEngine: @unchecked Sendable {
                             // A pathname may now refer to a newly created object.
                             // Only the exact receipt object may be moved back.
                             if (try? FS.info(parent: destinationFD, name: original.lastPathComponent)).map(UninstallIdentity.init) == receipt.footprint.identity {
-                                try? renameAction(destinationFD, original.lastPathComponent, sourceFD, source.lastPathComponent)
+                                if (try? requireInactive(journal.batches[index].app, batch: index)) != nil {
+                                    try? renameAction(destinationFD, original.lastPathComponent, sourceFD, source.lastPathComponent)
+                                }
                             }
                             throw error
                         }
@@ -365,7 +371,7 @@ final class UninstallEngine: @unchecked Sendable {
         try saveJournal()
         do {
             if cancelled() { throw CancellationError() }
-            try requireInactive(app)
+            try requireInactive(app, batch: batch)
             guard UninstallIdentity(try FS.info(parent: sourceFD, name: source.lastPathComponent)) == candidate.footprint.identity else {
                 throw UninstallFailure(message: "最后身份复核未通过。")
             }
@@ -375,7 +381,7 @@ final class UninstallEngine: @unchecked Sendable {
                 throw UninstallFailure(message: "暂存后完整复核未通过，尝试原样回退。")
             }
             if cancelled() { throw CancellationError() }
-            try requireInactive(app)
+            try requireInactive(app, batch: batch)
             if !injectedTrash {
                 let destination = try FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: stage, create: true)
                 receipt.trash = destination.appendingPathComponent(stage.lastPathComponent).path
@@ -396,6 +402,7 @@ final class UninstallEngine: @unchecked Sendable {
             // stage still exists, return that exact object without overwriting.
             if (try? FS.info(parent: stageFD, name: stage.lastPathComponent)).map(UninstallIdentity.init) == receipt.footprint.identity {
                 do {
+                    try requireInactive(app, batch: batch)
                     try renameAction(stageFD, stage.lastPathComponent, sourceFD, source.lastPathComponent)
                     guard try FS.snapshot(source, appBundle: candidate.kind == .application) == candidate.footprint else { throw failure }
                     journal.batches[batch].receipts[r].state = .untouched
@@ -457,6 +464,38 @@ final class UninstallEngine: @unchecked Sendable {
     }
     private func requireInactive(_ app: InstalledApp) throws {
         guard running(app) == false else { throw UninstallFailure(message: "应用或相关进程仍在运行，或状态未知，已保留文件。") }
+    }
+    /// Restoring a cache still checks the application's receipt, never the cache
+    /// path. Missing original alone cannot establish that an application exited.
+    private func requireInactive(_ app: InstalledApp, batch index: Int) throws {
+        let original = URL(fileURLWithPath: app.path)
+        let appReceipts = journal.batches[index].receipts.filter { $0.itemKind == .application }
+        guard appReceipts.count <= 1 else { throw UninstallFailure(message: "应用恢复记录不唯一，已保留文件。") }
+        if let info = try FS.optionalInfo(original) {
+            guard UninstallIdentity(info) == app.identity else { throw UninstallFailure(message: "原应用位置已有其他对象，已停止移动或恢复。") }
+            try validateApp(app)
+            if let receipt = appReceipts.first {
+                guard try FS.snapshot(original, appBundle: true) == receipt.footprint else {
+                    throw UninstallFailure(message: "原应用内容已改变，已保留文件。")
+                }
+            }
+            return
+        }
+        guard let receipt = appReceipts.first, receipt.original == app.path,
+              receipt.footprint.identity == app.identity,
+              let current = try recoverySource(receipt),
+              try FS.snapshot(current, appBundle: true) == receipt.footprint else {
+            throw UninstallFailure(message: "无法核验当前应用恢复实物，未将原路径缺失视为已退出。")
+        }
+        let parent = try FS.directory(original.deletingLastPathComponent()); defer { close(parent) }
+        let currentFD = try FS.directory(current); defer { close(currentFD) }
+        guard try FS.identity(parent) == receipt.parentIdentity, try FS.identity(currentFD) == app.identity,
+              runningAtLocation?(app, current) == false,
+              try FS.identity(parent) == receipt.parentIdentity, try FS.identity(currentFD) == app.identity,
+              try FS.optionalInfo(original) == nil,
+              try FS.snapshot(current, appBundle: true) == receipt.footprint else {
+            throw UninstallFailure(message: "原位置或当前应用实物有运行进程、状态未知或身份改变，已保留文件。")
+        }
     }
     private func protection(bundleID: String, path: String) -> String? {
         if bundleID.hasPrefix("com.apple.") || path == "/System" || path.hasPrefix("/System/") {

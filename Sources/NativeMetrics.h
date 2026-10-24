@@ -46,6 +46,11 @@ int gjl_memory_maintenance_snapshot(GJLMemoryMaintenance *out);
 uint64_t gjl_memory_maintenance_relief(void);
 /* 1: running, 0: absent, -1: cannot safely establish absence. */
 int gjl_application_running(const char *bundle_path, int check_developer_tools);
+/* An uninstall may have moved this exact bundle. Check both canonical original
+ * and verified current prefixes; missing original is not proof of inactivity.
+ * Current device/inode/UID must match, and all unknown observations fail closed. */
+int gjl_application_running_at_locations(const char *original_bundle_path, const char *current_bundle_path,
+    uint64_t device, uint64_t inode, uint32_t uid);
 /* Conservative global check for package managers and compilers, no argv read. */
 int gjl_development_tools_running(void);
 /* Fixed PID identity only; never sends a signal or reads process arguments. */

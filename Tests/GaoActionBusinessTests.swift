@@ -6,6 +6,8 @@ import Darwin
 // allocator operation or memory command prerequisite.
 @_cdecl("gjl_application_running")
 func gaBusinessForbiddenApplicationLookup(_ path: UnsafePointer<CChar>?, _ flags: Int32) -> Int32 { fatalError("Unexpected real process lookup") }
+@_cdecl("gjl_application_running_at_locations")
+func gaBusinessForbiddenMovedApplicationLookup(_ original: UnsafePointer<CChar>?, _ current: UnsafePointer<CChar>?, _ device: UInt64, _ inode: UInt64, _ uid: UInt32) -> Int32 { fatalError("Unexpected real moved process lookup") }
 @_cdecl("gjl_development_tools_running")
 func gaBusinessForbiddenDeveloperLookup() -> Int32 { fatalError("Unexpected real developer lookup") }
 @_cdecl("gjl_memory_maintenance_snapshot")
@@ -64,7 +66,7 @@ private final class MoveBoundary: @unchecked Sendable {
         duplicates = DuplicateAnalysisController(analyzer: DuplicateAnalyzer(), recovery: DuplicateRecovery(home: home,
             journalDirectory: data.appendingPathComponent("Duplicates"), trash: { try boundary.trash($0, home: home) }))
         manager = AppManagementController(engine: UninstallEngine(home: home, journalDirectory: data.appendingPathComponent("Uninstall"),
-            applicationRoots: [home.appendingPathComponent("Applications")], appIsRunning: { _ in false }, trash: { try boundary.trash($0, home: home) }))
+            applicationRoots: [home.appendingPathComponent("Applications")], appIsRunning: { _ in false }, appIsRunningAtLocation: { _, _ in false }, trash: { try boundary.trash($0, home: home) }))
         exchange = GAExchangeController(dataDirectory: data, clock: { GAFixtures.clock })
         bind()
         try check(exchange.writable, "Private exchange fixture must initialize")

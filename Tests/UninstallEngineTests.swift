@@ -59,9 +59,13 @@ private final class Fixture: @unchecked Sendable {
         for child in paths.reversed() { try fm.setAttributes([.modificationDate: date], ofItemAtPath: child.path) }
         try fm.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
     }
-    func engine(action: UninstallEngine.TrashAction? = nil, writer: UninstallEngine.JournalWriter? = nil, rename: UninstallEngine.RenameAction? = nil) -> UninstallEngine {
-        UninstallEngine(home: home, journalDirectory: journal, applicationRoots: [apps],
-            appIsRunning: { [state] in state.lookup($0) }, trash: action ?? { [self] source in
+    func engine(action: UninstallEngine.TrashAction? = nil, writer: UninstallEngine.JournalWriter? = nil, rename: UninstallEngine.RenameAction? = nil,
+                omitMovedChecker: Bool = false) -> UninstallEngine {
+        var moved: UninstallEngine.MovedRunningLookup?
+        if !omitMovedChecker { moved = { [state] app, _ in state.lookup(app) } }
+        return UninstallEngine(home: home, journalDirectory: journal, applicationRoots: [apps],
+            appIsRunning: { [state] in state.lookup($0) },
+            appIsRunningAtLocation: moved, trash: action ?? { [self] source in
                 let destination = trash.appendingPathComponent(source.lastPathComponent + "-moved")
                 try fm.moveItem(at: source, to: destination); return destination
             }, journalWriter: writer, rename: rename)
@@ -104,7 +108,9 @@ private final class Fixture: @unchecked Sendable {
             ("External approval identity rejects an application replaced at the same path", approvalIdentity),
             ("Last-moment source replacement while restoring is never moved", lateRestore),
             ("Failure rollback leaves a substituted staging object in place", replacedStageRollback),
-            ("Restore validation failure never rolls back a newly created original-path object", replacedRestoreRollback)
+            ("Restore validation failure never rolls back a newly created original-path object", replacedRestoreRollback),
+            ("A missing moved-process checker cannot inherit original-path inactivity", movedCheckerRequired),
+            ("Active or unknown after staging preserves the object until a verified inactive restore", movedProcessBlocked)
         ]
         do {
             for (name, test) in tests {
@@ -113,6 +119,39 @@ private final class Fixture: @unchecked Sendable {
             }
             print("PASS: \(tests.count) uninstall tests; synthetic apps and injected Trash only")
         } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+    }
+    static func movedCheckerRequired() throws {
+        let f = try Fixture(), app = try f.app(), engine = f.engine(omitMovedChecker: true)
+        let plan = try engine.review(appURL: app)
+        let report = try engine.execute(planID: plan.id, selectedIDs: f.selectable(plan))
+        try check(report.movedIDs.isEmpty && report.issues.count == 1 && !f.exists(app), "Missing moved checker must stop and keep the recoverable stage, not assume inactive or blindly roll back")
+        let object = try JSONSerialization.jsonObject(with: Data(contentsOf: f.ledger)) as! [String: Any]
+        let batch = (object["batches"] as! [[String: Any]])[0]
+        let receipt = (batch["receipts"] as! [[String: Any]])[0]
+        let stage = URL(fileURLWithPath: receipt["stage"] as! String)
+        try check(receipt["state"] as? String == "staged" && UninstallIdentity(try UninstallFileSafety.info(stage)) == plan.app.identity,
+                  "The exact staged App and durable receipt remain")
+        try check(try f.fm.contentsOfDirectory(atPath: f.trash.path).isEmpty, "Unknown inactivity must never reach Trash")
+        let restored = f.engine().restore(batchID: plan.id)
+        try check(restored.issues.isEmpty && f.exists(app) && !f.exists(stage), "An explicitly provided fixture checker can subsequently recover the exact App")
+    }
+    static func movedProcessBlocked() throws {
+        for blocked: Bool? in [true, nil] {
+            let f = try Fixture(), app = try f.app()
+            let engine = f.engine(rename: { from, name, to, destination in
+                try UninstallFileSafety.rename(from: from, name: name, to: to, destination: destination)
+                if name == app.lastPathComponent && destination.hasPrefix("GaoJiLing-Uninstall-") { f.state.running = blocked }
+            })
+            let plan = try engine.review(appURL: app)
+            let report = try engine.execute(planID: plan.id, selectedIDs: f.selectable(plan))
+            try check(report.movedIDs.isEmpty && report.issues.count == 1 && !f.exists(app), "Active/unknown after stage must not be moved again")
+            try check(try f.fm.contentsOfDirectory(atPath: f.trash.path).isEmpty, "Active/unknown stage must not reach Trash")
+            let held = f.engine().restore(batchID: plan.id)
+            try check(held.movedIDs.isEmpty && !held.issues.isEmpty && !f.exists(app), "Active/unknown stage cannot be restored either")
+            f.state.running = false
+            let restored = f.engine().restore(batchID: plan.id)
+            try check(restored.issues.isEmpty && restored.movedIDs.count == 1 && f.exists(app), "A fresh inactive check permits exact recovery")
+        }
     }
     static func exactScope() throws {
         let f = try Fixture(), app = try f.app(), cache = try f.cache()

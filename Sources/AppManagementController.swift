@@ -27,19 +27,27 @@ private final class UninstallCancellation: @unchecked Sendable {
 
     init(dataDirectory: URL) {
         engine = UninstallEngine(journalDirectory: dataDirectory.appendingPathComponent("Uninstall", isDirectory: true),
-            appIsRunning: { Self.runningState($0) })
+            appIsRunning: { Self.runningState($0) },
+            appIsRunningAtLocation: { Self.runningState($0, current: $1) })
         refreshHistory()
     }
     /// Tests or another native host can inject its own serialized engine.
     init(engine: UninstallEngine) { self.engine = engine; refreshHistory() }
 
-    nonisolated private static func runningState(_ app: InstalledApp) -> Bool? {
+    nonisolated private static func runningState(_ app: InstalledApp, current: URL? = nil) -> Bool? {
         if NSWorkspace.shared.runningApplications.contains(where: {
-            $0.bundleIdentifier == app.bundleID || $0.bundleIdentifier?.hasPrefix(app.bundleID + ".") == true || $0.bundleURL?.path == app.path
+            $0.bundleIdentifier == app.bundleID || $0.bundleIdentifier?.hasPrefix(app.bundleID + ".") == true ||
+                $0.bundleURL?.path == app.path || (current != nil && $0.bundleURL?.path == current?.path)
         }) { return true }
         // Native enumeration includes background executables under the bundle;
         // an unreadable process list is unknown, never a claim of inactivity.
-        let state = app.path.withCString { gjl_application_running($0, 0) }
+        let state = app.path.withCString { original in
+            if let current {
+                return current.path.withCString { gjl_application_running_at_locations(original, $0,
+                    app.identity.device, app.identity.inode, app.identity.uid) }
+            }
+            return gjl_application_running(original, 0)
+        }
         return state < 0 ? nil : state != 0
     }
 

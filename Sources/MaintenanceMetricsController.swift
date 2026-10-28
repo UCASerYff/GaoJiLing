@@ -143,11 +143,21 @@ import UserNotifications
             let decision = self.policy.evaluate(rule, observation: checked, now: self.clock(), currentUID: geteuid(), enabled: self.preferences.appExitEnabled, paused: self.preferences.appExitPaused)
             self.ruleReasons[rule.id] = decision.reason
             guard decision.eligible, self.actionsAllowed(), self.driver.validate(checked), self.actionsAllowed() else { return }
-            let prepared = AppExitRecord(ruleID: rule.id, date: self.clock(), name: rule.name, outcome: "准备请求", reason: decision.reason)
+            // Recheck saved state off the main actor, then repeat every local
+            // guard before persisting intent. This narrows the inspection gap;
+            // normal quit still lets the target handle later document changes.
+            let finalSaved = await Task.detached(priority: .utility) { inspect(observation) }.value
+            guard self.generation == expectedGeneration, self.writable, !self.sleeping, !self.actionsSuspended, self.actionsAllowed() else { return }
+            guard finalSaved.identity == observation.identity else { self.ruleReasons[rule.id] = "请求前复核期间进程身份发生变化，已跳过"; return }
+            checked.windowCount = finalSaved.windows; checked.saveState = finalSaved.saved
+            let finalDecision = self.policy.evaluate(rule, observation: checked, now: self.clock(), currentUID: geteuid(), enabled: self.preferences.appExitEnabled, paused: self.preferences.appExitPaused)
+            self.ruleReasons[rule.id] = finalDecision.reason
+            guard finalDecision.eligible, self.actionsAllowed(), self.driver.validate(checked), self.actionsAllowed() else { return }
+            let prepared = AppExitRecord(ruleID: rule.id, date: self.clock(), name: rule.name, outcome: "准备请求", reason: finalDecision.reason)
             // Durable intent before the only side effect. A crash never replays it.
             guard self.appendRecord(prepared) else { return }
             self.policy.recordAttempt(rule, at: prepared.date)
-            guard self.generation == expectedGeneration, self.actionsAllowed(), self.driver.validate(checked), self.actionsAllowed() else { return }
+            guard self.generation == expectedGeneration, self.writable, !self.sleeping, !self.actionsSuspended, self.actionsAllowed(), self.driver.validate(checked), self.actionsAllowed() else { return }
             let attempt = self.driver.request(checked)
             if attempt.accepted {
                 self.pending = (attempt, rule, prepared.date)

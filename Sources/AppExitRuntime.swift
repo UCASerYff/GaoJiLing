@@ -42,37 +42,63 @@ enum AppExitRuntime {
         return ProcessIdentity(pid: pid, startTime: start, uid: uid)
     }
 
-    /// AX reads only application/window state, never document text. No prompt is
-    /// generated here. Failure/unsupported "edited" attributes stay unknown.
-    static func saveStatus(pid: Int32) -> (windows: Int?, saved: AppExitSaveState) {
-        guard AXIsProcessTrusted() else { return (nil, .unknown) }
-        let app = AXUIElementCreateApplication(pid)
-        guard AXUIElementSetMessagingTimeout(app, 0.2) == .success else { return (nil, .unknown) }
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
-              let windows = value as? [AXUIElement], windows.count <= 32 else { return (nil, .unknown) }
-        // No window does not prove that no background document exists. Require
-        // an explicit app-level clean declaration in that case, or skip.
-        if windows.isEmpty {
-            return (0, editedState(app))
+    /// Internal dependency boundary for the production saved-state reader.
+    /// Tests inject raw AX replies; the live implementation never prompts.
+    struct AXReader {
+        var isTrusted: () -> Bool
+        var application: (Int32) -> AXUIElement
+        var setTimeout: (AXUIElement, Float) -> AXError
+        var copyAttribute: (AXUIElement, CFString) -> (error: AXError, value: CFTypeRef?)
+        static var live: Self {
+            Self(isTrusted: { AXIsProcessTrusted() }, application: { AXUIElementCreateApplication($0) },
+                setTimeout: { AXUIElementSetMessagingTimeout($0, $1) }, copyAttribute: { element, attribute in
+                    var value: CFTypeRef?
+                    let error = AXUIElementCopyAttributeValue(element, attribute, &value)
+                    return (error, value)
+                })
         }
+    }
+
+    /// AX reads only application/window state, never document text or prompts.
+    /// Only app Edited attributeUnsupported with no value may fall back to a
+    /// nonempty list of known-clean windows. Other failures and unknowns skip.
+    static func saveStatus(pid: Int32) -> (windows: Int?, saved: AppExitSaveState) {
+        saveStatus(pid: pid, reader: .live)
+    }
+    static func saveStatus(pid: Int32, reader: AXReader) -> (windows: Int?, saved: AppExitSaveState) {
+        guard reader.isTrusted() else { return (nil, .unknown) }
+        let app = reader.application(pid)
+        guard reader.setTimeout(app, 0.2) == .success else { return (nil, .unknown) }
+        // An explicit app edit always takes precedence over window flags.
+        // An unsupported error carrying a value is inconsistent, not a fallback.
+        let appReply = reader.copyAttribute(app, kAXEditedAttribute as CFString)
+        let appEdited = booleanAttribute(appReply)
+        let windowFallback = appReply.error == .attributeUnsupported && appReply.value == nil
+        if appEdited == true { return (nil, .edited) }
+        guard appEdited == false || windowFallback else { return (nil, .unknown) }
+        let reply = reader.copyAttribute(app, kAXWindowsAttribute as CFString)
+        // Core Foundation element casts do not prove each array member's type.
+        // Validate every member before passing any of them to an AX operation.
+        guard reply.error == .success, let value = reply.value,
+              CFGetTypeID(value) == CFArrayGetTypeID(), let elements = value as? [AnyObject],
+              elements.count <= 32, elements.allSatisfy({ CFGetTypeID($0) == AXUIElementGetTypeID() }),
+              let windows = elements as? [AXUIElement] else { return (nil, .unknown) }
+        if windows.isEmpty { return (0, appEdited == false ? .clean : .unknown) }
         var unknown = false
         for window in windows {
-            _ = AXUIElementSetMessagingTimeout(window, 0.2)
-            let state = editedState(window)
-            if state == .edited { return (windows.count, .edited) }
-            if state == .unknown { unknown = true }
-            var modal: CFTypeRef?
-            if AXUIElementCopyAttributeValue(window, kAXModalAttribute as CFString, &modal) == .success,
-               let modal, CFGetTypeID(modal) == CFBooleanGetTypeID(), (modal as? Bool) == true { return (windows.count, .unknown) }
+            guard reader.setTimeout(window, 0.2) == .success else { return (windows.count, .unknown) }
+            if let edited = booleanAttribute(reader.copyAttribute(window, kAXEditedAttribute as CFString)) {
+                if edited { return (windows.count, .edited) }
+            } else { unknown = true }
+            // Only an explicit Boolean false excludes a modal/save operation.
+            if booleanAttribute(reader.copyAttribute(window, kAXModalAttribute as CFString)) != false { unknown = true }
         }
         return (windows.count, unknown ? .unknown : .clean)
     }
-    private static func editedState(_ element: AXUIElement) -> AppExitSaveState {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXEditedAttribute as CFString, &value) == .success,
-              let value, CFGetTypeID(value) == CFBooleanGetTypeID(), let edited = value as? Bool else { return .unknown }
-        return edited ? .edited : .clean
+    private static func booleanAttribute(_ reply: (error: AXError, value: CFTypeRef?)) -> Bool? {
+        guard reply.error == .success, let value = reply.value,
+              CFGetTypeID(value) == CFBooleanGetTypeID(), let boolean = value as? Bool else { return nil }
+        return boolean
     }
 
     @MainActor static func observations(rules: [AppExitRule], sample: MetricsSample, now: Date) -> [AppExitObservation] {

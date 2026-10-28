@@ -102,6 +102,7 @@ run_swift_test MemoryMaintenanceTests "${NATIVE[@]}" Sources/MemoryMaintenance.s
 run_swift_test MetricsTests "${NATIVE[@]}" "${METRICS[@]}"
 run_swift_test MaintenanceTests "${NATIVE[@]}" "${METRICS[@]}" Sources/BatteryCapabilities.swift Sources/FanCapabilities.swift Sources/AppExitRules.swift Sources/MaintenanceMetricsState.swift
 run_swift_test AppExitControllerTests "${NATIVE[@]}" "${MAINTENANCE[@]}" Sources/AppExitRuntime.swift Sources/MaintenanceMetricsController.swift -framework AppKit -framework ApplicationServices -framework UserNotifications
+run_swift_test AppExitRuntimeTests "${NATIVE[@]}" Sources/Models.swift Sources/AppExitRules.swift Sources/AppExitRuntime.swift -framework AppKit -framework ApplicationServices
 # Keep the live read-only probe and self-created App GUI prototype opt-in.
 # GJL_REQUIRE_LIVE=1 enables the former; GJL_RUN_APP_EXIT_PROTOTYPE=1 requires
 # a separately coordinated GUI window and must never be set by this script.

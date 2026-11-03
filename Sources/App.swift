@@ -55,6 +55,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     private var store: MonitorStore!
     private var cleanup: CleanupController!
     private var analysis: StorageAnalysisController!
+    private var diskStorage: DiskStorageController!
     private var duplicates: DuplicateAnalysisController!
     private var manager: AppManagementController!
     private var maintenance: MaintenanceController!
@@ -96,6 +97,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         store = MonitorStore()
         cleanup = CleanupController(dataDirectory: store.dataDirectory)
         analysis = StorageAnalysisController(dataDirectory: store.dataDirectory)
+        diskStorage = DiskStorageController(dataDirectory: store.dataDirectory)
         duplicates = DuplicateAnalysisController(dataDirectory: store.dataDirectory)
         manager = AppManagementController(dataDirectory: store.dataDirectory)
         maintenance = MaintenanceController(dataDirectory: store.dataDirectory, actionsAllowed: { [weak self] in
@@ -104,10 +106,15 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         exchange = GAExchangeController(dataDirectory: store.dataDirectory)
         duplicates.actionsAllowed = { [weak self] in
             guard let self else { return false }
-            return !self.pendingTermination && !self.store.dataBusy && !self.cleanup.isBusy && !self.analysis.isBusy && !self.manager.isBusy && !self.exchange.isBusy
+            return !self.pendingTermination && !self.store.dataBusy && !self.cleanup.isBusy && !self.analysis.isBusy && !self.manager.isBusy && !self.exchange.isBusy && !self.diskStorage.isBusy
         }
+        diskStorage.actionsAllowed = { [weak self] in
+            guard let self else { return false }
+            return !self.pendingTermination && !self.store.dataBusy && !self.cleanup.isBusy && !self.analysis.isBusy && !self.duplicates.isBusy && !self.manager.isBusy && !self.exchange.isBusy
+        }
+        store.dataActionsAllowed = { [weak self] in self?.diskStorage.isBusy == false }
         business = GABusinessCoordinator(exchange: exchange, cleanup: cleanup, analysis: analysis, manager: manager, duplicates: duplicates,
-            externallyBusy: { [weak self] in self?.store.dataBusy ?? true },
+            externallyBusy: { [weak self] in guard let self else { return true }; return self.store.dataBusy || self.diskStorage.isBusy },
             navigate: { [weak self] action in self?.showBusiness(action) })
         signal(SIGTERM, SIG_IGN)
         terminationSignal = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
@@ -121,7 +128,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         window.minSize = NSSize(width: 960, height: 690)
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.contentView = NSHostingView(rootView: DashboardView(store: store, cleanup: cleanup, analysis: analysis, openSettings: { [weak self] in self?.showSettings() }, manager: manager, maintenance: maintenance, exchange: exchange, navigation: dashboardNavigation, duplicates: duplicates))
+        window.contentView = NSHostingView(rootView: DashboardView(store: store, cleanup: cleanup, analysis: analysis, diskStorage: diskStorage, openSettings: { [weak self] in self?.showSettings() }, manager: manager, maintenance: maintenance, exchange: exchange, navigation: dashboardNavigation, duplicates: duplicates))
         window.setFrameAutosaveName("GaoJiLing.MainWindow")
         if !window.setFrameUsingName("GaoJiLing.MainWindow") { window.center() }
 
@@ -150,7 +157,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         configurePanelMouseMonitoring()
         store.$latest.sink { [weak self] sample in self?.updateStatus(sample); self?.maintenance.ingest(sample: sample) }.store(in: &subscriptions)
         store.$isPaused.sink { [weak self] _ in DispatchQueue.main.async { self?.updateStatus(self?.store.latest ?? .empty) } }.store(in: &subscriptions)
-        for publisher in [store.$dataBusy.eraseToAnyPublisher(), cleanup.$isBusy.eraseToAnyPublisher(), analysis.$isBusy.eraseToAnyPublisher(), duplicates.$isBusy.eraseToAnyPublisher(), manager.$isBusy.eraseToAnyPublisher(), exchange.$isBusy.eraseToAnyPublisher(), store.$isPaused.eraseToAnyPublisher()] {
+        for publisher in [store.$dataBusy.eraseToAnyPublisher(), cleanup.$isBusy.eraseToAnyPublisher(), analysis.$isBusy.eraseToAnyPublisher(), diskStorage.$isBusy.eraseToAnyPublisher(), duplicates.$isBusy.eraseToAnyPublisher(), manager.$isBusy.eraseToAnyPublisher(), exchange.$isBusy.eraseToAnyPublisher(), store.$isPaused.eraseToAnyPublisher()] {
             publisher.sink { [weak self] _ in
                 DispatchQueue.main.async { self?.maintenanceStateChanged() }
             }.store(in: &subscriptions)
@@ -170,9 +177,9 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         if let edgeTimer { RunLoop.main.add(edgeTimer, forMode: .common) }
         settingsChanged()
         showDashboard()
-        for url in pendingPackages { exchange.receive(url) }
-        if !pendingPackages.isEmpty { dashboardNavigation.page = .exchange }
+        let pending = pendingPackages
         pendingPackages.removeAll()
+        if !pending.isEmpty { application(NSApp, open: pending) }
     }
     private func configureMainMenu() {
         let main = NSMenu(); let appItem = NSMenuItem(); let appMenu = NSMenu()
@@ -231,7 +238,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     func windowDidChangeOcclusionState(_ notification: Notification) { updateSamplingDemand() }
     func applicationDidHide(_ notification: Notification) { updateSamplingDemand() }
     func applicationDidUnhide(_ notification: Notification) { updateSamplingDemand() }
-    private var operationsBusy: Bool { store?.dataBusy == true || cleanup?.isBusy == true || analysis?.isBusy == true || duplicates?.isBusy == true || manager?.isBusy == true || exchange?.isBusy == true }
+    private var operationsBusy: Bool { store?.dataBusy == true || cleanup?.isBusy == true || analysis?.isBusy == true || diskStorage?.isBusy == true || duplicates?.isBusy == true || manager?.isBusy == true || exchange?.isBusy == true }
     private func maintenanceStateChanged() {
         updateSamplingDemand()
         maintenance?.setActionsSuspended(operationsBusy || store?.isPaused == true || pendingTermination)
@@ -250,8 +257,18 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     @objc private func showExchange() { dashboardNavigation.page = .exchange; showDashboard() }
     func application(_ application: NSApplication, open urls: [URL]) {
         guard exchange != nil else { pendingPackages.append(contentsOf: urls.prefix(max(0, 16 - pendingPackages.count))); return }
-        dashboardNavigation.page = .exchange; showDashboard()
-        for url in urls.prefix(16) { exchange.receive(url) }
+        let limited = Array(urls.prefix(16))
+        let images = limited.filter { $0.isFileURL && ["ntfs", "img", "raw", "dd"].contains($0.pathExtension.lowercased()) }
+        let packages = limited.filter { !images.contains($0) }
+        if !packages.isEmpty {
+            dashboardNavigation.page = .exchange
+            for url in packages { exchange.receive(url) }
+        }
+        if let image = images.first {
+            diskStorage.prepareImage(image)
+            dashboardNavigation.page = .storage; dashboardNavigation.storageMode = "disk"
+        }
+        showDashboard()
     }
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
         application(sender, open: filenames.map { URL(fileURLWithPath: $0) })
@@ -315,6 +332,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
             pendingTermination = true
             cleanup?.cancel()
             analysis?.cancel()
+            diskStorage?.cancel()
             duplicates?.cancel()
             manager?.cancel()
             exchange?.prepareForTermination()

@@ -13,6 +13,7 @@ fi
 APP_VERSION="$(tr -d '\n' < "$PROJECT_DIR/VERSION")"
 if [[ ! "$APP_VERSION" =~ '^[0-9]+\.[0-9]{2}$' ]]; then print -u2 'VERSION 必须为 1.00 格式'; exit 1; fi
 BUILD_NUMBER="${APP_VERSION//./}"
+python3 "$PROJECT_DIR/Scripts/sign-app.py" --check-identity
 STAGING="$(python3 "$SAFETY" workdir --parent /private/tmp --prefix gaojiling-build-)"
 OUTPUT_CREATED=false
 OUTPUT_COMPLETE=false
@@ -57,6 +58,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSHumanReadableCopyright</key><string>搞系列 · 搞机灵</string>
 <key>NSSupportsAutomaticTermination</key><false/>
+<key>CFBundleDocumentTypes</key><array><dict>
+<key>CFBundleTypeName</key><string>普通 NTFS 卷镜像（确认后只读）</string>
+<key>CFBundleTypeRole</key><string>Viewer</string>
+<key>LSHandlerRank</key><string>Alternate</string>
+<key>CFBundleTypeExtensions</key><array><string>ntfs</string><string>img</string><string>raw</string><string>dd</string></array>
+</dict></array>
 </dict></plist>
 PLIST
 PYTHONDONTWRITEBYTECODE=1 python3 "$PROJECT_DIR/Scripts/make-capabilities.py" \
@@ -64,7 +71,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$PROJECT_DIR/Scripts/make-capabilities.py" \
   --output "$APP/Contents/Resources/GaoCapabilities.json"
 plutil -lint "$APP/Contents/Info.plist"
 xattr -cr "$APP"
-codesign --force --sign - --identifier com.gaoseries.GaoJiLing "$APP"
+python3 "$PROJECT_DIR/Scripts/sign-app.py" --app "$APP" --new-build
 codesign --verify --strict "$APP"
 if [[ -n "$APP_ONLY" ]]; then
   mkdir "$APP_ONLY"

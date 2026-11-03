@@ -181,6 +181,41 @@ def only_root_macl_missing(expected, restored):
     return reduced == restored[""]
 
 
+def original_retention_archive_gaps(expected, restored):
+    """Diagnose an INEXACT auxiliary ZIP, never certify archive fidelity.
+
+    These OS-managed copy gaps require retaining the complete original inode.
+    All original-object verification still uses the unmodified strict trees.
+    """
+    if not isinstance(expected, dict) or not isinstance(restored, dict) or expected.keys() != restored.keys() or "" not in expected:
+        return None
+    gaps = []
+    for relative in expected:
+        source, copied = expected[relative], restored[relative]
+        if source == copied:
+            continue
+        if not isinstance(source, dict) or not isinstance(copied, dict):
+            return None
+        attributes, other = source.get("xattrs"), copied.get("xattrs")
+        if source.get("type") not in ("file", "directory") or not isinstance(attributes, dict) or not isinstance(other, dict):
+            return None
+        first, second = dict(source), dict(copied)
+        first["xattrs"], second["xattrs"] = dict(attributes), dict(other)
+        for attribute in ("com.apple.provenance", "com.apple.macl"):
+            if attributes.get(attribute) == other.get(attribute) and (attribute in attributes) == (attribute in other):
+                continue
+            if attribute == "com.apple.macl" and (relative != "" or source.get("type") != "directory" or attribute not in attributes or attribute in other):
+                return None
+            gaps.append({"path": relative, "attribute": attribute,
+                         "sourcePresent": attribute in attributes, "sourceSHA256": attributes.get(attribute),
+                         "archiveRoundTripPresent": attribute in other, "archiveRoundTripSHA256": other.get(attribute)})
+            first["xattrs"].pop(attribute, None)
+            second["xattrs"].pop(attribute, None)
+        if first != second:
+            return None
+    return gaps or None
+
+
 def original_metadata(app, manifest):
     # Same inodes are retained, rather than rebuilding ACLs or system metadata.
     # tree_manifest separately checks all content, links, modes and xattrs.
@@ -364,7 +399,10 @@ def load_receipt(path):
                 or not re.fullmatch(r"[0-9]+:[0-9]+:[0-9]+", original.get("identity", ""))
                 or receipt.get("sourcePath") != str(DESTINATION)
                 or not isinstance(original.get("metadata"), dict)
-                or not only_root_macl_missing(receipt.get("tree", {}), receipt.get("archiveRoundTripTree", {}))):
+                or not (("archiveRoundTripGaps" not in receipt
+                         and only_root_macl_missing(receipt.get("tree", {}), receipt.get("archiveRoundTripTree", {})))
+                        or (receipt.get("archiveRoundTripGaps") is not None
+                            and receipt["archiveRoundTripGaps"] == original_retention_archive_gaps(receipt.get("tree", {}), receipt.get("archiveRoundTripTree", {}))))):
             raise RuntimeError("原件回滚收据无效，不能降级使用辅助 ZIP")
         authority = path.parent / original["relativePath"]
         require_noindex(authority)
@@ -377,11 +415,168 @@ def load_receipt(path):
     return receipt, archive
 
 
+def root_provenance_evidence(app):
+    raw = {}
+    with backup.directory_fd(app, read=True) as fd:
+        backup.extended_attributes(fd, provenance=raw)
+    return raw or None
+
+
+def root_provenance_move_only(before, after):
+    """A move observation, never permission to ignore other provenance attrs."""
+    if before == after: return True
+    if before.keys() != after.keys() or "" not in before:
+        return False
+    if any(before[key] != after[key] for key in before if key):
+        return False
+    first, second = dict(before[""]), dict(after[""])
+    if first.get("type") != "directory" or second.get("type") != "directory":
+        return False
+    attributes, other = first.get("xattrs", {}), second.get("xattrs", {})
+    if backup.PROVENANCE not in attributes or backup.PROVENANCE not in other:
+        return False
+    first["xattrs"] = {key: value for key, value in attributes.items() if key != backup.PROVENANCE}
+    second["xattrs"] = {key: value for key, value in other.items() if key != backup.PROVENANCE}
+    return first == second
+
+
+def original_move_paths(receipt_path, receipt, operation):
+    formal = Path(receipt["sourcePath"])
+    authority = Path(receipt_path).absolute().parent / receipt["original"]["relativePath"]
+    if operation == "preserve": return formal, authority
+    if operation == "restore": return authority, formal
+    raise RuntimeError("原件移动阶段无效")
+
+
+def transition_path(receipt_path, operation, kind):
+    return Path(receipt_path).absolute().parent / ("original-" + operation + "." + kind + ".json")
+
+
+def read_transition(path):
+    value = backup.safe_lstat(path)
+    if value.st_uid != os.getuid() or stat.S_IMODE(value.st_mode) != 0o600:
+        raise RuntimeError("原件移动附录权限或归属不符")
+    return json.loads(backup.read_regular(path, 256 * 1024 * 1024))
+
+
+def validate_original_intent(value, receipt_path, receipt, operation, tree, location, previous):
+    source, target = original_move_paths(receipt_path, receipt, operation)
+    if (value.get("format") != 1 or value.get("operation") != operation
+            or value.get("receiptSHA256") != backup.file_digest(receipt_path)
+            or value.get("identity") != receipt["original"]["identity"]
+            or value.get("sourcePath") != str(source) or value.get("targetPath") != str(target)
+            or location != source or value.get("beforeTree") != tree
+            or value.get("metadata") != receipt["original"]["metadata"]
+            or value.get("authorityContainer") != receipt["original"]["container"]
+            or value.get("previousTransitionSHA256") != previous):
+        raise RuntimeError("原件移动意图未与精确收据、位置、身份及前序证据绑定")
+    backup.validate_provenance({"": tree[""]}, {"": value.get("beforeProvenance")})
+
+
+def original_transition_state(receipt_path, receipt):
+    """Select an exact immutable observed tree, not a normalized baseline."""
+    tree, location, previous = receipt["tree"], Path(receipt["sourcePath"]), None
+    for operation in ("preserve", "restore"):
+        complete = transition_path(receipt_path, operation, "transition")
+        intent = transition_path(receipt_path, operation, "intent")
+        if backup.optional_stat(complete) is None:
+            if operation == "preserve" and backup.optional_stat(transition_path(receipt_path, "restore", "transition")) is not None:
+                raise RuntimeError("原件移动附录链缺失前序")
+            break
+        value = read_transition(complete)
+        plan = read_transition(intent)
+        validate_original_intent(plan, receipt_path, receipt, operation, tree, location, previous)
+        required = ("format", "operation", "receiptSHA256", "identity", "sourcePath", "targetPath",
+                    "beforeTree", "beforeProvenance", "metadata", "authorityContainer", "previousTransitionSHA256")
+        if (any(value.get(key) != plan.get(key) for key in required)
+                or value.get("intentSHA256") != backup.file_digest(intent)
+                or not isinstance(value.get("afterTree"), dict)
+                or not root_provenance_move_only(tree, value["afterTree"])):
+            raise RuntimeError("原件移动附录内容、链或唯一根来源属性差异不符")
+        backup.validate_provenance({"": value["afterTree"][""]}, {"": value.get("afterProvenance")})
+        tree, location, previous = value["afterTree"], Path(value["targetPath"]), backup.file_digest(complete)
+    return tree, location, previous
+
+
+def finish_original_move(receipt_path, receipt, operation):
+    tree, location, previous = original_transition_state(receipt_path, receipt)
+    plan_path = transition_path(receipt_path, operation, "intent")
+    plan = read_transition(plan_path)
+    validate_original_intent(plan, receipt_path, receipt, operation, tree, location, previous)
+    source, target = original_move_paths(receipt_path, receipt, operation)
+    if backup.optional_stat(source) is not None or backup.optional_stat(target) is None:
+        raise RuntimeError("原件移动后的两个位置状态不符，保留现场")
+    if app_identity(target) != receipt["original"]["identity"]:
+        raise RuntimeError("移动后不是收据中的原 inode")
+    observed = backup.tree_manifest(target, allow_links=True)
+    if (not root_provenance_move_only(tree, observed)
+            or original_metadata(target, observed) != receipt["original"]["metadata"]):
+        raise RuntimeError("移动后的原件内容、身份、模式或其他属性变化，未承认来源属性迁移")
+    signature_valid(target)
+    raw = root_provenance_evidence(target)
+    backup.validate_provenance({"": observed[""]}, {"": raw})
+    # Recheck after signature/raw reads before persisting the new exact tree.
+    if (backup.tree_manifest(target, allow_links=True) != observed
+            or original_metadata(target, observed) != receipt["original"]["metadata"]):
+        raise RuntimeError("原件在移动附录持久化前变化")
+    value = dict(plan, intentSHA256=backup.file_digest(plan_path), afterTree=observed,
+                 afterProvenance=raw, observedAt=time.time())
+    write_json(transition_path(receipt_path, operation, "transition"), value)
+
+
+def reconcile_original_move(receipt_path, receipt):
+    tree, location, previous = original_transition_state(receipt_path, receipt)
+    operation = "preserve" if previous is None else "restore"
+    intent = transition_path(receipt_path, operation, "intent")
+    complete = transition_path(receipt_path, operation, "transition")
+    if backup.optional_stat(complete) is not None or backup.optional_stat(intent) is None:
+        return
+    plan = read_transition(intent)
+    validate_original_intent(plan, receipt_path, receipt, operation, tree, location, previous)
+    source, target = original_move_paths(receipt_path, receipt, operation)
+    if backup.optional_stat(source) is None and backup.optional_stat(target) is not None:
+        # Only a durable pre-move intent and the exact original inode can close
+        # an interrupted rename. Unknown movement never becomes an exception.
+        finish_original_move(receipt_path, receipt, operation)
+
+
+def record_original_move(receipt_path, app, target, operation):
+    receipt, _ = load_receipt(receipt_path)
+    tree, location, previous = original_transition_state(receipt_path, receipt)
+    source, destination = original_move_paths(receipt_path, receipt, operation)
+    if Path(app).absolute() != source or Path(target).absolute() != destination or location != source:
+        raise RuntimeError("原件移动位置或阶段与证据链不符")
+    verify_program(receipt_path, source)
+    raw = root_provenance_evidence(source)
+    backup.validate_provenance({"": tree[""]}, {"": raw})
+    plan = {"format": 1, "operation": operation, "receiptSHA256": backup.file_digest(receipt_path),
+            "identity": receipt["original"]["identity"], "sourcePath": str(source), "targetPath": str(destination),
+            "beforeTree": tree, "beforeProvenance": raw, "metadata": receipt["original"]["metadata"],
+            "authorityContainer": receipt["original"]["container"], "previousTransitionSHA256": previous}
+    intent = transition_path(receipt_path, operation, "intent")
+    if backup.optional_stat(intent) is None: write_json(intent, plan)
+    else:
+        existing = read_transition(intent)
+        validate_original_intent(existing, receipt_path, receipt, operation, tree, location, previous)
+        if existing != plan: raise RuntimeError("已存在的原件移动意图不符")
+    # A target collision is rejected atomically, without replacing either app.
+    verify_program(receipt_path, source)
+    move_program(source, destination, receipt["original"]["identity"],
+                 target_parent=receipt["original"]["container"] if operation == "preserve" else None,
+                 source_parent=receipt["original"]["container"] if operation == "restore" else None)
+    finish_original_move(receipt_path, receipt, operation)
+
+
 @backup.no_materialization
 def verify_program(receipt_path, app):
     receipt, _ = load_receipt(receipt_path)
     info(app)
-    if backup.tree_manifest(app, allow_links=True) != receipt["tree"]:
+    expected = receipt["tree"]
+    if receipt["format"] == 2:
+        expected, location, previous = original_transition_state(receipt_path, receipt)
+        if previous is not None and Path(app).absolute() != location:
+            raise RuntimeError("原件位置不符合已记录的移动链")
+    if backup.tree_manifest(app, allow_links=True) != expected:
         raise RuntimeError("展开回滚程序与核验收据不符")
     for name, checksum in receipt["tools"].items():
         if name not in ("release-safety.py", "backup-data.py") or backup.file_digest(Path(receipt_path).parent / name) != checksum:
@@ -410,14 +605,14 @@ def preserve_original(receipt_path, app):
     if Path(app).absolute() != Path(receipt["sourcePath"]):
         raise RuntimeError("待保留原件位置与持久收据不符")
     verify_program(receipt_path, app)
-    move_program(app, target, receipt["original"]["identity"], target_parent=receipt["original"]["container"])
+    record_original_move(receipt_path, app, target, "preserve")
     verify_program(receipt_path, target)
     # PREPARED alone is never a completed backup. Only a verified moved inode
     # earns this marker, and it lives outside the installer's disposable WORK.
     write_json(Path(receipt_path).parent / "VERIFIED", {
         "format": 2, "authorityAtVerification": str(target), "identity": app_identity(target),
         "receiptSHA256": backup.file_digest(receipt_path),
-        "treeSHA256": backup.digest(receipt["tree"]), "verifiedAt": time.time(),
+        "treeSHA256": backup.digest(original_transition_state(receipt_path, receipt)[0]), "verifiedAt": time.time(),
         "rootCtimeNs": backup.safe_lstat(target).st_ctime_ns})
 
 
@@ -425,6 +620,7 @@ def preserve_original(receipt_path, app):
 def restore_original(receipt_path):
     receipt, _ = load_receipt(receipt_path)
     source = original_path(receipt_path)
+    reconcile_original_move(receipt_path, receipt)
     target = Path(receipt["sourcePath"])
     # A failed preserve may have moved the inode before its final fsync/marker.
     # Recovery relies on actual identity/tree, never a marker or ZIP copy.
@@ -435,7 +631,12 @@ def restore_original(receipt_path):
         verify_program(receipt_path, target)
     else:
         verify_program(receipt_path, source)
-        move_program(source, target, receipt["original"]["identity"], source_parent=receipt["original"]["container"])
+        if backup.optional_stat(transition_path(receipt_path, "preserve", "transition")) is not None:
+            record_original_move(receipt_path, source, target, "restore")
+        else:
+            # Legacy receipts keep their old strict tree behavior. They have no
+            # durable evidence authorizing a provenance move transition.
+            move_program(source, target, receipt["original"]["identity"], source_parent=receipt["original"]["container"])
         verify_program(receipt_path, target)
         moved = True
     # VERIFIED records the earlier successful backup, not a live location
@@ -443,7 +644,7 @@ def restore_original(receipt_path):
     # so a full disk or receipt error cannot stop the filesystem restoration.
     state = {"format": 2, "authority": str(target), "identity": app_identity(target),
              "receiptSHA256": backup.file_digest(receipt_path),
-             "status": "restored-original" if moved else "original-remained-installed",
+             "status": "restored-original" if moved or backup.optional_stat(transition_path(receipt_path, "restore", "transition")) is not None else "original-remained-installed",
              "previousAuthority": str(source), "restoredAt": time.time(),
              "rootCtimeNs": backup.safe_lstat(target).st_ctime_ns}
     marker = Path(receipt_path).parent / "RESTORED.json"
@@ -509,8 +710,9 @@ def archive_program(app, directory):
     if backup.file_digest(archive) != archive_checksum:
         raise RuntimeError("程序归档在核验期间变化")
     retained = baseline != restored
-    if retained and not only_root_macl_missing(baseline, restored):
-        raise RuntimeError("程序恢复内容、模式、链接或扩展属性不符；不是唯一根 macl 差异")
+    archive_gaps = original_retention_archive_gaps(baseline, restored) if retained else None
+    if retained and not archive_gaps:
+        raise RuntimeError("程序恢复内容、模式、链接或扩展属性不符；不是唯一根 macl 缺失或 com.apple.provenance 系统赋值差异")
     if (app_identity(app) != identity or backup.tree_manifest(app, allow_links=True) != baseline
             or original_metadata(app, baseline) != metadata):
         raise RuntimeError("旧程序在归档期间变化，停止安装")
@@ -530,6 +732,7 @@ def archive_program(app, directory):
                 raise RuntimeError("权威原件备份必须与原程序同卷，未移动旧程序")
             os.fsync(parent)
         receipt.update(format=2, archiveRole="supplemental-only", archiveRoundTripTree=restored,
+                       archiveRoundTripGaps=archive_gaps,
                        original={"relativePath": "Program.noindex/" + app.name,
                                  "identity": identity, "metadata": metadata,
                                  "container": original_container(container),
@@ -543,7 +746,8 @@ def archive_program(app, directory):
     write_json(receipt_path, receipt)
     if retained:
         instructions = (
-            "格式 2：ZIP 解包唯一缺失根 com.apple.macl，ZIP 仅为辅助，不是完整恢复备份。\n"
+            "格式 2：ZIP 解包有 com.apple.provenance 系统赋值差异和/或唯一根 com.apple.macl 缺失，精确差异见收据。\n"
+            "ZIP 仅为辅助，不是完整恢复备份；不能忽略这些属性来声称归档精确。\n"
             "receipt.json 为不可变计划；PREPARED.json 只表示原位准备，不能视为备份通过。\n"
             "VERIFIED 仅记历史核验：原 inode 当时已移动至 Program.noindex/搞机灵.app。\n"
             "如有 RESTORED.json，其 authority 是随后恢复并完整核验的真实正式位置，优先于历史 VERIFIED。\n"

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Private, verified upgrade backup; never put its output in a release package."""
 import argparse
+import base64
 import contextlib
 import ctypes
 import functools
@@ -15,6 +16,7 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import tempfile
 import time
 import uuid
 
@@ -29,6 +31,8 @@ DATALESS = getattr(stat, "SF_DATALESS", 0x40000000)
 UNINSTALL_MARKER = b"GaoJiLing.UninstallJournal.v1\n"
 DUPLICATE_MARKER = b"GaoJiLing.DuplicateJournal.v1\n"
 MISSING_CLEANUP_REASON = "userConfirmedExternalRemoval"
+PROVENANCE = "com.apple.provenance"
+DATA_COPY_POLICY = "system-assigned-provenance-only-v1"
 
 def confirmed_missing_policy(value):
     """Explicit consent for exact historical Cleanup receipts, never a switch
@@ -64,7 +68,7 @@ def load_confirmed_missing(path):
         return result
     return confirmed_missing_policy(json.loads(read_regular(path, 64 * 1024), object_pairs_hook=unique_object))
 
-def extended_attributes(fd, output=None):
+def extended_attributes(fd, output=None, provenance=None, data_copy=False):
     # Darwin provides these fd variants; this Python build has no os.*xattr.
     system = ctypes.CDLL(None, use_errno=True)
     system.flistxattr.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
@@ -86,6 +90,13 @@ def extended_attributes(fd, output=None):
         if not name: continue
         value = sized(lambda buffer, count: system.fgetxattr(fd, name, buffer, count, 0, 0))
         result[os.fsdecode(name)] = hashlib.sha256(value).hexdigest()
+        if name == PROVENANCE.encode() and provenance is not None:
+            provenance.update(base64=base64.b64encode(value).decode("ascii"),
+                              byteCount=len(value), sha256=hashlib.sha256(value).hexdigest())
+        # macOS assigns this attribute to the new object. Preserve its original
+        # bytes as evidence; never rewrite the source or claim the copy has the
+        # same provenance. All other attributes retain exact copy semantics.
+        if data_copy and name == PROVENANCE.encode(): continue
         if output is not None and system.fsetxattr(output, name, value, len(value), 0, 0) != 0:
             raise OSError(ctypes.get_errno(), "无法保存扩展属性")
     return result
@@ -167,11 +178,14 @@ def digest(value):
 def file_digest(path):
     return tree_manifest(Path(path))[""]["sha256"]
 
-def tree_manifest(path, allow_links=False, copy_to=None, exclude=()):
+def tree_manifest(path, allow_links=False, copy_to=None, exclude=(), provenance=None,
+                  identities=None, data_copy=False):
     """Bounded nofollow walk. Regular data is copied through pinned FDs;
     app framework links are copied as link text, never as their target contents.
     """
     path = Path(path); result = {}; count = 0
+    if data_copy and provenance is None:
+        raise RuntimeError("资料复制必须保留系统来源属性证据")
     root_info = safe_lstat(path)
     if stat.S_ISLNK(root_info.st_mode): raise RuntimeError("恢复根项目不能是链接")
     def walk(parent, name, relative, target):
@@ -182,6 +196,7 @@ def tree_manifest(path, allow_links=False, copy_to=None, exclude=()):
         if before.st_dev != root_info.st_dev or before.st_uid not in (0, os.getuid()):
             raise RuntimeError("备份树跨卷或含其他用户的文件")
         mode = stat.S_IMODE(before.st_mode)
+        if identities is not None: identities[relative] = list(signature(before))
         if stat.S_ISLNK(before.st_mode):
             if not allow_links or not relative: raise RuntimeError("资料含链接，不能跟随备份")
             text = os.readlink(name, dir_fd=parent)
@@ -196,7 +211,9 @@ def tree_manifest(path, allow_links=False, copy_to=None, exclude=()):
                 if target is not None: target.mkdir(mode=0o700)
                 with contextlib.ExitStack() as stack:
                     output = stack.enter_context(directory_fd(target)) if target is not None else None
-                    attributes = extended_attributes(fd, output)
+                    raw = {} if provenance is not None else None
+                    attributes = extended_attributes(fd, output, raw, data_copy)
+                if provenance is not None: provenance[relative] = raw or None
                 result[relative] = {"type": "directory", "mode": mode, "xattrs": attributes}
                 for child in sorted(os.listdir(fd)):
                     if not relative and child in exclude: continue
@@ -224,7 +241,9 @@ def tree_manifest(path, allow_links=False, copy_to=None, exclude=()):
                         wrote = os.write(out, chunk[offset:])
                         if wrote <= 0: raise RuntimeError("备份文件未完整写入")
                         offset += wrote
-            attributes = extended_attributes(fd, out)
+            raw = {} if provenance is not None else None
+            attributes = extended_attributes(fd, out, raw, data_copy)
+            if provenance is not None: provenance[relative] = raw or None
             if signature(before) != signature(os.fstat(fd)) or size != before.st_size:
                 raise RuntimeError("文件在备份期间改变")
             result[relative] = {"type": "file", "mode": mode, "sha256": checksum.hexdigest(), "xattrs": attributes}
@@ -236,6 +255,76 @@ def tree_manifest(path, allow_links=False, copy_to=None, exclude=()):
     with directory_fd(path.parent) as parent:
         walk(parent, path.name, "", Path(copy_to) if copy_to is not None else None)
     return result
+
+def validate_provenance(tree, evidence):
+    """Raw bytes are private backup evidence, not a replacement attribute."""
+    if not isinstance(evidence, dict) or set(evidence) != {key for key, row in tree.items() if row["type"] != "link"}:
+        raise RuntimeError("系统来源属性证据不完整")
+    for key, value in evidence.items():
+        checksum = tree[key].get("xattrs", {}).get(PROVENANCE)
+        if value is None:
+            if checksum is not None: raise RuntimeError("系统来源属性存在状态不符")
+            continue
+        if not isinstance(value, dict) or set(value) != {"base64", "byteCount", "sha256"}:
+            raise RuntimeError("系统来源属性证据格式不符")
+        if (not isinstance(value["base64"], str) or type(value["byteCount"]) is not int
+                or not 0 <= value["byteCount"] <= 16 * 1024 * 1024):
+            raise RuntimeError("系统来源属性证据长度或编码无效")
+        try: raw = base64.b64decode(value["base64"], validate=True)
+        except (ValueError, TypeError): raise RuntimeError("系统来源属性证据编码不符") from None
+        if len(raw) != value["byteCount"] or hashlib.sha256(raw).hexdigest() != value["sha256"] or value["sha256"] != checksum:
+            raise RuntimeError("系统来源属性原始证据摘要不符")
+
+def data_copy_equivalent(source, copied):
+    """Only for data copies; never program archive or original-inode fidelity."""
+    def without_provenance(tree):
+        return {key: {**row, "xattrs": {name: value for name, value in row["xattrs"].items() if name != PROVENANCE}}
+                if "xattrs" in row else row for key, row in tree.items()}
+    return without_provenance(source) == without_provenance(copied)
+
+def data_tree_state(path, allow_links=False, exclude=()):
+    raw, identities = {}, {}
+    tree = tree_manifest(path, allow_links=allow_links, exclude=exclude,
+                         provenance=raw, identities=identities)
+    validate_provenance(tree, raw)
+    return tree, raw, identities
+
+def copy_data_tree(source, destination, allow_links=False, exclude=(), expected=None):
+    """Verified data backup/restore copy with a separate exact source baseline.
+
+    The destination keeps the provenance assigned by macOS. No identity, mode,
+    content or other xattr exception is granted to the source or copied tree.
+    """
+    before, source_raw, source_ids = data_tree_state(source, allow_links, exclude)
+    if expected is not None and before != expected:
+        raise RuntimeError("资料源与已核验清单不符")
+    copy_raw, copy_ids = {}, {}
+    observed = tree_manifest(source, allow_links=allow_links, copy_to=destination, exclude=exclude,
+                             provenance=copy_raw, identities=copy_ids, data_copy=True)
+    copied, destination_raw, _ = data_tree_state(destination, allow_links, exclude)
+    if (observed != before or copy_raw != source_raw or copy_ids != source_ids
+            or data_tree_state(source, allow_links, exclude) != (before, source_raw, source_ids)
+            or not data_copy_equivalent(before, copied)):
+        raise RuntimeError("资料源、身份、内容、模式或扩展属性在复制时变化")
+    return {"format": 1, "policy": DATA_COPY_POLICY, "sourceTree": before, "copyTree": copied,
+            "sourceProvenance": source_raw, "copyProvenance": destination_raw,
+            "sourceIdentities": source_ids}
+
+def verify_data_copy(metadata, copied, allow_links=False, exclude=(), source=None, source_identity=False):
+    if metadata.get("format") != 1 or metadata.get("policy") != DATA_COPY_POLICY:
+        raise RuntimeError("资料副本元数据策略无效")
+    validate_provenance(metadata["sourceTree"], metadata["sourceProvenance"])
+    validate_provenance(metadata["copyTree"], metadata["copyProvenance"])
+    if not data_copy_equivalent(metadata["sourceTree"], metadata["copyTree"]):
+        raise RuntimeError("资料副本存在非系统来源属性差异")
+    tree, raw, _ = data_tree_state(copied, allow_links, exclude)
+    if tree != metadata["copyTree"] or raw != metadata["copyProvenance"]:
+        raise RuntimeError("已核验资料副本发生变化")
+    if source is not None:
+        tree, raw, identities = data_tree_state(source, allow_links, exclude)
+        if (tree != metadata["sourceTree"] or raw != metadata["sourceProvenance"]
+                or (source_identity and identities != metadata["sourceIdentities"])):
+            raise RuntimeError("原资料的内容、属性或身份发生变化")
 
 def row_digest(row, columns):
     normalized = list(row)
@@ -252,6 +341,12 @@ def manifest(directory, exclude=()):
     return {name: value["sha256"] for name, value in result.items() if value["type"] == "file" and name not in exclude}
 
 def records(directory):
+    # mode=ro still lets SQLite rebuild/update a WAL-index on disk. Never
+    # connect SQLite to the user's actual three-file set, even for validation.
+    with isolated_sqlite_inputs(directory) as (isolated, _, _):
+        return records_on_isolated_input(isolated)
+
+def records_on_isolated_input(directory):
     file = directory / "monitor.sqlite"
     before = optional_stat(file)
     if before is None or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != os.getuid():
@@ -677,23 +772,109 @@ def recovery_objects(source, home, confirmed_missing_cleanup=None, missing_clean
     if missing_cleanup is not None: missing_cleanup.extend(sorted(observed_missing, key=lambda item: item["receiptID"]))
     return objects
 
+def sqlite_metadata(directory):
+    """Evidence only: SQLite backup is a logical snapshot, not a file copy."""
+    result = {}
+    with directory_fd(directory) as parent:
+        for name in sorted(DB_FILES):
+            before = optional_stat(directory / name)
+            if before is None:
+                result[name] = {"present": False}
+                continue
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != os.getuid():
+                raise RuntimeError("数据库元数据对象不是当前用户的独立普通文件")
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            try:
+                if signature(before) != signature(os.fstat(fd)):
+                    raise RuntimeError("数据库元数据对象在打开时变化")
+                raw = {}; attributes = extended_attributes(fd, provenance=raw)
+                checksum = hashlib.sha256(); size = 0
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk: break
+                    checksum.update(chunk); size += len(chunk)
+                if (signature(before) != signature(os.fstat(fd)) or signature(before) != signature(checked_stat(name, parent))
+                        or size != before.st_size):
+                    raise RuntimeError("数据库元数据对象在读取时变化")
+                validate_provenance({"": {"type": "file", "xattrs": attributes}}, {"": raw or None})
+                result[name] = {"present": True, "identity": list(signature(before)),
+                                "xattrs": attributes, "provenance": raw or None,
+                                "sha256": checksum.hexdigest()}
+            finally: os.close(fd)
+    return result
+
+def validate_sqlite_metadata(metadata):
+    if not isinstance(metadata, dict) or set(metadata) != DB_FILES:
+        raise RuntimeError("数据库来源属性证据不完整")
+    for row in metadata.values():
+        if isinstance(row, dict) and set(row) == {"present"} and row["present"] is False: continue
+        if (not isinstance(row, dict) or row.get("present") is not True
+                or set(row) not in ({"present", "identity", "xattrs", "provenance"},
+                                    {"present", "identity", "xattrs", "provenance", "sha256"})):
+            raise RuntimeError("数据库来源属性证据格式无效")
+        if "sha256" in row and (not isinstance(row["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", row["sha256"])):
+            raise RuntimeError("数据库原始文件摘要无效")
+        validate_provenance({"": {"type": "file", "xattrs": row["xattrs"]}}, {"": row["provenance"]})
+
+def require_sqlite_unchanged(source, baseline, phase):
+    observed = sqlite_metadata(source)
+    if observed != baseline:
+        changes = {name: sorted(key for key in set(baseline[name]) | set(observed[name])
+                                if baseline[name].get(key) != observed[name].get(key))
+                   for name in sorted(DB_FILES) if baseline[name] != observed[name]}
+        # Report field names only, never rows or raw provenance values.
+        raise RuntimeError("数据库三文件在" + phase + "变化：" + json.dumps(changes, ensure_ascii=False))
+
+@contextlib.contextmanager
+def isolated_sqlite_inputs(source):
+    """Capture a stable three-file input without ever opening the source in SQL.
+
+    Raw input is only an intermediate to SQLite's logical backup API. All
+    source files, including SHM, must retain exact identity, bytes and xattrs.
+    SQLite may rebuild its private input SHM, never the source SHM.
+    """
+    source = Path(source)
+    baseline = sqlite_metadata(source)
+    if not baseline["monitor.sqlite"]["present"]:
+        raise RuntimeError("原数据库缺失，未创建空数据库或覆盖资料")
+    with tempfile.TemporaryDirectory(prefix="gaojiling-sqlite-input-", suffix=".noindex", dir="/private/tmp") as temporary:
+        isolated = Path(temporary); copies = {}
+        for name in sorted(DB_FILES):
+            if not baseline[name]["present"]: continue
+            copies[name] = copy_data_tree(source / name, isolated / name)
+            observed = copies[name]
+            if (observed["sourceIdentities"][""] != baseline[name]["identity"]
+                    or observed["sourceTree"][""]["sha256"] != baseline[name]["sha256"]
+                    or observed["sourceTree"][""]["xattrs"] != baseline[name]["xattrs"]
+                    or observed["sourceProvenance"][""] != baseline[name]["provenance"]):
+                raise RuntimeError("原数据库文件与隔离输入的基线不符")
+        require_sqlite_unchanged(source, baseline, "隔离复制期间")
+        for name, metadata in copies.items():
+            verify_data_copy(metadata, isolated / name, source=source / name, source_identity=True)
+        try:
+            yield isolated, baseline, copies
+        finally:
+            require_sqlite_unchanged(source, baseline, "隔离核验期间")
+
 def sqlite_snapshot(source, destination):
-    original = source / "monitor.sqlite"
-    before = safe_lstat(original)
-    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1: raise RuntimeError("数据库不是独立普通文件")
-    with contextlib.closing(sqlite3.connect(original.as_uri() + "?mode=ro", uri=True)) as incoming:
-        with contextlib.closing(sqlite3.connect(destination / "monitor.sqlite")) as outgoing:
-            incoming.backup(outgoing)
-            if outgoing.execute("PRAGMA quick_check").fetchone()[0] != "ok": raise RuntimeError("数据库快照核验失败")
-            outgoing.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            outgoing.execute("PRAGMA journal_mode=DELETE")
-    after = safe_lstat(original)
-    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino): raise RuntimeError("数据库在快照期间被替换")
+    with isolated_sqlite_inputs(source) as (isolated, source_metadata, input_copies):
+        original = isolated / "monitor.sqlite"
+        with contextlib.closing(sqlite3.connect(original.as_uri() + "?mode=ro", uri=True)) as incoming:
+            with contextlib.closing(sqlite3.connect(destination / "monitor.sqlite")) as outgoing:
+                incoming.backup(outgoing)
+                if outgoing.execute("PRAGMA quick_check").fetchone()[0] != "ok": raise RuntimeError("数据库快照核验失败")
+                outgoing.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                outgoing.execute("PRAGMA journal_mode=DELETE")
     os.chmod(destination / "monitor.sqlite", 0o600)
     with directory_fd(destination) as parent:
         fd = os.open("monitor.sqlite", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
         try: os.fsync(fd); os.fsync(parent)
         finally: os.close(fd)
+    if sqlite_metadata(source) != source_metadata:
+        raise RuntimeError("原数据库对象或系统来源属性在快照期间变化")
+    return {"kind": "logicalSQLiteSnapshot", "source": source_metadata,
+            "copy": sqlite_metadata(destination), "readStrategy": "isolatedFixedFileCopy",
+            "isolatedInputEvidenceStage": "beforeSQLiteOpen", "isolatedInputCopies": input_copies}
 
 @no_materialization
 def make_backup(source, destination, preferences, home=None, confirmed_missing_cleanup=None):
@@ -705,31 +886,38 @@ def make_backup(source, destination, preferences, home=None, confirmed_missing_c
     missing_cleanup = []
     recovery = recovery_objects(source, home or Path.home(), policy, missing_cleanup)
     destination.mkdir(mode=0o700, parents=True, exist_ok=False)
-    data_tree = tree_manifest(source, exclude=DB_FILES)
-    copied_tree = tree_manifest(source, copy_to=destination / "Data", exclude=DB_FILES)
-    sqlite_snapshot(source, destination / "Data")
-    if copied_tree != data_tree or tree_manifest(source, exclude=DB_FILES) != data_tree or tree_manifest(destination / "Data", exclude=DB_FILES) != data_tree:
-        raise RuntimeError("备份期间资料变化或校验失败，保留原资料和备份，停止安装")
+    data_copy = copy_data_tree(source, destination / "Data", exclude=DB_FILES)
+    sqlite_copy = sqlite_snapshot(source, destination / "Data")
+    verify_data_copy(data_copy, destination / "Data", exclude=DB_FILES, source=source, source_identity=True)
+    if sqlite_metadata(source) != sqlite_copy["source"] or sqlite_metadata(destination / "Data") != sqlite_copy["copy"]:
+        raise RuntimeError("数据库对象或属性在备份期间变化")
     if records(destination / "Data") != baseline or records(source) != baseline:
         raise RuntimeError("备份数据库摘要不一致，停止安装")
+    recovery_copies = {}
     for name, content in recovery.items():
         path = Path(name)
         target = destination / "RecoveryObjects" / hashlib.sha256(name.encode()).hexdigest()
         target.parent.mkdir(mode=0o700, exist_ok=True)
-        copied = tree_manifest(path, allow_links=content["allowLinks"], copy_to=target)
-        if copied != content["tree"] or tree_manifest(path, allow_links=content["allowLinks"]) != content["tree"] or tree_manifest(target, allow_links=content["allowLinks"]) != content["tree"]:
-            raise RuntimeError("清理恢复实物备份校验失败，停止安装")
+        recovery_copies[name] = copy_data_tree(path, target, allow_links=content["allowLinks"], expected=content["tree"])
     checked_missing = []
     checked_recovery = recovery_objects(source, home or Path.home(), policy, checked_missing)
     if manifest(source, exclude=DB_FILES) != before or checked_recovery != recovery or checked_missing != missing_cleanup:
         raise RuntimeError("资料或恢复记录在备份期间变化，停止安装")
+    verify_data_copy(data_copy, destination / "Data", exclude=DB_FILES, source=source, source_identity=True)
+    for name, metadata in recovery_copies.items():
+        verify_data_copy(metadata, destination / "RecoveryObjects" / hashlib.sha256(name.encode()).hexdigest(),
+                         allow_links=recovery[name]["allowLinks"], source=Path(name), source_identity=True)
+    if sqlite_metadata(source) != sqlite_copy["source"] or sqlite_metadata(destination / "Data") != sqlite_copy["copy"]:
+        raise RuntimeError("数据库对象或属性在备份完成前变化")
     (destination / "preferences.plist").write_bytes(preferences)
     (destination / "baseline.json").write_text(json.dumps({"data": baseline, "files": before, "recovery": recovery, "startedAt": started_at,
-        "confirmedMissingCleanup": policy, "missingCleanup": missing_cleanup}, ensure_ascii=False))
+        "confirmedMissingCleanup": policy, "missingCleanup": missing_cleanup,
+        "copyMetadata": {"data": data_copy, "recovery": recovery_copies, "sqlite": sqlite_copy}}, ensure_ascii=False))
     for path in destination.iterdir():
         if path.is_file():
             path.chmod(0o600)
     (destination / "VERIFIED").write_text("Existing data, attachments, database integrity, preferences and present recovery objects verified.\n" +
+        "Only OS-assigned com.apple.provenance may differ on new data copies; source and copy raw attribute evidence retained separately; all other attributes exact.\n" +
         "User-confirmed externally removed Cleanup receipts: " + str(len(missing_cleanup)) + "; original journals and missing-object details retained; these objects are not recoverable from this backup.\n")
     (destination / "VERIFIED").chmod(0o600)
     return destination, missing_cleanup
@@ -739,6 +927,18 @@ def verify_update(backup, source, preferences, home=None, confirmed_missing_clea
     if not (backup / "VERIFIED").is_file():
         raise RuntimeError("未找到已核验备份，停止清理旧程序")
     old = json.loads((backup / "baseline.json").read_text())
+    copy_metadata = old.get("copyMetadata")
+    if copy_metadata is not None:
+        if set(copy_metadata) != {"data", "recovery", "sqlite"} or set(copy_metadata["recovery"]) != set(old.get("recovery", {})):
+            raise RuntimeError("资料副本核验清单不完整")
+        verify_data_copy(copy_metadata["data"], backup / "Data", exclude=DB_FILES)
+        sqlite_copy = copy_metadata["sqlite"]
+        validate_sqlite_metadata(sqlite_copy["source"])
+        validate_sqlite_metadata(sqlite_copy["copy"])
+        if (sqlite_copy.get("kind") != "logicalSQLiteSnapshot" or set(sqlite_copy["source"]) != DB_FILES
+                or sqlite_metadata(backup / "Data") != sqlite_copy["copy"]
+                or records(backup / "Data") != old["data"]):
+            raise RuntimeError("原数据库逻辑快照或属性未通过备份核验")
     policy = confirmed_missing_policy(confirmed_missing_cleanup)
     if confirmed_missing_policy(old.get("confirmedMissingCleanup")) != policy:
         raise RuntimeError("须显式提供与此备份一致的清理实物移除确认白名单")
@@ -784,7 +984,13 @@ def verify_update(backup, source, preferences, home=None, confirmed_missing_clea
             valid = (info.st_dev, info.st_ino, info.st_uid) == (identity["device"], identity["inode"], identity["uid"])
             valid = valid and tree_manifest(Path(name), allow_links=content["allowLinks"]) == content["tree"]
             copied = backup / "RecoveryObjects" / hashlib.sha256(name.encode()).hexdigest()
-            valid = valid and tree_manifest(copied, allow_links=content["allowLinks"]) == content["tree"]
+            if copy_metadata is not None:
+                metadata = copy_metadata["recovery"][name]
+                if metadata["sourceTree"] != content["tree"]:
+                    raise RuntimeError("恢复实物原树与副本证据不符")
+                verify_data_copy(metadata, copied, allow_links=content["allowLinks"], source=Path(name), source_identity=True)
+            else:
+                valid = valid and tree_manifest(copied, allow_links=content["allowLinks"]) == content["tree"]
         else: valid = object_manifest(Path(name)) == content  # pre-V1.10 backups
         if not valid:
             raise RuntimeError("原清理恢复实物未通过保留核验")

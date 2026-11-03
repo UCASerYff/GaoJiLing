@@ -23,6 +23,7 @@ extension Notification.Name {
     @Published var focusedEvent: MonitorEvent?
     @Published var eventHistory: [MetricsSample] = []
     @Published var dataBusy = false
+    var dataActionsAllowed: () -> Bool = { true }
     @Published var dataSummaryText = "正在读取本地数据…"
     @Published var dataSizeText = "—"
     @Published var lastExportURL: URL?
@@ -247,13 +248,13 @@ extension MonitorStore {
         if let lastExportURL { NSWorkspace.shared.activateFileViewerSelecting([lastExportURL]) }
     }
     func exportTable(_ kind: String, days: Int, since requestedStart: Date? = nil, until requestedEnd: Date? = nil) {
-        guard !dataBusy else { return }
+        guard !dataBusy, dataActionsAllowed() else { return }
         guard let database else { storageUnavailable(); return }
         checkpoint()
         let title = kind == "events" ? "异常事件" : kind == "sessions" ? "任务汇总" : "监控记录"
         let panel = NSSavePanel(); panel.allowedContentTypes = [.commaSeparatedText]
         panel.nameFieldStringValue = "搞机灵-\(title)-\(Date().formatted(.iso8601.year().month().day().dateSeparator(.dash))).csv"
-        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        guard panel.runModal() == .OK, let destination = panel.url, dataActionsAllowed() else { return }
         do { try database.validateExportDestination(destination) } catch { statusMessage = error.localizedDescription; return }
         dataBusy = true; statusMessage = "正在导出\(title)…"
         let directory = database.directory
@@ -282,12 +283,12 @@ extension MonitorStore {
         }
     }
     func exportFullBackup() {
-        guard !dataBusy else { return }
+        guard !dataBusy, dataActionsAllowed() else { return }
         guard let database else { storageUnavailable(); return }
         checkpoint()
         let panel = NSSavePanel(); panel.allowedContentTypes = [.json]
         panel.nameFieldStringValue = "搞机灵-完整备份-\(backupStamp()).json"
-        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        guard panel.runModal() == .OK, let destination = panel.url, dataActionsAllowed() else { return }
         dataBusy = true; statusMessage = "正在备份全部历史、任务和设置，并校验文件…"
         let directory = database.directory, prefs = savedEdgePreferences
         Task {
@@ -302,12 +303,12 @@ extension MonitorStore {
         }
     }
     func restoreFullBackup() {
-        guard !dataBusy else { return }
+        guard !dataBusy, dataActionsAllowed() else { return }
         guard let database else { storageUnavailable(); return }
         guard activeSession == nil else { statusMessage = "请先结束当前任务记录，再恢复备份。"; return }
         let panel = NSOpenPanel(); panel.allowedContentTypes = [.json]; panel.allowsMultipleSelection = false; panel.canChooseDirectories = false
         panel.message = "选择搞机灵导出的完整备份 JSON 文件"
-        guard panel.runModal() == .OK, let source = panel.url else { return }
+        guard panel.runModal() == .OK, let source = panel.url, dataActionsAllowed() else { return }
         dataBusy = true; statusMessage = "正在核验备份…"
         let directory = database.directory
         Task {
@@ -384,7 +385,7 @@ extension MonitorStore {
         }
     }
     func clearSavedData(_ scope: MonitorDataScope) {
-        guard !dataBusy else { return }
+        guard !dataBusy, dataActionsAllowed() else { return }
         guard let database else { storageUnavailable(); return }
         guard activeSession == nil else { statusMessage = "请先结束当前任务记录，再清理数据。"; return }
         let title: String
@@ -392,7 +393,7 @@ extension MonitorStore {
         let alert = NSAlert(); alert.alertStyle = .warning; alert.messageText = "清空全部\(title)？"
         alert.informativeText = "只删除\(title)，其他记录和设置保持不变。此操作无法撤销，请先导出完整备份。"
         alert.addButton(withTitle: "取消"); alert.addButton(withTitle: "清空\(title)")
-        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        guard alert.runModal() == .alertSecondButtonReturn, dataActionsAllowed() else { return }
         do {
             _ = try database.clearData(scope)
             switch scope {

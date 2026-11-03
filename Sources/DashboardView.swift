@@ -78,6 +78,7 @@ struct DashboardView: View {
     @ObservedObject var store: MonitorStore
     @ObservedObject var cleanup: CleanupController
     @ObservedObject var analysis: StorageAnalysisController
+    @ObservedObject var diskStorage: DiskStorageController
     var openSettings: () -> Void
     @ObservedObject var manager: AppManagementController
     @ObservedObject var maintenance: MaintenanceController
@@ -127,11 +128,11 @@ struct DashboardView: View {
                         case .history: history
                         case .sessions: sessions
                         case .network: network
-                        case .cleanup: CleanupView(cleanup: cleanup, dataBusy: store.dataBusy || analysis.isBusy || duplicates.isBusy || manager.isBusy || exchange.isBusy)
+                        case .cleanup: CleanupView(cleanup: cleanup, dataBusy: store.dataBusy || diskStorage.isBusy || analysis.isBusy || duplicates.isBusy || manager.isBusy || exchange.isBusy)
                         case .storage: storageWorkspace
-                        case .maintenance: MaintenanceView(store: store, maintenance: maintenance).disabled(store.dataBusy || cleanup.isBusy || analysis.isBusy || duplicates.isBusy || manager.isBusy || exchange.isBusy)
-                        case .appManagement: AppManagementView(manager: manager, dataBusy: store.dataBusy || cleanup.isBusy || analysis.isBusy || duplicates.isBusy || exchange.isBusy)
-                        case .exchange: GAExchangeView(exchange: exchange, dataBusy: store.dataBusy || cleanup.isBusy || analysis.isBusy || duplicates.isBusy || manager.isBusy)
+                        case .maintenance: MaintenanceView(store: store, maintenance: maintenance).disabled(store.dataBusy || diskStorage.isBusy || cleanup.isBusy || analysis.isBusy || duplicates.isBusy || manager.isBusy || exchange.isBusy)
+                        case .appManagement: AppManagementView(manager: manager, dataBusy: store.dataBusy || diskStorage.isBusy || cleanup.isBusy || analysis.isBusy || duplicates.isBusy || exchange.isBusy)
+                        case .exchange: GAExchangeView(exchange: exchange, dataBusy: store.dataBusy || diskStorage.isBusy || cleanup.isBusy || analysis.isBusy || duplicates.isBusy || manager.isBusy)
                         }
                     }
                     .disabled(store.dataBusy)
@@ -157,11 +158,14 @@ struct DashboardView: View {
             Picker("分析方式", selection: $navigation.storageMode) {
                 Text("占用与磁盘地图").tag("metadata")
                 Text("重复文件内容分析").tag("duplicates")
-            }.pickerStyle(.segmented).disabled(analysis.isBusy || duplicates.isBusy)
-            if navigation.storageMode == "duplicates" {
-                DuplicateAnalysisView(controller: duplicates, dataBusy: store.dataBusy || cleanup.isBusy || analysis.isBusy || manager.isBusy || exchange.isBusy)
+                Text("卷与镜像").tag("disk")
+            }.pickerStyle(.segmented).disabled(analysis.isBusy || duplicates.isBusy || diskStorage.isBusy)
+            if navigation.storageMode == "disk" {
+                DiskStorageView(controller: diskStorage, dataBusy: store.dataBusy || cleanup.isBusy || analysis.isBusy || duplicates.isBusy || manager.isBusy || exchange.isBusy)
+            } else if navigation.storageMode == "duplicates" {
+                DuplicateAnalysisView(controller: duplicates, dataBusy: store.dataBusy || diskStorage.isBusy || cleanup.isBusy || analysis.isBusy || manager.isBusy || exchange.isBusy)
             } else {
-                StorageAnalysisView(analysis: analysis, dataBusy: store.dataBusy || cleanup.isBusy || duplicates.isBusy || manager.isBusy || exchange.isBusy)
+                StorageAnalysisView(analysis: analysis, dataBusy: store.dataBusy || diskStorage.isBusy || cleanup.isBusy || duplicates.isBusy || manager.isBusy || exchange.isBusy)
             }
         }
     }

@@ -6,6 +6,7 @@ Installer tests execute a fixture copy after replacing every system/app path;
 all process, launch, mount, signing and registry commands are mandatory stubs.
 """
 import importlib.util
+import base64
 import hashlib
 import json
 import os
@@ -163,6 +164,343 @@ class ArchiveTests(unittest.TestCase):
             self.assertFalse(safety.only_root_macl_missing(expected, variant), variant)
         self.assertFalse(safety.only_root_macl_missing({}, {}))
         self.assertFalse(safety.only_root_macl_missing(expected, expected))
+
+    def retained_provenance_archive(self, root_macl=False):
+        destination = mock.patch.object(safety, "DESTINATION", self.app)
+        destination.start(); self.addCleanup(destination.stop)
+        actual = safety.backup.tree_manifest
+        self.synthetic_original_provenance = "1" * 64
+        def simulated_system_copy_metadata(path, *args, **kwargs):
+            result = actual(path, *args, **kwargs)
+            # Read real synthetic bundle bytes/modes. Only the OS provenance
+            # oracle is injected; never set or delete these system attributes.
+            if Path(path).name == self.app.name:
+                expanded = any(part.startswith("program-check-") for part in Path(path).parts)
+                seed = "2" * 64 if expanded else self.synthetic_original_provenance
+                result[""]["xattrs"]["com.apple.provenance"] = hashlib.sha256(seed.encode()).hexdigest()
+                result["Contents/MacOS/GaoJiLing"]["xattrs"]["com.apple.provenance"] = "4" * 64 if expanded else "3" * 64
+                if root_macl and not expanded:
+                    result[""]["xattrs"]["com.apple.macl"] = "synthetic-macl-digest"
+            return result
+        patcher = mock.patch.object(safety.backup, "tree_manifest", side_effect=simulated_system_copy_metadata)
+        patcher.start(); self.addCleanup(patcher.stop)
+        def raw_provenance(path):
+            raw = self.synthetic_original_provenance.encode()
+            return {"base64": base64.b64encode(raw).decode(), "byteCount": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest()}
+        raw_patch = mock.patch.object(safety, "root_provenance_evidence", side_effect=raw_provenance)
+        raw_patch.start(); self.addCleanup(raw_patch.stop)
+        return self.archive()
+
+    def transition_archive(self):
+        """Real fixture/rename; only the root OS attribute oracle is synthetic."""
+        self.transition_raw = b"original-root-provenance"
+        self.transition_change = None
+        self.transition_move_failure = None
+        destination = mock.patch.object(safety, "DESTINATION", self.app)
+        destination.start(); self.addCleanup(destination.stop)
+        tree = safety.backup.tree_manifest
+        move = safety.move_program
+        def observed_tree(path, *args, **kwargs):
+            result = tree(path, *args, **kwargs)
+            if Path(path).name == self.app.name:
+                expanded = any(part.startswith("program-check-") for part in Path(path).parts)
+                raw = b"archive-copy-provenance" if expanded else self.transition_raw
+                if raw is None: result[""]["xattrs"].pop("com.apple.provenance", None)
+                else: result[""]["xattrs"]["com.apple.provenance"] = hashlib.sha256(raw).hexdigest()
+                if not expanded and self.transition_change: self.transition_change(result)
+            return result
+        def raw_provenance(path):
+            self.assertTrue(Path(path).exists())
+            raw = self.transition_raw
+            if raw is None: return None
+            return {"base64": base64.b64encode(raw).decode(), "byteCount": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest()}
+        def observed_move(app, output, *args, **kwargs):
+            result = move(app, output, *args, **kwargs)
+            self.transition_raw = (b"restored-root-provenance" if Path(output) == self.app
+                                   else b"retained-root-provenance")
+            if self.transition_move_failure: self.transition_move_failure(Path(output))
+            return result
+        for patcher in (mock.patch.object(safety.backup, "tree_manifest", side_effect=observed_tree),
+                        mock.patch.object(safety, "root_provenance_evidence", side_effect=raw_provenance),
+                        mock.patch.object(safety, "move_program", side_effect=observed_move)):
+            patcher.start(); self.addCleanup(patcher.stop)
+        return self.archive()
+
+    def test_move_transition_preserve_restore_immutable_exact_chain(self):
+        receipt = self.transition_archive()
+        original_receipt = receipt.read_bytes()
+        value, _ = safety.load_receipt(receipt)
+        identity = value["original"]["identity"]
+        metadata = value["original"]["metadata"]
+        safety.preserve_original(receipt, self.app)
+        retained = safety.original_path(receipt)
+        first_path = receipt.parent / "original-preserve.transition.json"
+        first_bytes = first_path.read_bytes()
+        first = json.loads(first_bytes)
+        intent = receipt.parent / "original-preserve.intent.json"
+        self.assertEqual(first["intentSHA256"], hashlib.sha256(intent.read_bytes()).hexdigest())
+        self.assertEqual(first["receiptSHA256"], hashlib.sha256(original_receipt).hexdigest())
+        self.assertEqual(first["identity"], identity)
+        self.assertEqual(first["metadata"], metadata)
+        self.assertEqual(first["authorityContainer"], value["original"]["container"])
+        self.assertEqual(first["beforeTree"], value["tree"])
+        self.assertNotEqual(first["beforeTree"], first["afterTree"])
+        self.assertNotEqual(first["beforeProvenance"], first["afterProvenance"])
+        self.assertIsNone(first["previousTransitionSHA256"])
+        self.assertEqual(first["sourcePath"], str(self.app))
+        self.assertEqual(first["targetPath"], str(retained))
+        self.assertEqual(safety.original_transition_state(receipt, value),
+                         (first["afterTree"], retained, hashlib.sha256(first_bytes).hexdigest()))
+        safety.verify_program(receipt, retained)
+        self.assertEqual(safety.original_metadata(retained, value["tree"]), metadata)
+        safety.restore_original(receipt)
+        second_path = receipt.parent / "original-restore.transition.json"
+        second_bytes = second_path.read_bytes(); second = json.loads(second_bytes)
+        self.assertEqual(second["previousTransitionSHA256"], hashlib.sha256(first_bytes).hexdigest())
+        self.assertEqual(second["beforeTree"], first["afterTree"])
+        self.assertEqual(second["beforeProvenance"], first["afterProvenance"])
+        self.assertNotEqual(second["beforeProvenance"], second["afterProvenance"])
+        self.assertEqual(second["sourcePath"], str(retained))
+        self.assertEqual(second["targetPath"], str(self.app))
+        self.assertEqual(safety.app_identity(self.app), identity)
+        self.assertEqual(safety.original_metadata(self.app, value["tree"]), metadata)
+        self.assertEqual(receipt.read_bytes(), original_receipt)
+        safety.verify_program(receipt, self.app)
+        safety.restore_original(receipt)  # Idempotent; no appendices rewritten.
+        self.assertEqual(first_path.read_bytes(), first_bytes)
+        self.assertEqual(second_path.read_bytes(), second_bytes)
+        for path in (intent, first_path, receipt.parent / "original-restore.intent.json", second_path):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_move_transition_predicate_rejects_absence_nested_and_other_changes(self):
+        before = {"": {"type": "directory", "mode": 0o755,
+                       "xattrs": {"com.apple.provenance": "before", "com.apple.macl": "macl"}},
+                  "file": {"type": "file", "mode": 0o644, "sha256": "same",
+                           "xattrs": {"com.apple.provenance": "nested"}},
+                  "link": {"type": "link", "target": "file"}}
+        changed = json.loads(json.dumps(before)); changed[""]["xattrs"]["com.apple.provenance"] = "after"
+        self.assertTrue(safety.root_provenance_move_only(before, changed))
+        for change in (lambda v: v[""]["xattrs"].pop("com.apple.provenance"),
+                       lambda v: v[""]["xattrs"].update({"com.apple.macl": "changed"}),
+                       lambda v: v[""]["xattrs"].pop("com.apple.macl"),
+                       lambda v: v[""]["xattrs"].update({"com.apple.quarantine": "new"}),
+                       lambda v: v["file"]["xattrs"].update({"com.apple.provenance": "changed"}),
+                       lambda v: v["file"].update(sha256="changed"),
+                       lambda v: v["file"].update(mode=0o600),
+                       lambda v: v["link"].update(target="changed"),
+                       lambda v: v.update(extra={"type": "file"}),
+                       lambda v: v.pop("file")):
+            after = json.loads(json.dumps(changed)); change(after)
+            self.assertFalse(safety.root_provenance_move_only(before, after), after)
+        absent = json.loads(json.dumps(before)); absent[""]["xattrs"].pop("com.apple.provenance")
+        self.assertFalse(safety.root_provenance_move_only(absent, changed))
+
+    def test_move_transition_unmoved_intent_does_not_authorize_attribute_drift(self):
+        receipt = self.transition_archive()
+        actual = safety.move_program
+        with mock.patch.object(safety, "move_program", side_effect=OSError("synthetic before-rename failure")):
+            with self.assertRaisesRegex(OSError, "before-rename"):
+                safety.preserve_original(receipt, self.app)
+        self.assertTrue(self.app.exists())
+        self.assertTrue((receipt.parent / "original-preserve.intent.json").exists())
+        self.assertFalse((receipt.parent / "original-preserve.transition.json").exists())
+        self.transition_raw = b"unexplained-drift-without-move"
+        with self.assertRaises(RuntimeError): safety.restore_original(receipt)
+        with self.assertRaises(RuntimeError): safety.verify_program(receipt, self.app)
+        self.assertFalse((receipt.parent / "original-preserve.transition.json").exists())
+
+    def test_move_transition_rejects_tampered_intent_complete_and_chain(self):
+        receipt = self.transition_archive()
+        safety.preserve_original(receipt, self.app)
+        retained = safety.original_path(receipt)
+        intent = receipt.parent / "original-preserve.intent.json"
+        complete = receipt.parent / "original-preserve.transition.json"
+        raw_intent, raw_complete = intent.read_bytes(), complete.read_bytes()
+        mutations = [
+            (complete, lambda v: v.update(intentSHA256="0" * 64)),
+            (complete, lambda v: v.update(receiptSHA256="0" * 64)),
+            (complete, lambda v: v.update(identity="1:2:3")),
+            (complete, lambda v: v.update(sourcePath=str(self.root / "foreign.app"))),
+            (complete, lambda v: v.update(targetPath=str(self.root / "foreign.app"))),
+            (complete, lambda v: v.update(previousTransitionSHA256="0" * 64)),
+            (complete, lambda v: v["authorityContainer"].update(inode=0)),
+            (complete, lambda v: v["metadata"][""].update(inode=0)),
+            (complete, lambda v: v["afterProvenance"].update(base64=base64.b64encode(b"forged").decode())),
+            (complete, lambda v: v["afterTree"]["Contents/MacOS/GaoJiLing"].update(sha256="forged")),
+            (intent, lambda v: v.update(receiptSHA256="0" * 64)),
+            (intent, lambda v: v["beforeProvenance"].update(byteCount=0)),
+        ]
+        for path, mutate in mutations:
+            with self.subTest(file=path.name, mutate=mutate):
+                value = json.loads(raw_intent if path == intent else raw_complete); mutate(value)
+                path.write_text(json.dumps(value))
+                with self.assertRaises(RuntimeError): safety.verify_program(receipt, retained)
+                intent.write_bytes(raw_intent); complete.write_bytes(raw_complete)
+        held = intent.with_suffix(".held")
+        intent.rename(held)
+        try:
+            with self.assertRaises((OSError, RuntimeError)): safety.verify_program(receipt, retained)
+        finally: held.rename(intent)
+        safety.restore_original(receipt)
+        restored = receipt.parent / "original-restore.transition.json"
+        value = json.loads(restored.read_bytes()); value["previousTransitionSHA256"] = "0" * 64
+        restored.write_text(json.dumps(value))
+        with self.assertRaises(RuntimeError): safety.verify_program(receipt, self.app)
+
+    def test_move_transition_existing_chain_does_not_normalize_later_drift(self):
+        receipt = self.transition_archive()
+        safety.preserve_original(receipt, self.app)
+        retained = safety.original_path(receipt)
+        for change in (lambda v: v[""]["xattrs"].update({"com.apple.quarantine": "new"}),
+                       lambda v: v[""]["xattrs"].update({"com.apple.macl": "new"}),
+                       lambda v: v["Contents/MacOS/GaoJiLing"]["xattrs"].update({"com.apple.provenance": "nested-drift"}),
+                       lambda v: v["Contents/MacOS/GaoJiLing"].update(mode=0o600),
+                       lambda v: v["Contents/MacOS/GaoJiLing"].update(sha256="changed")):
+            self.transition_change = change
+            with self.assertRaises(RuntimeError): safety.restore_original(receipt)
+            self.assertTrue(retained.exists()); self.assertFalse(self.app.exists())
+        self.transition_change = None
+        self.transition_raw = b"later-unrecorded-root-value"
+        with self.assertRaises(RuntimeError): safety.restore_original(receipt)
+        self.assertTrue(retained.exists()); self.assertFalse(self.app.exists())
+
+    def test_move_transition_postrename_child_inode_replacement_is_refused(self):
+        receipt = self.transition_archive()
+        def replace_child(output):
+            path = output / "Contents/MacOS/GaoJiLing"
+            held = self.root / "held-original-inode"
+            path.rename(held)
+            path.write_bytes(held.read_bytes()); path.chmod(0o755)
+        self.transition_move_failure = replace_child
+        with self.assertRaises(RuntimeError): safety.preserve_original(receipt, self.app)
+        self.assertFalse((receipt.parent / "original-preserve.transition.json").exists())
+        self.assertFalse(self.app.exists())
+        with self.assertRaises(RuntimeError): safety.restore_original(receipt)
+
+    def test_move_transition_postrename_signature_failure_is_refused(self):
+        receipt = self.transition_archive()
+        def valid_until_moved(path):
+            if "Program.noindex" in Path(path).parts:
+                raise subprocess.CalledProcessError(1, "synthetic codesign")
+        with mock.patch.object(safety, "signature_valid", side_effect=valid_until_moved):
+            with self.assertRaises(subprocess.CalledProcessError): safety.preserve_original(receipt, self.app)
+            with self.assertRaises(subprocess.CalledProcessError): safety.restore_original(receipt)
+        self.assertFalse((receipt.parent / "original-preserve.transition.json").exists())
+        safety.restore_original(receipt)
+        safety.verify_program(receipt, self.app)
+
+    def test_move_transition_reconciles_only_persisted_exact_interrupted_rename(self):
+        receipt = self.transition_archive()
+        original_receipt = receipt.read_bytes()
+        identity = safety.app_identity(self.app)
+        def fail_after_move(output): raise OSError("synthetic post-rename fsync failure")
+        self.transition_move_failure = fail_after_move
+        with self.assertRaisesRegex(OSError, "post-rename"):
+            safety.preserve_original(receipt, self.app)
+        self.assertTrue((receipt.parent / "original-preserve.intent.json").exists())
+        self.assertFalse((receipt.parent / "original-preserve.transition.json").exists())
+        self.assertFalse(self.app.exists())
+        self.transition_move_failure = None
+        safety.restore_original(receipt)
+        self.assertTrue((receipt.parent / "original-preserve.transition.json").exists())
+        self.assertTrue((receipt.parent / "original-restore.transition.json").exists())
+        self.assertEqual(safety.app_identity(self.app), identity)
+        self.assertEqual(receipt.read_bytes(), original_receipt)
+        safety.verify_program(receipt, self.app)
+
+    def test_provenance_gap_diagnostic_is_not_archive_fidelity(self):
+        expected = {"": {"type": "directory", "mode": 0o755,
+                         "xattrs": {"com.apple.macl": "m", "com.apple.provenance": "p"}},
+                    "file": {"type": "file", "mode": 0o644, "sha256": "f",
+                             "xattrs": {"com.apple.provenance": "q", "com.example.fixture": "unchanged"}},
+                    "directory": {"type": "directory", "mode": 0o700, "xattrs": {}},
+                    "link": {"type": "link", "target": "file"}}
+        copied = json.loads(json.dumps(expected))
+        del copied[""]["xattrs"]["com.apple.macl"]
+        copied[""]["xattrs"]["com.apple.provenance"] = "system-assigned"
+        del copied["file"]["xattrs"]["com.apple.provenance"]
+        copied["directory"]["xattrs"]["com.apple.provenance"] = "new"
+        gaps = safety.original_retention_archive_gaps(expected, copied)
+        self.assertEqual(len(gaps), 4)
+        self.assertEqual(gaps[0], {"path": "", "attribute": "com.apple.provenance",
+            "sourcePresent": True, "sourceSHA256": "p", "archiveRoundTripPresent": True,
+            "archiveRoundTripSHA256": "system-assigned"})
+        self.assertFalse(safety.only_root_macl_missing(expected, copied))
+        self.assertIsNone(safety.original_retention_archive_gaps(expected, expected))
+        self.assertNotEqual(expected, copied)
+        self.assertEqual(expected["file"]["xattrs"]["com.apple.provenance"], "q")
+        for change in (lambda v: v["file"].update(sha256="changed"),
+                       lambda v: v["file"].update(mode=0o600),
+                       lambda v: v["link"].update(target="elsewhere"),
+                       lambda v: v.update(extra={"type": "directory"}),
+                       lambda v: v.pop("file"),
+                       lambda v: v["file"]["xattrs"].update({"com.apple.quarantine": "new"}),
+                       lambda v: v["file"]["xattrs"].pop("com.example.fixture"),
+                       lambda v: v["file"]["xattrs"].update({"com.example.fixture": "changed"}),
+                       lambda v: v["file"]["xattrs"].update({"com.apple.macl": "nested"}),
+                       lambda v: v[""]["xattrs"].update({"com.apple.macl": "changed"})):
+            variant = json.loads(json.dumps(copied)); change(variant)
+            self.assertIsNone(safety.original_retention_archive_gaps(expected, variant), variant)
+
+    def test_provenance_archive_retains_exact_original_inode_and_blocks_zip_restore(self):
+        before = safety.original_metadata(self.app, safety.backup.tree_manifest(self.app, allow_links=True))
+        receipt = self.retained_provenance_archive(root_macl=True)
+        value, _ = safety.load_receipt(receipt)
+        self.assertEqual(value["format"], 2)
+        self.assertEqual(value["archiveRole"], "supplemental-only")
+        self.assertEqual(value["original"]["metadata"], before)
+        self.assertEqual(len(value["archiveRoundTripGaps"]), 3)
+        self.assertNotEqual(value["tree"], value["archiveRoundTripTree"])
+        self.assertFalse((receipt.parent / "VERIFIED").exists())
+        with self.assertRaisesRegex(RuntimeError, "禁止解包"):
+            safety.extract(receipt, self.root / "forbidden.app")
+        safety.preserve_original(receipt, self.app)
+        retained = safety.original_path(receipt)
+        self.assertEqual(safety.original_metadata(retained, value["tree"]), before)
+        safety.verify_program(receipt, retained)
+        safety.restore_original(receipt)
+        self.assertEqual(safety.original_metadata(self.app, value["tree"]), before)
+        safety.verify_program(receipt, self.app)
+
+    def test_provenance_receipt_rejects_missing_forged_or_broadened_gap_evidence(self):
+        receipt = self.retained_provenance_archive()
+        raw = receipt.read_bytes()
+        for change in (lambda v: v.pop("archiveRoundTripGaps"),
+                       lambda v: v.update(archiveRoundTripGaps=[]),
+                       lambda v: v["archiveRoundTripGaps"][0].update(sourceSHA256="forged"),
+                       lambda v: v["archiveRoundTripTree"]["Contents/MacOS/GaoJiLing"]["xattrs"].update({"com.apple.quarantine": "new"}),
+                       lambda v: v["archiveRoundTripTree"]["Contents/MacOS/GaoJiLing"].update(sha256="changed")):
+            value = json.loads(raw); change(value); receipt.write_text(json.dumps(value))
+            with self.assertRaisesRegex(RuntimeError, "原件回滚收据无效"):
+                safety.load_receipt(receipt)
+        receipt.write_bytes(raw)
+        safety.load_receipt(receipt)
+
+    def test_provenance_original_attribute_content_and_signature_remain_strict(self):
+        receipt = self.retained_provenance_archive()
+        safety.preserve_original(receipt, self.app)
+        retained = safety.original_path(receipt)
+        self.synthetic_original_provenance = "5" * 64
+        with self.assertRaisesRegex(RuntimeError, "收据"):
+            safety.verify_program(receipt, retained)
+        self.synthetic_original_provenance = "1" * 64
+        with mock.patch.object(safety, "signature_valid", side_effect=subprocess.CalledProcessError(1, "synthetic codesign")):
+            with self.assertRaises(subprocess.CalledProcessError): safety.verify_program(receipt, retained)
+        (retained / "Contents/MacOS/GaoJiLing").write_bytes(b"unexpected content")
+        with self.assertRaisesRegex(RuntimeError, "收据"):
+            safety.restore_original(receipt)
+        self.assertFalse(self.app.exists())
+
+    def test_provenance_legacy_root_macl_receipt_stays_compatible(self):
+        receipt = self.retained_archive()
+        value = json.loads(receipt.read_bytes())
+        self.assertIn("archiveRoundTripGaps", value)
+        value.pop("archiveRoundTripGaps")
+        receipt.write_text(json.dumps(value))
+        self.assertEqual(safety.load_receipt(receipt)[0], value)
+        safety.verify_program(receipt, self.app)
 
     def test_original_prepared_is_not_verified_until_same_inode_is_retained(self):
         attribute_file = Path("Contents/MacOS/GaoJiLing")

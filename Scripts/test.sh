@@ -1,7 +1,7 @@
 #!/bin/zsh
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-TEST_TEMP="$(mktemp -d /private/tmp/gaojiling-tests.XXXXXX)"
+TEST_TEMP="$(python3 -c 'import tempfile; print(tempfile.mkdtemp(prefix="gaojiling-tests-", suffix=".noindex", dir="/private/tmp"))')"
 trap 'rm -rf "$TEST_TEMP"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -44,8 +44,10 @@ run_swift_test() {
 }
 
 python3 Tests/BackupTests.py
+python3 Tests/DataCopyMetadataTests.py
+python3 Tests/SQLiteIsolationTests.py
 python3 Tests/CapabilitiesTests.py
-((TEST_SUITES += 2))
+((TEST_SUITES += 4))
 xcrun clang -O2 -Wall -Wextra -isysroot "$SDK" -c Sources/NativeMetrics.c -o "$TEST_TEMP/NativeMetrics.o"
 mkdir -m 700 "$TEST_TEMP/native-process.noindex"
 xcrun clang -O2 -Wall -Wextra -isysroot "$SDK" Tests/NativeProcessStateTests.c \
@@ -62,6 +64,11 @@ run_swift_test CleanupEngineTests Sources/CleanupEngine.swift
 run_swift_test StorageAnalysisTests "${STORAGE[@]}" -framework AppKit
 run_swift_test StorageAnalysisControllerTests "${STORAGE[@]}" Sources/StorageAnalysisController.swift Sources/Models.swift Sources/DataExport.swift -framework AppKit
 run_swift_test StorageTreeTests "${STORAGE[@]}" -framework AppKit
+run_swift_test DiskImageCoreTests Sources/DiskImageAnalysis.swift Sources/DiskImageNTFS.swift
+run_swift_test LocalVolumeMetadataTests Sources/LocalVolumeMetadata.swift
+run_swift_test DiskImageReportWriterTests Sources/DiskImageReportWriter.swift
+run_swift_test DiskStorageControllerTests Sources/LocalVolumeMetadata.swift Sources/DiskImageAnalysis.swift \
+  Sources/DiskImageNTFS.swift Sources/DiskImageReportWriter.swift Sources/DiskStorageController.swift -framework AppKit
 run_swift_test FloatingGeometryTests Sources/FloatingGeometry.swift
 run_swift_test PanelInteractionTests Sources/PanelInteraction.swift
 run_swift_test SamplingDemandTests Sources/SamplingDemand.swift

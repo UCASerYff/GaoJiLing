@@ -1,4 +1,4 @@
-# 搞机灵 V1.14
+# 搞机灵 V1.15
 
 <img src="Assets/AppIcon.png" width="96" alt="搞机灵：黑底白字的机灵图标">
 
@@ -6,7 +6,19 @@
 
 搞机灵是一款原生 macOS 边缘系统监控工具，使用 SwiftUI、AppKit、Mach/IOKit/libproc 和 SQLite。监控记录保存在本机，无第三方运行时，无 AI 和账号。
 
-[下载最新版](https://github.com/UCASerYff/GaoJiLing/releases/latest) · [V1.14 发布页](https://github.com/UCASerYff/GaoJiLing/releases/tag/v1.14) · [使用说明](使用说明.txt) · [验证范围](VALIDATION.md) · [功能覆盖与限制](FEATURE-COVERAGE.md)
+[下载最新版](https://github.com/UCASerYff/GaoJiLing/releases/latest) · [V1.15 发布页](https://github.com/UCASerYff/GaoJiLing/releases/tag/v1.15) · [使用说明](使用说明.txt) · [验证范围](VALIDATION.md) · [功能覆盖与限制](FEATURE-COVERAGE.md)
+
+## V1.15 磁盘能力整合
+
+版本 1.15，构建 115。新增“卷与镜像”，提供本机内置卷信息和普通 NTFS 卷镜像分析。已完成本机安装、原资料保留、安装时唯一入口及公开合成镜像的搜索、单文件提取和完整报告导出验收；验证边界见 [VALIDATION.md](VALIDATION.md)。安装包采用 Apple Development 签名，未作 Developer ID 签名或公证。
+
+在“存储 → 卷与镜像”中按需读取已挂载内置卷的名称、格式、容量、读写标记与能力来源。未知字段显示不可用；外接、可移除、网络和归属不明的卷排除，APFS 共享容量不累计。
+
+普通 NTFS 卷镜像须先手动选择，再单独同意读取内容。从 Finder 打开 `.ntfs/.img/.raw/.dd` 仅预填文件，不自动解析。固定只读 FD 和预算内解析后，可浏览已核验父引用形成的目录、搜索本次名称和路径、导出包含限制与来源的 JSON 报告。父路径不明的记录单列，MFT 前缀不冒充完整目录或卷健康检查。
+
+支持的普通默认数据流可以逐文件明确确认并提取到新文件，最大 16 MiB；不覆盖已有目标，不自动执行副本。压缩、加密、稀疏、重解析点、命名流、属性扩展、未初始化数据或未知父路径不支持提取。分析最多 4096 个记录槽、64 MiB 累计读取、默认 10 秒协作预算；正在阻塞的系统调用不能被强制打断。镜像变化会使结果失效，前后身份检查不证明快照一致性。
+
+现有占用/磁盘地图仍只读元数据；镜像功能不混入默认扫描、原清理权限或浮窗。无需来源搞磁盘文件夹运行；来源真实偏好、原报告、镜像与备份由整合流程保留。原数据库格式、资料路径和钥匙串保持；实际安装与业务验证状态见 [VALIDATION.md](VALIDATION.md)。外接盘、原始设备、驱动、挂载、格式化和修复“不做（用户取消）”。
 
 ## 安装
 
@@ -14,7 +26,7 @@
 
 从 GitHub Releases 下载 DMG，打开后将“搞机灵.app”拖入“Applications”。更新时先退出旧版，再替换应用；历史、任务和设置保存在独立的数据目录中。发布页同时提供安装包的 SHA-256 校验文件。
 
-当前公开安装包使用本地 ad-hoc 签名，未作 Apple Developer ID 签名或公证，会受到 Gatekeeper 检查。也可以按下方步骤从源码构建。
+V1.15 安装包使用 Apple Development 签名，未作 Apple Developer ID 签名或公证，仍受 macOS 正常安全检查。此次由旧 ad-hoc 身份切换，系统权限不会自动继承；需要权限时请在系统设置中正常授权。也可以按下方步骤从源码构建。
 
 ## 功能
 
@@ -115,15 +127,15 @@ CPU 与应用 CPU 统一采用全机 0–100% 口径，与活动监视器的单�
 
 ## 从源码构建
 
-需要 Apple Silicon Mac、完整 Xcode 及其命令行工具、macOS 14 或更新 SDK，以及 Python 3。
+需要 Apple Silicon Mac、完整 Xcode 及其命令行工具、macOS 14 或更新 SDK，以及 Python 3。维护者构建脚本使用固定的开发签名身份；自行构建需按自己的有效签名身份调整签名配置，发行者私钥不随源码分发，脚本不会因查不到证书自动降为 ad-hoc。
 
     ./Scripts/test.sh
     python3 Scripts/test-release-safety.py
     ./Scripts/build.sh
 
-构建输出为 Release/GaoJiLing-1.14.dmg 及对应的 .sha256 文件。构建使用专属 `.noindex` 临时目录，并在退出时清理。`--app-only` 的目标也必须位于真实 `.noindex` 容器内，使用后精确清除展开副本。
+构建输出为 Release/GaoJiLing-1.15.dmg 及对应的 .sha256 文件。构建使用专属 `.noindex` 临时目录，并在退出时清理。`--app-only` 的目标也必须位于真实 `.noindex` 容器内，使用后精确清除展开副本。
 
-项目安装脚本默认不自动启动或冒烟。旧程序压缩后解包核对完整内容；若唯一差异是程序根目录的系统扩展属性 `com.apple.macl` 未被 ZIP 保留，则在同卷私有 `.noindex` 容器中保留旧程序原件，以原身份、完整内容和全部扩展属性核验后的原件作为回滚来源，ZIP 仅作辅助。其他差异仍停止安装。程序恢复入口与资料备份长期保留；静态安装或暂缓界面验收时也会清除临时展开程序、卸载镜像，并核对唯一安装入口。运行：
+项目安装脚本默认不自动启动或冒烟。资料备份与数据库记录核验只在私有三文件副本上运行 SQLite，真实主库/WAL/SHM 的身份、内容和属性必须保持；逻辑快照仍验证数据库完整性与记录。程序 ZIP 若只存在系统 provenance 赋值或根 macl 未保留差异，同卷保留旧程序原 inode，ZIP 仅作辅助。原件移动的根来源属性变化须有移动前意图与不可变完整前后记录，其他差异停止；不改旧收据或写回系统属性。恢复依据和完整备份长期保留，临时展开程序、镜像与本应用登记按精确路径收尾。运行：
 
     ./Scripts/install.sh
 

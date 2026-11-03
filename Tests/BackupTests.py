@@ -21,7 +21,7 @@ spec.loader.exec_module(backup)
 
 class BackupTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="gaojiling-backup-fixture-", dir="/private/tmp")
+        self.temp = tempfile.TemporaryDirectory(prefix="gaojiling-backup-fixture-", suffix=".noindex", dir="/private/tmp")
         self.root = Path(self.temp.name)
         self.data = self.root / "Data"
         self.data.mkdir()

@@ -313,25 +313,18 @@ extension MonitorStore {
         let directory = database.directory
         Task {
             var samplingWasPaused: Bool?
-            var recoveryFile: URL?
             var restoreCommitted = false
             do {
                 let backup = try await Task.detached(priority: .utility) { try MonitorDatabase.inspectBackup(at: source) }.value
                 let alert = NSAlert(); alert.alertStyle = .warning; alert.messageText = "恢复这份完整备份？"
-                alert.informativeText = "将恢复 \(backup.samples.count) 条采样、\(backup.events.count) 个事件、\(backup.sessions.count) 项任务和应用设置，替换当前记录。恢复前会自动保存一份当前数据的安全备份。登录项与通知权限保留本机当前状态。"
-                alert.addButton(withTitle: "备份当前数据并恢复"); alert.addButton(withTitle: "取消")
+                alert.informativeText = "将恢复 \(backup.samples.count) 条采样、\(backup.events.count) 个事件、\(backup.sessions.count) 项任务和应用设置，替换当前记录。不会自动备份当前数据。登录项与通知权限保留本机当前状态。"
+                alert.addButton(withTitle: "替换并恢复"); alert.addButton(withTitle: "取消")
                 guard alert.runModal() == .alertFirstButtonReturn else { dataBusy = false; statusMessage = "已取消恢复，当前数据未改变。"; return }
                 samplingWasPaused = isPaused; isPaused = true; dataGeneration += 1; detector.reset()
                 if latest.memoryTotal > 0 { try database.append(latest) }
-                let recoveryDirectory = directory.appendingPathComponent("Recovery", isDirectory: true)
-                try FileManager.default.createDirectory(at: recoveryDirectory, withIntermediateDirectories: true)
-                let recovery = recoveryDirectory.appendingPathComponent("恢复前安全备份-\(backupStamp())-\(UUID().uuidString.prefix(6)).json")
-                recoveryFile = recovery
-                let prefs = savedEdgePreferences
-                statusMessage = "正在保存安全备份并恢复…"
+                statusMessage = "正在恢复…"
                 _ = try await Task.detached(priority: .utility) {
                     let db = try MonitorDatabase(directory: directory)
-                    _ = try db.exportBackup(to: recovery, appVersion: GLPalette.version, auxiliaryPreferences: prefs)
                     return try db.restoreBackup(backup)
                 }.value
                 restoreCommitted = true
@@ -363,17 +356,13 @@ extension MonitorStore {
                 }
                 focusedEvent = nil; eventHistory = []; latest = .empty; lastPersisted = .distantPast; lastPruned = Date()
                 restartTimer(); NotificationCenter.default.post(name: .monitorSettingsChanged, object: "restored")
-                lastExportURL = recovery; statusMessage = "恢复完成。恢复前的数据已保存在数据目录的 Recovery 文件夹。"
+                statusMessage = "恢复完成，已重新加载记录和设置。"
             } catch {
                 if restoreCommitted {
                     // Never resume persistence from stale memory after the replacement has committed.
                     self.database = nil; isPaused = true
                     latest = .empty; history = []; events = []; sessions = []; focusedEvent = nil; eventHistory = []
-                }
-                if let recoveryFile, FileManager.default.fileExists(atPath: recoveryFile.path) {
-                    lastExportURL = recoveryFile
-                    let prefix = restoreCommitted ? "数据已恢复，但重新加载失败；采样已暂停，请退出并重新打开应用。" : "恢复未完成："
-                    statusMessage = "\(prefix)\(error.localizedDescription)。恢复前数据已保存为 \(recoveryFile.lastPathComponent)。"
+                    statusMessage = "数据已恢复，但重新加载失败；采样已暂停，请退出并重新打开应用。\(error.localizedDescription)"
                 } else { statusMessage = "恢复未完成：\(error.localizedDescription)。原数据未改变。" }
             }
             dataBusy = false

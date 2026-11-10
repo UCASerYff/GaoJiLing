@@ -109,7 +109,7 @@ struct DuplicateAnalysisView: View {
             if !controller.history.isEmpty {
                 GroupBox("重复副本恢复记录") {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("仅恢复本应用回执指向的原实物，不覆盖原位置的新文件；废纸篓被清空或实物变化时无法恢复。原记录和备份会保留。")
+                        Text("仅恢复本应用回执指向的原实物，不覆盖原位置的新文件；废纸篓被清空或实物变化时无法恢复。原记录和待恢复实物会保留。")
                             .font(.caption).foregroundStyle(.secondary)
                         ForEach(controller.history) { entry in
                             HStack(alignment: .top) {

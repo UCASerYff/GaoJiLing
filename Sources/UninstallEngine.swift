@@ -588,7 +588,7 @@ final class UninstallEngine: @unchecked Sendable {
     private func loadJournal() throws {
         markerPresent = try readMarker()
         guard let data = try journalData() else {
-            guard !markerPresent else { throw UninstallFailure(message: "卸载恢复记录已丢失，不能作为首次使用覆盖。请保留废纸篓与暂存文件，从安全备份恢复记录。") }
+            guard !markerPresent else { throw UninstallFailure(message: "卸载恢复记录已丢失，不能作为首次使用覆盖。请保留废纸篓与暂存文件，停止操作并检查恢复记录。") }
             // Orphaned private staging is also evidence of an earlier operation.
             do {
                 let fd = try FS.directory(stageDirectory, read: true, privateOnly: true); defer { close(fd) }

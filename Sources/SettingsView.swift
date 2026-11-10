@@ -238,7 +238,7 @@ struct GLDataSettingsView: View {
                 Text("CSV 可用 Excel 或 Numbers 打开。任务按开始时间筛选，只导出已结束的记录。")
             }
             Section {
-                    Text("包含全部已保存的历史、异常事件、任务、应用设置和唤起条位置。恢复会替换当前记录，并先自动备份当前数据；请先结束正在记录的任务。")
+                    Text("包含全部已保存的历史、异常事件、任务、应用设置和唤起条位置。恢复会替换当前记录，不会自动备份当前数据；请先结束正在记录的任务。")
                     .foregroundStyle(.secondary)
                 HStack(spacing: 12) {
                     Button(action: store.exportFullBackup) {

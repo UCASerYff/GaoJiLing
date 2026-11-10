@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("gjl_package_safety", ROOT / "Scripts/release-safety.py")
 safety = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(safety)
-backup = safety.backup
+files = safety.files
 
 
 def run(arguments):
@@ -41,7 +41,7 @@ def requirement(app):
 def receipt_and_candidate(path, checksum, approved_changes=None):
     if not re.fullmatch(r"[0-9a-f]{64}", checksum):
         raise RuntimeError("必须提供已独立核对的原构建收据 SHA-256")
-    raw = backup.read_regular(path, 2 * 1024 * 1024)
+    raw = files.read_regular(path, 2 * 1024 * 1024)
     if hashlib.sha256(raw).hexdigest() != checksum:
         raise RuntimeError("原构建收据摘要改变，未打包")
     value = json.loads(raw)
@@ -61,7 +61,7 @@ def receipt_and_candidate(path, checksum, approved_changes=None):
         parent_sha = value.get("originalBuildReceiptSHA256")
         if not parent or not parent_sha:
             raise RuntimeError("新签名收据缺原编译收据关联")
-        parent_bytes = backup.read_regular(Path(parent), 2 * 1024 * 1024)
+        parent_bytes = files.read_regular(Path(parent), 2 * 1024 * 1024)
         if hashlib.sha256(parent_bytes).hexdigest() != parent_sha or json.loads(parent_bytes).get("buildInputHashes") != hashes:
             raise RuntimeError("原编译图或关联摘要改变")
     for name, expected in hashes.items():
@@ -73,17 +73,17 @@ def receipt_and_candidate(path, checksum, approved_changes=None):
             if set(change) != {"from", "to", "reason"} or change["from"] != expected or not re.fullmatch(r"[0-9a-f]{64}", change["to"]):
                 raise RuntimeError("构建后改动摘要未精确绑定")
             expected = change["to"]
-        if backup.file_digest(ROOT / relative) != expected:
+        if files.file_digest(ROOT / relative) != expected:
             raise RuntimeError("候选构建输入已经改变：" + name)
     app = Path(value["app"])
     if not app.is_absolute() or ".." in app.parts or app.name != "搞机灵.app":
         raise RuntimeError("候选必须是精确绝对程序路径")
     safety.require_noindex(app)
-    info = plistlib.loads(backup.read_regular(app / "Contents/Info.plist", 1024 * 1024))
+    info = plistlib.loads(files.read_regular(app / "Contents/Info.plist", 1024 * 1024))
     if (info.get("CFBundleIdentifier"), info.get("CFBundleShortVersionString"), info.get("CFBundleVersion"), info.get("CFBundleExecutable")) != (safety.IDENTIFIER, version, value["build"], "GaoJiLing"):
         raise RuntimeError("真实候选 Info 身份不符")
     safety.signature_valid(app)
-    if backup.file_digest(app / "Contents/MacOS/GaoJiLing") != value["executableSHA256"]:
+    if files.file_digest(app / "Contents/MacOS/GaoJiLing") != value["executableSHA256"]:
         raise RuntimeError("候选可执行文件摘要改变")
     expected = [x.strip() for x in value["designatedRequirementOutput"].splitlines() if "designated =>" in x]
     if len(expected) != 1 or requirement(app) != expected[0]:
@@ -94,19 +94,19 @@ def receipt_and_candidate(path, checksum, approved_changes=None):
 def verify_copy(app, tree, expected_requirement):
     safety.require_noindex(app)
     safety.signature_valid(app)
-    if requirement(app) != expected_requirement or backup.tree_manifest(app, allow_links=True) != tree:
+    if requirement(app) != expected_requirement or files.tree_manifest(app, allow_links=True) != tree:
         raise RuntimeError("打包副本与候选的内容/模式/链接/xattr或指定要求不一致；不豁免差异")
 
 
 def publish_new_file(source, destination):
     """Same-volume, no-replace file rename; no temporary hardlink exception."""
-    with backup.directory_fd(source.parent, read=True) as origin, backup.directory_fd(destination.parent, read=True) as target:
-        before = backup.checked_stat(source.name, origin)
+    with files.directory_fd(source.parent, read=True) as origin, files.directory_fd(destination.parent, read=True) as target:
+        before = files.checked_stat(source.name, origin)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != os.getuid() or before.st_dev != os.fstat(target).st_dev:
             raise RuntimeError("发行文件不是当前用户的同卷独立普通文件")
         fd = os.open(source.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=origin)
         try:
-            if backup.signature(os.fstat(fd)) != backup.signature(before):
+            if files.signature(os.fstat(fd)) != files.signature(before):
                 raise RuntimeError("发行文件在落盘前改变")
             os.fsync(fd)
         finally:
@@ -117,22 +117,22 @@ def publish_new_file(source, destination):
         if system.renameatx_np(origin, os.fsencode(source.name), target, os.fsencode(destination.name), 0x4) != 0:
             raise OSError(ctypes.get_errno(), "发行目标已存在或无法排他落盘；未覆盖")
         os.fsync(origin); os.fsync(target)
-        after = backup.checked_stat(destination.name, target)
+        after = files.checked_stat(destination.name, target)
         if (before.st_dev, before.st_ino, before.st_uid) != (after.st_dev, after.st_ino, after.st_uid):
             raise RuntimeError("发行落盘后的文件身份改变，保留实际产物")
 
 
-@backup.no_materialization
+@files.no_materialization
 def execute(args):
     receipt = Path(args.receipt)
     if not receipt.is_absolute():
         raise RuntimeError("收据路径必须是规范绝对路径")
     value, app, expected_requirement = receipt_and_candidate(receipt, args.receipt_sha256)
     original_identity = safety.app_identity(app)
-    tree = backup.tree_manifest(app, allow_links=True)
+    tree = files.tree_manifest(app, allow_links=True)
     evidence = {"version": value["version"], "build": value["build"], "bundleID": safety.IDENTIFIER,
                 "candidate": str(app), "buildReceipt": str(receipt), "buildReceiptSHA256": args.receipt_sha256,
-                "candidateIdentity": original_identity, "candidateTreeSHA256": backup.digest(tree),
+                "candidateIdentity": original_identity, "candidateTreeSHA256": files.digest(tree),
                 "treeComparison": "entry set, file SHA-256, modes, link text and xattr digests; not a claim about all ACL/owner/time metadata",
                 "designatedRequirement": expected_requirement, "compiledOrResigned": False,
                 "launchedOrInstalled": False}
@@ -146,10 +146,10 @@ def execute(args):
     prepared = record.with_name(record.stem + "-prepared.json")
     if record.exists() or record.is_symlink() or prepared.exists() or prepared.is_symlink():
         raise RuntimeError("打包收据已存在，不覆盖")
-    with backup.directory_fd(record.parent):
+    with files.directory_fd(record.parent):
         pass
     release = ROOT / "Release"
-    with backup.directory_fd(release):
+    with files.directory_fd(release):
         pass
     output = release / ("GaoJiLing-" + value["version"] + ".dmg")
     checksum = output.with_name(output.name + ".sha256")
@@ -178,26 +178,26 @@ def execute(args):
         mounted = True  # On uncertain attach failure preserve work until a detach succeeds.
         run(["/usr/bin/hdiutil", "attach", "-quiet", "-readonly", "-nobrowse", "-noautoopen", "-mountpoint", str(mount), str(image)])
         verify_copy(mount / "搞机灵.app", tree, expected_requirement)
-        if backup.read_regular(mount / "使用说明.txt") != backup.read_regular(app / "Contents/Resources/使用说明.txt"):
+        if files.read_regular(mount / "使用说明.txt") != files.read_regular(app / "Contents/Resources/使用说明.txt"):
             raise RuntimeError("镜像根使用说明与已签候选不同")
         detach_attempted = True
         run(["/usr/bin/hdiutil", "detach", "-quiet", str(mount)])
         mounted = False
         receipt_and_candidate(receipt, args.receipt_sha256)
-        if safety.app_identity(app) != original_identity or backup.tree_manifest(app, allow_links=True) != tree:
+        if safety.app_identity(app) != original_identity or files.tree_manifest(app, allow_links=True) != tree:
             raise RuntimeError("打包期间候选发生变化")
-        digest = backup.file_digest(image)
+        digest = files.file_digest(image)
         sha_file = work / "checksum"
         sha_bytes = (digest + "  " + output.name + "\n").encode()
         safety.write_private(sha_file, sha_bytes)
         publish_new_file(image, output)
         evidence["outputPublished"] = True
         publish_new_file(sha_file, checksum)
-        with backup.directory_fd(release, read=True) as directory:
+        with files.directory_fd(release, read=True) as directory:
             os.fsync(directory)
-        if backup.file_digest(output) != digest or backup.read_regular(checksum) != sha_bytes:
+        if files.file_digest(output) != digest or files.read_regular(checksum) != sha_bytes:
             raise RuntimeError("发行文件读回不符；保留实际产物供核对")
-        evidence.update(status="PACKAGE_VERIFIED", dmgSHA256=digest, dmgBytes=backup.safe_lstat(output).st_size,
+        evidence.update(status="PACKAGE_VERIFIED", dmgSHA256=digest, dmgBytes=files.safe_lstat(output).st_size,
                         sourceCopyAndMountedTreeEqual=True, mountedImageDetached=True)
     except Exception as failure:
         error = failure

@@ -358,7 +358,7 @@ final class DuplicateRecovery: @unchecked Sendable {
     private func loadJournal() throws {
         markerPresent = try readMarker()
         guard let data = try journalData() else {
-            guard !markerPresent else { throw UninstallFailure(message: "重复文件恢复记录缺失；不能当首次使用覆盖，请保留实物与备份。") }
+            guard !markerPresent else { throw UninstallFailure(message: "重复文件恢复记录缺失；不能当首次使用覆盖，请保留实物与恢复记录。") }
             for directory in [journalDirectory, stageDirectory] {
                 do {
                     let fd = try FS.directory(directory, read: true, privateOnly: true); defer { close(fd) }

@@ -43,11 +43,10 @@ run_swift_test() {
   ((++TEST_SUITES))
 }
 
-python3 Tests/BackupTests.py
-python3 Tests/DataCopyMetadataTests.py
-python3 Tests/SQLiteIsolationTests.py
+python3 Tests/AutomaticBackupRemovalTests.py
 python3 Tests/CapabilitiesTests.py
-((TEST_SUITES += 4))
+python3 Scripts/test-release-safety.py
+((TEST_SUITES += 3))
 xcrun clang -O2 -Wall -Wextra -isysroot "$SDK" -c Sources/NativeMetrics.c -o "$TEST_TEMP/NativeMetrics.o"
 mkdir -m 700 "$TEST_TEMP/native-process.noindex"
 xcrun clang -O2 -Wall -Wextra -isysroot "$SDK" Tests/NativeProcessStateTests.c \

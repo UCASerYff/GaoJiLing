@@ -49,12 +49,12 @@ def describe(app):
 
 
 def inventory(app):
-    tree = safety.backup.tree_manifest(app, allow_links=True)
+    tree = safety.files.tree_manifest(app, allow_links=True)
     macho = []
     magic = {b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
              b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}
     for name, row in tree.items():
-        if row["type"] == "file" and safety.backup.read_regular(app / name)[:4] in magic:
+        if row["type"] == "file" and safety.files.read_regular(app / name)[:4] in magic:
             macho.append(name)
     if macho != ["Contents/MacOS/GaoJiLing"]:
         raise RuntimeError("MachO 库存不再是单一已核主程序；须逐组件计划，禁止 deep 重签")

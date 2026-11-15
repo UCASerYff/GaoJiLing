@@ -1,0 +1,72 @@
+name: Windows
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test and build executables
+        run: powershell -ExecutionPolicy Bypass -File .\build.ps1
+      - name: Smoke-test the packaged exe
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dest = Join-Path $env:TEMP ("gaojiling-smoke-" + [guid]::NewGuid().ToString("n"))
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $port = 18767
+          $exe = Join-Path (Get-Location) "dist\GaoJiLing.exe"
+          if (-not (Test-Path $exe)) { throw "GaoJiLing.exe was not packaged" }
+          $proc = Start-Process -FilePath $exe -ArgumentList @(
+            "--data-dir", $dest, "--serve", "--no-browser", "--port", "$port"
+          ) -PassThru -WindowStyle Hidden
+          try {
+            $page = $null
+            $deadline = (Get-Date).AddSeconds(90)
+            do {
+              if ($proc.HasExited) { throw "GaoJiLing.exe exited early with code $($proc.ExitCode)" }
+              try {
+                $response = Invoke-WebRequest -Uri "http://127.0.0.1:$port/" -UseBasicParsing -TimeoutSec 3 -NoProxy
+                if ($response.StatusCode -eq 200) { $page = $response; break }
+              } catch {}
+              Start-Sleep -Seconds 1
+            } while ((Get-Date) -lt $deadline)
+            if (-not $page) { throw "packaged exe did not return HTTP 200" }
+            if ($page.Content -notmatch "搞机灵") { throw "HTTP 200 page did not include the app name" }
+            $token = [regex]::Match($page.Content, 'name="gao-token" content="([^"]+)"').Groups[1].Value
+            if (-not $token) { throw "HTTP 200 page did not include a session token" }
+            $headers = @{ "X-Gao-Token" = $token }
+            $body = '{"name":"CI smoke"}'
+            Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$port/api/session/start" -Headers $headers -ContentType "application/json" -Body $body -NoProxy | Out-Null
+            $listed = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/state" -Headers $headers -NoProxy
+            if ($listed.activeSession.name -ne "CI smoke") { throw "reading state did not return the session written by the running exe" }
+            $database = Join-Path $dest "monitor.sqlite"
+            if (-not (Test-Path $database)) { throw "the running exe did not create monitor.sqlite" }
+            Write-Output "smoke ok: process stayed up, HTTP 200, wrote and read a session"
+            try {
+              Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$port/api/shutdown" -Headers $headers -ContentType "application/json" -Body "{}" -NoProxy | Out-Null
+            } catch {}
+            $exitDeadline = (Get-Date).AddSeconds(20)
+            while (-not $proc.HasExited -and (Get-Date) -lt $exitDeadline) { Start-Sleep -Milliseconds 500 }
+          } finally {
+            if (-not $proc.HasExited) { & taskkill.exe /PID $proc.Id /T /F | Out-Null }
+            if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GaoJiLing-Windows-1.16
+          if-no-files-found: error
+          path: |
+            windows/dist/GaoJiLing.exe
+            windows/dist/GaoJiLing-cli.exe

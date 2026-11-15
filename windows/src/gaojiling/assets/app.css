@@ -1,0 +1,44 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f4f1ea;
+  --panel: #fffdf8;
+  --ink: #1c1915;
+  --muted: #6d645b;
+  --line: #e4ddd2;
+  --accent: #0f6e6b;
+  --warn: #9a4d16;
+  --danger: #8d2f2f;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #141210; --panel: #1e1b18; --ink: #f3efe8; --muted: #b7aea3; --line: #34302b; }
+}
+body[data-appearance="light"] { --bg: #f4f1ea; --panel: #fffdf8; --ink: #1c1915; --muted: #6d645b; --line: #e4ddd2; }
+body[data-appearance="dark"] { --bg: #141210; --panel: #1e1b18; --ink: #f3efe8; --muted: #b7aea3; --line: #34302b; color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 15px/1.5 "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif; background: var(--bg); color: var(--ink); }
+button, input, select { font: inherit; color: inherit; }
+button { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+button.primary { background: var(--accent); color: white; border-color: transparent; }
+button.danger { color: var(--danger); }
+shell { display: grid; grid-template-columns: 196px 1fr; min-height: 100vh; }
+nav { padding: 18px 12px; border-right: 1px solid var(--line); position: sticky; top: 0; height: 100vh; overflow: auto; }
+nav h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: 0.08em; }
+nav .ver { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
+nav button { display: block; width: 100%; text-align: left; margin: 2px 0; background: transparent; border-color: transparent; }
+nav button.active { background: var(--panel); border-color: var(--line); }
+main { padding: 22px 28px 48px; max-width: 1080px; }
+h2 { margin: 0 0 8px; font-size: 22px; }
+.muted { color: var(--muted); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+.card strong { display: block; font-size: 22px; font-weight: 600; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.warn { color: var(--warn); }
+.error { color: var(--danger); }
+.note { font-size: 13px; color: var(--muted); }
+input[type="text"], input[type="number"], select { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+.panel-demo { height: 220px; border: 1px dashed var(--line); position: relative; border-radius: 12px; overflow: hidden; }
+.panel-demo i { position: absolute; width: 6px; height: 72px; background: var(--ink); border-radius: 6px; }
+.tabs button.active { border-color: var(--accent); }

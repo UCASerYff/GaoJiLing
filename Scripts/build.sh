@@ -79,7 +79,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$PROJECT_DIR/Scripts/make-capabilities.py" \
 plutil -lint "$APP/Contents/Info.plist"
 python3 "$VERSION_TOOL" --info-plist "$APP/Contents/Info.plist" >/dev/null
 if $VERIFY_ONLY; then
-  xcrun lipo -verify_arch arm64 "$APP/Contents/MacOS/GaoJiLing"
+  xcrun lipo "$APP/Contents/MacOS/GaoJiLing" -verify_arch arm64
   print "macOS ARM64 编译和宿主 Info.plist 核验通过：V$APP_VERSION 构建 $BUILD_NUMBER"
   exit 0
 fi

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from gaojiling.errors import AppError
 from gaojiling.jsonutil import dumps
+from gaojiling.sessioncompare import BACKUP_PREFIX, DETAIL_LIMIT, validate_detail
 from gaojiling.store import decode_event, decode_sample, decode_session, normalize_settings
 from gaojiling.timeutil import check_unix, cocoa_to_unix, unix_to_cocoa
 from gaojiling.version import MARKETING
@@ -233,13 +234,35 @@ def validate_backup(raw: dict) -> dict:
     content = {key: content[key] for key in content if key in allowed}
     if not isinstance(digest, str) or len(digest) != 64 or digest != _sha(dumps(content)):
         raise AppError("备份 SHA-256 校验不符，文件可能损坏或已被修改。")
+    details = _comparison_details(decoded_sessions, auxiliary or {})
     return {
         "samples": decoded_samples,
         "events": decoded_events,
         "sessions": decoded_sessions,
         "settings": normalize_settings(settings) if settings is not None else None,
         "auxiliary": auxiliary,
+        "sessionDetails": details,
     }
+
+
+def _comparison_details(sessions, auxiliary):
+    keys = [key for key in auxiliary if key.startswith(BACKUP_PREFIX)]
+    if not keys:
+        return {}
+    if len(keys) > DETAIL_LIMIT:
+        raise AppError("完整资料中的任务比较明细数量异常。")
+    by_key = {BACKUP_PREFIX + item["id"].upper(): item for item in sessions if item.get("end") is not None}
+    details = {}
+    for key in keys:
+        item = by_key.get(key)
+        try:
+            detail = json.loads(auxiliary[key])
+        except (json.JSONDecodeError, TypeError, RecursionError):
+            raise AppError("完整资料中的任务比较明细无效。") from None
+        if item is None or not validate_detail(detail, item["end"] - item["start"]):
+            raise AppError("完整资料中的任务比较明细与会话不匹配。")
+        details[item["id"]] = detail
+    return details
 
 
 def load_backup(path: Path) -> dict:

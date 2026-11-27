@@ -2,11 +2,28 @@ from ctypes import wintypes
 import os
 import sys
 import time
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows desktop lifecycle")
+
+
+def test_app_window_registers_process_before_probing_webview2(tmp_path, monkeypatch):
+    from gaojiling import appwindow, win32
+
+    webview = ModuleType("webview")
+    webview.__path__ = []
+    platforms = ModuleType("webview.platforms")
+    platforms.winforms = SimpleNamespace(renderer="unavailable")
+    monkeypatch.setitem(sys.modules, "webview", webview)
+    monkeypatch.setitem(sys.modules, "webview.platforms", platforms)
+    monkeypatch.setattr(win32, "setup_dpi", lambda: None)
+
+    assert appwindow.run("http://127.0.0.1:8765/", tmp_path, dark=False) == 3
+    assert (tmp_path / appwindow.PROCESS).read_text(encoding="ascii") == str(os.getpid())
+    assert not (tmp_path / appwindow.READY).exists()
 
 
 def test_owned_view_contains_descendants_and_closes_only_its_job(tmp_path):
@@ -80,6 +97,49 @@ def test_repeated_open_waits_for_one_replacement_window(tmp_path, monkeypatch):
     host._poll_views(time.monotonic())
     assert process.closed and host.views == {} and not profile.exists()
     assert started == [("main", host.url, "webview2")]
+
+
+@pytest.mark.parametrize("already_open", [False, True])
+def test_explicit_open_is_retained_until_edge_readiness_poll(tmp_path, monkeypatch, already_open):
+    from gaojiling import desktop
+
+    class Process:
+        running = True
+
+        def is_running(self):
+            return self.running
+
+        def close(self):
+            self.running = False
+
+    host = desktop.Desktop.__new__(desktop.Desktop)
+    host.stopping = False
+    host.url = "http://127.0.0.1:8765/"
+    host.view_backend = "edge-app"
+    profile = tmp_path / "edge"
+    profile.mkdir()
+    process = Process()
+    view = desktop._View(process, profile, host.url, time.monotonic() + 25, host.view_backend)
+    host.views = {"main": view}
+    started = []
+    host._launch_view = lambda *arguments: started.append(arguments)
+    monkeypatch.setattr(desktop, "_view_handle", lambda *_: None)
+
+    host._open_view()
+    host._open_view()
+    assert view.reopen == (host.url, "edge-app") and not started
+    if already_open:
+        activated = []
+        monkeypatch.setattr(desktop, "_view_handle", lambda *_: 37)
+        monkeypatch.setattr(desktop.win, "is_iconic", lambda _: False)
+        monkeypatch.setattr(desktop.win, "set_foreground", activated.append)
+        host._poll_views(time.monotonic())
+        assert activated == [37] and view.ready and view.reopen is None and not started
+        monkeypatch.setattr(desktop, "_view_handle", lambda *_: None)
+
+    process.running = False
+    host._poll_views(time.monotonic())
+    assert started == ([] if already_open else [("main", host.url, "edge-app")])
 
 
 def test_edge_window_uses_only_the_owned_visible_edge_window(monkeypatch):

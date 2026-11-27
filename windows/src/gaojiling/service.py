@@ -26,6 +26,7 @@ from gaojiling.filesafety import atomic_text, send_to_trash
 from gaojiling.geometry import PanelAutoCollapse, dragging_handle, handle_frame, horizontal_ratio, panel_placement, vertical_ratio
 from gaojiling.memory import release_own, snapshot as memory_snapshot, system_cache_report
 from gaojiling.processes import cleanup_owner_installed, cleanup_owner_running
+from gaojiling.sessioncompare import new_detail, observe, public_compare, public_run
 from gaojiling.metrics import MetricCollector
 from gaojiling.network import diagnose
 from gaojiling.ntfs import analyze_image, extract
@@ -74,6 +75,7 @@ class Service:
         self.latest = None
         self.paused = False
         self.active = None
+        self._session_detail = None
         self.message = self.store.status
         self.cleanup = CleanupEngine(
             self.home, self.data_dir / "Cleanup", self.data_dir / "CleanupStage",
@@ -217,13 +219,13 @@ class Service:
                         self._notify(event)
             for notice in self.battery_detector.evaluate(current.get("batterySnapshot"), self.store.settings, moment):
                 self._notify(notice)
-            if self.active is not None:
-                cpu = current.get("cpuPercent")
+            prior = self.active.get("lastObserved") if self.active is not None else None
+            if self.active is not None and moment >= self.active["start"] and (prior is None or moment > prior):
+                cpu, memory = observe(self._session_detail, self.active["start"], current, prior)
                 if cpu is not None:
                     self.active["peakCPU"] = max(self.active["peakCPU"], cpu)
                     self.active["cpuTotal"] += cpu
                     self.active["sampleCount"] += 1
-                memory = current.get("memoryUsed")
                 if memory is not None:
                     self.active["peakMemory"] = max(self.active["peakMemory"], memory)
                 temperature = current.get("cpuTemperature")
@@ -258,6 +260,7 @@ class Service:
         }
         self.store.save_session(session)
         self.active = session
+        self._session_detail = new_detail()
         return session
 
     def stop_session(self) -> dict:
@@ -267,10 +270,27 @@ class Service:
     def _stop_session(self) -> dict:
         if self.active is None:
             raise AppError("没有正在记录的任务。")
-        finished = {**self.active, "end": max(self.active["start"], now_unix()), "interrupted": False}
-        self.store.save_session(finished)
+        observed = self.active.get("lastObserved") or self.active["start"]
+        finished = {**self.active, "end": max(self.active["start"], observed, now_unix()), "interrupted": False}
+        self.store.save_session({**finished, "_comparison": self._session_detail})
         self.active = None
+        self._session_detail = None
         return finished
+
+    def compare_sessions(self, identifiers):
+        if (not isinstance(identifiers, list) or len(identifiers) != 2
+                or any(not isinstance(item, str) or not 1 <= len(item) <= 128 for item in identifiers)
+                or identifiers[0] == identifiers[1]):
+            raise AppError("请选择两条不同的已保存任务。")
+        with self._data_lock:
+            runs = []
+            for identifier in identifiers:
+                item = self.store.session(identifier)
+                if item is None or item.get("end") is None:
+                    raise AppError("任务已不存在或尚未结束，请重新选择。")
+                detail = self.store.session_detail(item)
+                runs.append(public_run(item, detail, self.store.history_for_comparison))
+            return public_compare(runs)
 
     def state(self) -> dict:
         with self._data_lock:
@@ -386,7 +406,9 @@ class Service:
         auxiliary["GaoJiLing.EdgeHandle.verticalRatio"] = str(self.store.panel["verticalRatio"])
         if self.store.panel.get("displayId"):
             auxiliary["GaoJiLing.EdgeHandle.displayId"] = self.store.panel["displayId"]
-        document = build_backup(self.store.history(0), self.store.events(), self.store.sessions(), self.store.settings, auxiliary, now_unix())
+        sessions = self.store.sessions()
+        auxiliary.update(self.store.comparison_backup(sessions))
+        document = build_backup(self.store.history(0), self.store.events(), sessions, self.store.settings, auxiliary, now_unix())
         _write_new(Path(path), backup_bytes(document))
         self.last_export = Path(path)
         return {"path": str(path), "message": "已导出完整资料。恢复不会自动备份当前数据。"}
@@ -401,7 +423,8 @@ class Service:
         if self.active is not None:
             raise AppError("请先结束正在记录的任务。")
         loaded = load_backup(Path(path))
-        self.store.replace_backup(loaded["samples"], loaded["events"], loaded["sessions"], loaded["settings"])
+        self.store.replace_backup(loaded["samples"], loaded["events"], loaded["sessions"], loaded["settings"],
+                                  loaded["sessionDetails"])
         auxiliary = loaded.get("auxiliary") or {}
         # 没有横向偏好时，不用侧边选择覆盖已经保存的横向位置。
         if "GaoJiLing.EdgeHandle.horizontalRatio" in auxiliary or "GaoJiLing.EdgeHandle.verticalRatio" in auxiliary:

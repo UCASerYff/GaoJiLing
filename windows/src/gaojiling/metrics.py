@@ -91,6 +91,7 @@ class MetricCollector:
         self.previous_disk = None
         self.previous_processes = None
         self.previous_at = None
+        self.previous_process_at = None
         self.previous_core_times = None
         self.previous_core_count = None
 
@@ -100,6 +101,7 @@ class MetricCollector:
                 self._performance.close()
             self._last_readings.clear()
             self.previous_cpu = self.previous_net = self.previous_disk = self.previous_processes = self.previous_at = None
+            self.previous_process_at = None
             self.previous_core_times = self.previous_core_count = None
 
     def sample(self) -> dict:
@@ -145,12 +147,14 @@ class MetricCollector:
             capacity = elapsed * 10_000_000 * logical_processors if elapsed and same_topology else None
         cpu_reason = "等待有效 CPU 基线采样" if not elapsed else "本次 CPU 计数不可用或发生变化"
         inventory = native.process_inventory()
+        process_baseline_at = self.previous_process_at
         groups, baselines = _group_processes(inventory, self.previous_processes or {}, capacity, now)
         network = native.network_counters()
         down, up = _network_rates(self.previous_net, network, elapsed)
         self.previous_at, self.previous_cpu = at, cpu_now
         self.previous_core_times, self.previous_core_count = core_times, logical_processors
         self.previous_net, self.previous_processes = network, baselines
+        self.previous_process_at = now
         memory = _windows_snapshot() or {}
         free, total = native.boot_disk()
         battery = battery_snapshot(now, reading)
@@ -203,7 +207,8 @@ class MetricCollector:
             "batteryHealth": battery["healthPercent"]["value"], "batteryCycles": battery["cycles"]["value"],
             "batterySnapshot": battery, "uptime": api.GetTickCount64() / 1000,
             "processCount": len(inventory) if inventory is not None else None,
-            "processes": groups, "processSource": "Windows GetProcessTimes（全机 0–100%）与 K32GetProcessMemoryInfo（工作集含共享页）",
+            "processes": groups, "processBaselineAt": process_baseline_at,
+            "processSource": "Windows GetProcessTimes（全机 0–100%）与 K32GetProcessMemoryInfo（工作集含共享页）",
             "thermalState": thermal or "未知", "thermalZones": zones, "readings": sample_readings,
             "fanDescriptors": [], "fanReason": "Windows 未提供经验证的通用实时风扇转速接口",
             "sensorReason": sensor_reason,

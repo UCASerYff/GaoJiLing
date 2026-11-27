@@ -46,7 +46,7 @@ def test_non_windows_trash_refuses_instead_of_deleting(tmp_path):
 
 
 def test_version_matches_mac_marketing_version():
-    assert display() == "1.16+3"
+    assert display() == "1.16+4"
 
 
 def test_sampling_interval_slows_down_only_in_the_background():

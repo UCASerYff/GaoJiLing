@@ -63,11 +63,117 @@ async function click(label) {
   assert(result, "Missing enabled button: " + label);
 }
 
+function checkbox(label) {
+  return `document.querySelector('input[type=checkbox][aria-label=${JSON.stringify("选取任务 " + label)}]')`;
+}
+
+async function selectTask(label, keyboard = false) {
+  const control = checkbox(label);
+  assert(await evaluate(`!!${control} && !${control}.disabled`), "Missing enabled task selection: " + label);
+  if (keyboard) {
+    await evaluate(`${control}.focus()`);
+    const key = { key: " ", code: "Space", windowsVirtualKeyCode: 32 };
+    await call("Input.dispatchKeyEvent", { type: "rawKeyDown", ...key });
+    await call("Input.dispatchKeyEvent", { type: "keyUp", ...key });
+  } else {
+    await evaluate(`${control}.click()`);
+  }
+  await waitFor(`${control}.checked`);
+}
+
+const compareReady = '[data-compare-status="ready"]';
+const compareHeading = "#task-comparison-result";
+const compareMetrics = '[data-compare-section="metrics"]';
+const compareTrends = '[data-compare-section="trends"]';
+const compareProcesses = '[data-compare-section="processes"]';
+const select = (selector) => `document.querySelector(${JSON.stringify(selector)})`;
+
+async function compareTasks() {
+  const button = `Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '比较所选任务')`;
+  const first = "批处理 · 首次";
+  const second = "批处理 · 复测";
+  const empty = "旧任务 · 无采样";
+  await viewport(1160, 970, 1, "light");
+  await show("/", "资源占用");
+  await click("任务");
+  await waitFor(`!!${checkbox(first)}`);
+  assert(await evaluate(`${button}?.disabled`), "Comparison must require two tasks");
+  await selectTask(first, true);
+  assert(await evaluate(`${button}?.disabled`), "One task must not be sufficient");
+  await selectTask(second);
+  assert(await evaluate(`${checkbox(empty)}.disabled`), "Selection must cap at two tasks");
+  await click("比较所选任务");
+  await waitFor(`!!${select(compareReady)}`);
+  assert(await evaluate(`document.activeElement === ${select(compareHeading)}`), "Comparison should focus its result");
+  const metrics = await evaluate(`${select(compareMetrics)}.innerText`);
+  assert.match(metrics, /耗时/);
+  assert.match(metrics, /CPU/);
+  assert.match(metrics, /内存/);
+  assert.match(metrics, /45(?:\.0+)?\s*%/);
+  assert.match(metrics, /32\.5\s*%/);
+  assert.match(metrics, /[−-]12\.5\s*百分点/);
+  assert.match(metrics, /00:01:55/);
+  assert.match(metrics, /00:01:19/);
+  assert.match(metrics, /[−-]00:00:36/);
+  assert.match(metrics, /8\s*GiB/);
+  assert.match(metrics, /10\s*GiB/);
+  const trends = await evaluate(`${select(compareTrends)}.innerText`);
+  assert.match(trends, /CPU/);
+  assert.match(trends, /内存/);
+  assert.equal(await evaluate(`${select(compareTrends)}.querySelectorAll('canvas.chart').length`), 4,
+    "Both runs need separate CPU and memory plots");
+  await evaluate("document.querySelector('[aria-label^=\"A 任务 CPU 趋势\"]').focus()");
+  await call("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "ArrowLeft", code: "ArrowLeft", windowsVirtualKeyCode: 37 });
+  await waitFor("!!document.querySelector('.task-comparison .chart-tip[data-visible=true]')");
+  const rankings = await evaluate(`${select(compareProcesses)}.innerText`);
+  assert.match(rankings, /报表工作进程/);
+  assert.match(rankings, /消息分发进程/);
+  assert.match(rankings, /760\s*MiB/);
+  assert.doesNotMatch(rankings, /素材预览/, "Current/global process snapshots must not be attached to a saved session");
+  await evaluate(`${select(compareHeading)}.scrollIntoView({block:'start'})`);
+  await save("compare-light");
+  await evaluate(`${select(compareProcesses)}.scrollIntoView({block:'start'})`);
+  await save("compare-rankings-light");
+
+  await viewport(544, 720, 1.5, "dark");
+  await waitFor("matchMedia('(prefers-color-scheme: dark)').matches && window.devicePixelRatio === 1.5");
+  const overflow = `document.querySelector('.viewport').scrollWidth - document.querySelector('.viewport').clientWidth`;
+  assert(await evaluate(`${overflow} <= 1`), "Comparison overflows a narrow dark viewport");
+  await evaluate(`${select(compareHeading)}.scrollIntoView({block:'start'})`);
+  await save("compare-dark-narrow-150");
+
+  await click("清空选择");
+  await waitFor(`!${select(compareReady)} && ${button}?.disabled`);
+  await selectTask(empty);
+  await selectTask(second);
+  await click("比较所选任务");
+  await waitFor(`!!${select(compareReady)}`);
+  const oldMetrics = await evaluate(`${select(compareMetrics)}.innerText`);
+  assert.match(oldMetrics, /未采样|不可用/);
+  assert.match(oldMetrics, /不可比较/);
+  const oldRankings = await evaluate(`${select(compareProcesses)}.innerText`);
+  assert.match(oldRankings, /未记录|未保存|缺少|不可用|无进程|没有归属|没有可归属/);
+  assert.match(oldRankings, /报表工作进程/);
+  await viewport(1160, 970, 1, "light");
+  await evaluate(`${select(compareHeading)}.scrollIntoView({block:'start'})`);
+  await save("compare-legacy-light");
+
+  await click("清空选择");
+  await waitFor(`!${select(compareReady)}`);
+  await evaluate("(() => { const field = document.querySelector('#taskName'); field.value = '隔离测量'; field.dispatchEvent(new Event('input')); })()");
+  await click("开始记录");
+  await waitFor("!!document.querySelector('[data-task-start]')");
+  await click("结束记录");
+  await waitFor("!document.querySelector('[data-task-start]') && document.querySelector('.viewport').innerText.includes('隔离测量')");
+}
+
 try {
   await call("Runtime.enable");
   await call("Page.enable");
   await viewport(1160, 790, 1, "light");
-  if (mode === "baseline") {
+  if (mode === "comparison") {
+    await compareTasks();
+  } else if (mode === "baseline") {
     for (const [path, marker, name] of [
       ["/", "近期趋势", "before-overview"],
       ["/?page=history", "资源时间线", "before-history"],
@@ -145,5 +251,8 @@ try {
   assert.equal(errors.length, 0, errors.join("\n"));
   console.log("Visual checks passed:", mode);
 } finally {
+  if (mode === "comparison" && fixturePath === "--close-browser" && socket.readyState === WebSocket.OPEN) {
+    await Promise.race([call("Browser.close").catch(() => {}), sleep(200)]);
+  }
   socket.close();
 }

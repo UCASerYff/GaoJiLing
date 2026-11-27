@@ -8,7 +8,7 @@ const pages = [
   ["overview", "概览", "监控此电脑的资源使用情况", "grid"],
   ["apps", "应用", "按 CPU 或内存查找资源占用", "apps"],
   ["history", "回看", "查看历史采样和异常发生的时间", "history"],
-  ["tasks", "任务", "记录运行时间与资源峰值", "record"],
+  ["tasks", "任务", "记录运行时间并比较资源占用", "record"],
   ["network", "网络", "查看实时流量，按需检查连接", "network"],
   ["cleanup", "清理", "检查候选项目与回收记录", "clean"],
   ["storage", "存储", "分析目录、重复文件和卷镜像", "disk"],
@@ -36,7 +36,8 @@ let storageMode = "metadata";
 let activeReview;
 let activeApp;
 let storageTrail = [];
-const selected = { cleanup: new Set(), duplicate: new Set() };
+let taskComparison;
+const selected = { cleanup: new Set(), duplicate: new Set(), tasks: new Set() };
 const drafts = { host: "www.microsoft.com", appSort: "cpu", storageSort: "allocatedBytes", suggestion: "", exportDays: "0" };
 
 function h(tag, attrs, ...children) {
@@ -62,11 +63,11 @@ const timeOnly = (time) => time ? new Date(time * 1000).toLocaleTimeString("zh-C
 const pct = (value) => Number.isFinite(value) ? Math.round(value) + "%" : "不可用";
 const reading = (value, unit) => Number.isFinite(value) ? Number(value.toFixed(1)) + " " + unit : "不可用";
 const rate = (value) => Number.isFinite(value) ? bytes(value) + "/秒" : "不可用";
-function bytes(value) {
+function bytes(value, units = ["B", "KB", "MB", "GB", "TB", "PB"]) {
   if (!Number.isFinite(value) || value < 0) return "不可用";
   let size = value;
-  for (const unit of ["B", "KB", "MB", "GB", "TB", "PB"]) {
-    if (size < 1024 || unit === "PB") return Number(size.toFixed(size >= 100 || unit === "B" ? 0 : 1)) + " " + unit;
+  for (const unit of units) {
+    if (size < 1024 || unit === units.at(-1)) return Number(size.toFixed(size >= 100 || unit === "B" ? 0 : 1)) + " " + unit;
     size /= 1024;
   }
 }
@@ -286,21 +287,23 @@ function render(preserveScroll = true, focusId) {
   requestAnimationFrame(drawCharts);
 }
 
-function seriesChart(label, samples, plots, { tall = false, marker = null, unit = "%", area = false } = {}) {
+function seriesChart(label, samples, plots, { tall = false, marker = null, unit = "%", area = false, axis = null } = {}) {
   const canvas = h("canvas", { class: "chart" + (tall ? " tall" : ""), "aria-hidden": "true" });
-  const summary = h("figcaption", { class: "chart-summary" }, samples.length ? samples.length + " 个采样点 · 留白表示无连续采样" : "暂无采样点");
+  const summary = !axis && h("figcaption", { class: "chart-summary" }, samples.length ? samples.length + " 个采样点 · 留白表示无连续采样" : "暂无采样点");
   const tip = h("output", { class: "chart-tip", "aria-live": "polite" });
-  const chart = { canvas, tip, samples, plots, marker, unit, area, selected: null };
+  const display = axis?.valueLabel ?? (unit === "%" ? pct : unit === "B" ? bytes : rate);
+  const timeLabel = axis?.timeLabel ?? timeOnly;
+  const title = axis?.title ?? label;
+  const chart = { canvas, tip, samples, plots, marker, unit, area, axis, display, timeLabel, selected: null };
   const moveTo = (index) => {
     chart.selected = index;
     const point = samples[index];
-    const display = unit === "%" ? pct : rate;
-    tip.textContent = point ? timeOnly(point.timestamp) + "  ·  " + plots.map(({ key, name }) => name + " " + display(point[key])).join("  ·  ") : "";
+    tip.textContent = point ? timeLabel(point.timestamp) + "  ·  " + plots.map(({ key, name }) => name + " " + display(point[key])).join("  ·  ") : "";
     tip.dataset.visible = String(!!point);
     drawChart(chart);
   };
   const plot = h("div", { class: "chart-plot", tabindex: 0, role: "group",
-    "aria-label": label + "，用左右方向键查看采样点", "data-focus-key": "chart-" + label,
+    "aria-label": title + "，用左右方向键查看采样点", "data-focus-key": "chart-" + title,
     onpointermove: (event) => {
       if (samples.length < 1 || !chart.coordinates) return;
       const rect = canvas.getBoundingClientRect();
@@ -334,7 +337,7 @@ function drawCharts() {
   for (const canvas of app.querySelectorAll(".chart")) drawChart(canvas.series);
 }
 function drawChart(chart) {
-  const { canvas, samples, plots, marker, unit, area, selected } = chart;
+  const { canvas, samples, plots, marker, unit, area, axis, display, timeLabel, selected } = chart;
   const width = canvas.clientWidth, height = canvas.clientHeight;
   if (!width || !height) return;
   const ratio = window.devicePixelRatio || 1;
@@ -346,11 +349,11 @@ function drawChart(chart) {
   const color = (name) => theme.getPropertyValue("--" + name).trim();
   const left = unit === "%" ? 37 : 72, right = 10, top = 12, bottom = height - 23;
   const plotWidth = Math.max(1, width - left - right);
-  const start = samples[0]?.timestamp ?? 0;
-  const end = samples.at(-1)?.timestamp ?? start;
+  const start = axis?.start ?? samples[0]?.timestamp ?? 0;
+  const end = axis?.end ?? samples.at(-1)?.timestamp ?? start;
   chart.coordinates = { left, width: plotWidth, start, end };
-  const maximum = unit === "%" ? 100 :
-    Math.max(1, ...samples.flatMap((sample) => plots.map(({ key }) => sample[key] ?? 0)));
+  const maximum = axis?.maximum ?? (unit === "%" ? 100 :
+    Math.max(1, ...samples.flatMap((sample) => plots.map(({ key }) => sample[key] ?? 0))));
   const x = (time) => left + (time - start) / Math.max(1, end - start) * plotWidth;
   const y = (number) => bottom - Math.max(0, Math.min(1, number / maximum)) * (bottom - top);
   ctx.font = "11px Segoe UI, Microsoft YaHei UI";
@@ -362,19 +365,19 @@ function drawChart(chart) {
     ctx.strokeStyle = color("line");
     ctx.moveTo(left, axis); ctx.lineTo(width - right, axis); ctx.stroke();
     ctx.textAlign = "right";
-    ctx.fillText(unit === "%" ? Math.round(part * 100) + "%" : rate(maximum * part), left - 6, axis + 3);
+    ctx.fillText(display(maximum * part), left - 6, axis + 3);
   }
   if (!samples.some((sample) => plots.some(({ key }) => Number.isFinite(sample[key])))) {
     ctx.textAlign = "center";
     ctx.fillText("暂无可用读数", left + plotWidth / 2, height / 2);
     return;
   }
-  const gap = Math.max(18, (state.settings?.sampleInterval || 2) * 3);
-  const labels = plotWidth > 520 ? [0, .25, .5, .75, 1] : [0, .5, 1];
+  const gap = axis?.gapSeconds ?? Math.max(18, (state.settings?.sampleInterval || 2) * 3);
+  const labels = plotWidth > 520 ? [0, .25, .5, .75, 1] : axis && plotWidth < 180 ? [0, 1] : [0, .5, 1];
   for (const fraction of end <= start ? [0] : labels) {
     const time = start + fraction * (end - start);
     ctx.textAlign = fraction === 0 ? "left" : fraction === 1 ? "right" : "center";
-    ctx.fillText(timeOnly(time), x(time), height - 5);
+    ctx.fillText(timeLabel(time), x(time), height - 5);
   }
   if (marker != null && marker >= start && marker <= end) {
     ctx.strokeStyle = color("amber");
@@ -548,6 +551,140 @@ function taskMetrics(task) {
     stat("内存峰值", task.peakMemory ? bytes(task.peakMemory) : "未采样"),
   ];
 }
+function selectTask(taskId, checked) {
+  if (checked && selected.tasks.size < 2) selected.tasks.add(taskId);
+  if (!checked) selected.tasks.delete(taskId);
+  taskComparison = null;
+  render();
+}
+async function compareTasks() {
+  const ids = [...selected.tasks];
+  if (ids.length !== 2 || taskComparison?.status === "loading") return;
+  const pending = { status: "loading" };
+  taskComparison = pending;
+  render();
+  try {
+    const result = await api("/api/session/compare", { ids });
+    if (taskComparison !== pending) return;
+    if (result.sessions?.length !== 2 || result.sessions.some((run, index) => run.id !== ids[index])) {
+      throw new Error("返回的记录与所选任务不一致。");
+    }
+    taskComparison = { status: "ready", result };
+  } catch (error) {
+    if (taskComparison !== pending) return;
+    taskComparison = { status: "error", message: error.message };
+  }
+  if (page !== "tasks") return;
+  const ready = taskComparison.status === "ready";
+  render(true, ready ? "task-comparison-result" : "compare-tasks");
+  if (ready) document.getElementById("task-comparison-result")?.scrollIntoView({ block: "start" });
+}
+const comparisonBytes = (value) => bytes(value, ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]);
+const compareMetrics = [
+  { key: "durationSeconds", label: "耗时", value: duration, difference: duration, precision: 0 },
+  { key: "cpuAveragePercent", label: "CPU 均值", value: (value) => reading(value, "%"), difference: (value) => reading(value, "百分点"), precision: 1 },
+  { key: "cpuPeakPercent", label: "CPU 峰值", value: (value) => reading(value, "%"), difference: (value) => reading(value, "百分点"), precision: 1 },
+  { key: "memoryPeakBytes", label: "内存峰值", value: comparisonBytes, difference: comparisonBytes, precision: 0 },
+];
+function compareRunTitle(run, index) {
+  return h("span", { class: "task-compare-run-title" },
+    h("span", { class: "task-compare-letter mono" }, index === 0 ? "A" : "B"),
+    h("span", { title: run.name }, run.name || "未命名任务"));
+}
+function compareRunRange(run) {
+  const day = (time) => new Date(time * 1000).toLocaleDateString("zh-CN");
+  if (day(run.start) === day(run.end)) {
+    return h("span", { class: "note task-compare-date" }, day(run.start),
+      h("span", {}, `${timeOnly(run.start)}–${timeOnly(run.end)}`));
+  }
+  return note(stamp(run.start) + " 至 " + stamp(run.end));
+}
+function compareSummary(sessions, comparable) {
+  const difference = (metric) => {
+    const [first, second] = sessions.map((run) => run[metric.key]);
+    if (!comparable[metric.key] || !Number.isFinite(first) || !Number.isFinite(second)) return "不可比较";
+    const delta = Number((second - first).toFixed(metric.precision));
+    return (delta > 0 ? "+" : delta < 0 ? "−" : "") + metric.difference(Math.abs(delta));
+  };
+  return h("section", { "data-compare-section": "metrics", "aria-label": "指标对比" },
+    h("table", { class: "task-compare-metrics", "aria-label": "会话关键指标" },
+      h("thead", {}, h("tr", {}, h("th", { scope: "col" }, "指标"),
+        sessions.map((run, index) => h("th", { scope: "col" }, compareRunTitle(run, index),
+          compareRunRange(run), run.interrupted && pill("中断记录", "warn"))),
+        h("th", { scope: "col" }, "差值 B−A"))),
+      h("tbody", {}, compareMetrics.map((metric, index) => h("tr", {},
+        h("th", { scope: "row" }, metric.label),
+        sessions.map((run) => h("td", { class: "mono" }, Number.isFinite(run[metric.key]) ? metric.value(run[metric.key]) : index ? "未采样" : "不可用")),
+        h("td", { class: "mono task-compare-difference" }, difference(metric)))))),
+    note("耗时以时:分:秒显示。CPU 按整机百分比计，差值用百分点。内存使用二进制单位。"),
+    sessions.some((run) => run.interrupted) && note("中断记录只显示已记录时长，耗时差值不可比较。"));
+}
+function comparisonTime(elapsed) {
+  const clock = duration(Math.round(elapsed));
+  return elapsed >= 3599.5 ? clock : clock.slice(3).replace(/^0/, "");
+}
+function compareTrends(sessions) {
+  const series = sessions.map((run) => run.trend.points.map((point) => ({
+    timestamp: point.elapsedSeconds, cpuPercent: point.cpuPercent, memoryBytes: point.memoryBytes,
+  })));
+  const horizon = Math.max(1, ...sessions.map((run) => run.durationSeconds || 0), ...series.map((points) => points.at(-1)?.timestamp || 0));
+  const memoryScale = Math.max(1, ...series.flatMap((points) => points.map((point) => point.memoryBytes ?? 0)));
+  return h("section", { class: "stack task-compare-section", "data-compare-section": "trends" },
+    h("div", {}, h("h3", {}, "会话采样趋势"), note("横轴从各任务开始计时，两次运行共用刻度。留白表示缺少连续采样或该任务已经结束。")),
+    h("div", { class: "task-compare-runs" }, sessions.map((run, index) => {
+      const points = series[index];
+      const axis = { start: 0, end: horizon, timeLabel: comparisonTime, gapSeconds: run.trend.gapSeconds };
+      const id = index === 0 ? "A" : "B";
+      const sampleRange = Number.isFinite(run.sampleStart) && Number.isFinite(run.sampleEnd)
+        ? "采样于 " + stamp(run.sampleStart) + " 至 " + stamp(run.sampleEnd) : "原记录未保存采样范围";
+      const counts = [Number.isFinite(run.sampleCount) ? "系统采样 " + run.sampleCount + " 次" : "总采样次数未知"];
+      if (Number.isFinite(run.cpuSampleCount)) counts.push("CPU " + run.cpuSampleCount + " 次");
+      if (Number.isFinite(run.memorySampleCount)) counts.push("内存 " + run.memorySampleCount + " 次");
+      const source = run.trend.source === "history" ? "来自任务时段内仍保留的系统历史" : "来自任务采样";
+      return h("article", { class: "task-compare-run" }, compareRunTitle(run, index), note(sampleRange), note(counts.join(" · ")),
+        run.trend.available && points.length ? [
+          note(source + " · 显示 " + points.length + " 个采样点"),
+          seriesChart("CPU", points, [{ key: "cpuPercent", color: "accent", name: "整机占用" }],
+            { axis: { ...axis, title: id + " 任务 CPU 趋势" } }),
+          seriesChart("内存", points, [{ key: "memoryBytes", color: "blue", name: "已用内存" }],
+            { unit: "B", axis: { ...axis, maximum: memoryScale, valueLabel: comparisonBytes, title: id + " 任务内存趋势" } }),
+        ] : note(run.trend.reason || "没有保留可用于绘图的采样。", "task-compare-empty"));
+    })));
+}
+function compareProcesses(sessions, comparable) {
+  return h("section", { class: "stack task-compare-section", "data-compare-section": "processes" },
+    h("div", {}, h("h3", {}, "进程占用排行"),
+      note("每个任务选取整机 CPU 最高且有有效进程读数的一次会话采样。按进程组的整机 CPU 占比排序，内存为当时的工作集。"),
+      !comparable && note("两次运行的排行不可比较。", "warn")),
+    h("div", { class: "task-compare-runs" }, sessions.map((run, index) => {
+      const snapshot = run.processes;
+      const rows = snapshot.rows;
+      const cpu = Number.isFinite(snapshot.systemCpuPercent) ? " · 整机 CPU " + reading(snapshot.systemCpuPercent, "%") : "";
+      return h("article", { class: "task-compare-run" }, compareRunTitle(run, index),
+        snapshot.available && rows.length ? [
+          note("采样于 " + stamp(snapshot.sampledAt) + cpu),
+          table(["进程组", { label: "CPU", numeric: true }, { label: "内存", numeric: true }],
+            rows.map((entry) => [
+              entry.name, reading(entry.cpuPercent, "%"), comparisonBytes(entry.memoryBytes),
+            ])),
+        ] : note(snapshot.reason || "没有可归属到该任务的进程采样。", "task-compare-empty"));
+    })));
+}
+function taskComparisonPanel() {
+  if (!taskComparison) return null;
+  if (taskComparison.status !== "ready") {
+    const loading = taskComparison.status === "loading";
+    return h("section", { class: "card task-compare-message", "data-compare-status": taskComparison.status,
+      role: loading ? "status" : "alert" },
+      loading ? [h("span", { class: "spinner", "aria-hidden": "true" }), "正在读取所选任务…"]
+        : "无法比较所选任务。" + taskComparison.message);
+  }
+  const { sessions, comparable } = taskComparison.result;
+  return h("section", { class: "card stack task-comparison", "data-compare-status": "ready",
+    "aria-labelledby": "task-comparison-result" },
+    h("h2", { id: "task-comparison-result", class: "section-title", tabindex: "-1" }, "任务对比结果"),
+    compareSummary(sessions, comparable), compareTrends(sessions), compareProcesses(sessions, comparable.processes));
+}
 function tasks() {
   const active = state.activeSession;
   const start = async () => {
@@ -556,6 +693,14 @@ function tasks() {
     return result;
   };
   const completed = state.sessions.filter((task) => task.end != null);
+  const completedIds = new Set(completed.map(({ id }) => id));
+  for (const id of selected.tasks) {
+    if (!completedIds.has(id)) {
+      selected.tasks.delete(id);
+      taskComparison = null;
+    }
+  }
+  const selectedIds = [...selected.tasks];
   const activeCard = active && h("section", { class: "card stack task-active" },
     h("div", { class: "split" }, h("div", {},
       h("div", { class: "row" }, h("h2", { class: "section-title" }, active.name),
@@ -571,16 +716,41 @@ function tasks() {
       h("form", { class: "row", onsubmit: (event) => { event.preventDefault(); perform(start, "开始记录"); } },
         field("taskName", "任务名称，例如素材导出"),
         h("button", { type: "submit", class: "primary", disabled: busy, "data-focus-key": "开始记录" }, "开始记录")))),
-  h("section", { class: "card data-panel" }, h("header", { class: "section-head panel-heading" },
-    h("h2", { class: "section-title" }, "已完成的任务"), note(completed.length + " 条")),
-  completed.length ? h("div", { class: "task-list" }, completed.map((task) => h("div", { class: "task-row" },
-    h("div", { class: "task-title" }, h("strong", {}, task.name), note(stamp(task.start)),
-      task.interrupted && pill("上次运行中断", "warn"), task.peakTemperature != null && note("峰值温度 " + reading(task.peakTemperature, "°C"))),
-    stat("耗时", duration(task.end - task.start)), taskMetrics(task),
-    button("导出任务记录", () => withPath("saveCSV", "任务 CSV 的新文件路径",
-      (path) => api("/api/export", { kind: "sessions", path, sessionId: task.id })),
-    { icon: "upload", class: "icon-button", key: "task-export-" + task.id })))) :
-    empty("record", "暂无已完成的任务", "开始记录后可在这里比较任务用时和资源峰值。")));
+  taskComparisonPanel(),
+  h("section", { class: "card data-panel task-list-panel", "aria-labelledby": "completed-tasks" },
+    h("header", { class: "section-head panel-heading task-list-header" },
+      h("div", {}, h("h2", { class: "section-title", id: "completed-tasks" }, "已完成的任务"),
+        note(completed.length + " 条" + (completed.length >= 2 ? " · 按选取顺序设为 A、B" : ""))),
+      completed.length >= 2 && row(h("span", { class: "note mono", role: "status" }, "已选 " + selectedIds.length + "/2"),
+        selectedIds.length > 0 && button("清空选择", () => {
+          selected.tasks.clear();
+          taskComparison = null;
+          render(true, "task-select-" + selectedIds[0]);
+        }, { local: true, class: "text" }),
+        button("比较所选任务", compareTasks, { local: true, key: "compare-tasks", class: "primary",
+          disabled: selectedIds.length !== 2 || taskComparison?.status === "loading" }))),
+    completed.length ? h("div", { class: "task-list", role: "list" }, completed.map((task) => {
+      const order = selectedIds.indexOf(task.id);
+      const dateId = "task-date-" + task.id;
+      const orderId = "task-order-" + task.id;
+      const selection = completed.length >= 2 && h("input", { type: "checkbox",
+        "aria-label": "选取任务 " + (task.name || "未命名任务"),
+        "aria-describedby": dateId + (order >= 0 ? " " + orderId : ""),
+        "data-focus-key": "task-select-" + task.id,
+        checked: order >= 0 ? "" : null, disabled: order < 0 && selectedIds.length === 2,
+        onchange: (event) => selectTask(task.id, event.currentTarget.checked) });
+      const title = h("span", { class: "task-title" }, h("strong", {}, task.name || "未命名任务"),
+        h("span", { class: "note", id: dateId }, stamp(task.start)),
+        task.interrupted && pill("上次运行中断", "warn"),
+        task.peakTemperature != null && h("span", { class: "note" }, "峰值温度 " + reading(task.peakTemperature, "°C")));
+      return h("div", { class: "task-row", role: "listitem", "data-comparison-order": order < 0 ? null : order },
+        selection ? h("label", { class: "task-select" }, selection, title,
+          order >= 0 && h("span", { class: "task-compare-letter mono", id: orderId }, order === 0 ? "A" : "B")) : title,
+        stat("耗时", duration(task.end - task.start)), taskMetrics(task),
+        button("导出任务记录", () => withPath("saveCSV", "任务 CSV 的新文件路径",
+          (path) => api("/api/export", { kind: "sessions", path, sessionId: task.id })),
+        { icon: "upload", class: "icon-button", key: "task-export-" + task.id }));
+    })) : empty("record", "暂无已完成的任务", "保存至少两次运行后，可在这里对比用时和资源占用。")));
 }
 function network() {
   const s = state.latest || {};
@@ -1180,6 +1350,7 @@ document.addEventListener("keydown", (event) => {
   else perform(() => openSettings(tab));
 });
 window.addEventListener("resize", drawCharts);
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => requestAnimationFrame(drawCharts));
 function connect() {
   app.replaceChildren(h("main", { class: "startup" }, card(null, null,
     h("div", { class: "banner loading", role: "status" }, h("span", { class: "spinner", "aria-hidden": "true" }), "正在连接本机监控…"))));

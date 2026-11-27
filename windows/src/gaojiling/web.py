@@ -102,7 +102,7 @@ def serve(service, port: int = 0, open_browser: bool = False, token: str | None 
                     if self.headers.get("X-Gao-Visible") == "1":
                         service._interactive = time.monotonic()
                     result = dispatch(service, method, path, payload)
-                elif path in {"/api/cancel", "/api/history"}:
+                elif path in {"/api/cancel", "/api/history", "/api/session/compare"}:
                     result = dispatch(service, method, path, payload)
                 elif path == "/api/shutdown":
                     if service.desktop:
@@ -167,6 +167,8 @@ def dispatch(service, method, path, payload):
         return {"session": service.start_session(payload.get("name") or "")}
     if path == "/api/session/stop":
         return {"session": service.stop_session()}
+    if path == "/api/session/compare":
+        return service.compare_sessions(payload.get("ids"))
     if path == "/api/settings":
         return {"settings": service.update_settings(payload)}
     if path == "/api/export":

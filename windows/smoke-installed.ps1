@@ -100,7 +100,28 @@ function Invoke-InstalledApp([string]$Version, [string]$TaskName, [string]$Previ
         $state = Invoke-RestMethod -Uri "$url/api/state" -Headers $headers -NoProxy
         if ($state.activeSession.name -ne $TaskName) { throw "Installed GUI failed to write a task" }
         $taskId = $state.activeSession.id
+        if ($PreviousTaskId) {
+            $started = $state.activeSession.start
+            $deadline = (Get-Date).AddSeconds(35)
+            do {
+                Start-Sleep -Milliseconds 400
+                $state = Invoke-RestMethod -Uri "$url/api/state" -Headers $headers -NoProxy
+                if ($state.latest.timestamp -gt $started) { break }
+            } while ((Get-Date) -lt $deadline)
+            if ($state.latest.timestamp -le $started) { throw 'The candidate task did not receive a real sample' }
+        }
         Invoke-RestMethod -Uri "$url/api/session/stop" @post -Body '{}' | Out-Null
+        if ($PreviousTaskId) {
+            $body = @{ ids = @($PreviousTaskId, $taskId) } | ConvertTo-Json -Compress
+            $comparison = Invoke-RestMethod -Uri "$url/api/session/compare" @post -Body $body
+            $runs = @($comparison.sessions)
+            if ($runs.Count -ne 2 -or $runs[0].id -ne $PreviousTaskId -or $runs[1].id -ne $taskId -or
+                $runs[0].trend.source -ne 'history' -or $runs[0].processes.available -ne $false -or
+                $runs[1].trend.source -ne 'session' -or $runs[1].sampleCount -lt 1 -or
+                $comparison.comparable.durationSeconds -ne $true) {
+                throw 'Upgraded GUI did not compare the legacy task and the newly sampled task as expected'
+            }
+        }
         Invoke-RestMethod -Uri "$url/api/shutdown" @post -Body '{}' | Out-Null
         if (-not $app.WaitForExit(20000) -or $app.ExitCode -ne 0) { throw "Installed GUI did not exit normally" }
         $probe = [Net.Sockets.TcpClient]::new()
@@ -160,7 +181,10 @@ try {
         throw "Uninstall did not remove only installed program files"
     }
     $verified = $true
-    if ($previous) { Write-Output "Verified private MSI major upgrade $($previous.version) to $($candidate.version), saved task and settings." }
+    if ($previous) {
+        Write-Output "Verified private MSI major upgrade $($previous.version) to $($candidate.version), saved task and settings."
+        Write-Output 'Verified the upgraded comparison of a legacy task and a new task with real samples.'
+    }
     Write-Output 'Verified MSI SHA-256, private install, x64 headless launcher without tray, task round-trip, loopback shutdown and data-preserving uninstall.'
 } finally {
     foreach ($entry in @($candidate, $previous)) {

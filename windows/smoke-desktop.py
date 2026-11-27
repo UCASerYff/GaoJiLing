@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -18,6 +19,7 @@ import tempfile
 import time
 import traceback
 import urllib.request
+from urllib.parse import urlsplit
 import uuid
 
 ROOT = Path(__file__).resolve().parent
@@ -122,6 +124,12 @@ def available_port():
         return sock.getsockname()[1]
 
 
+def port_closed(port):
+    with socket.socket() as sock:
+        sock.settimeout(.35)
+        return sock.connect_ex(("127.0.0.1", port)) != 0
+
+
 def identity_for(data):
     path = os.path.normcase(str(data.resolve())).encode("utf-8")
     return "GaoJiLing." + hashlib.sha256(path).hexdigest()[:24]
@@ -158,9 +166,7 @@ class LocalApp:
             return json.load(response)
 
     def port_closed(self):
-        with socket.socket() as sock:
-            sock.settimeout(.35)
-            return sock.connect_ex(("127.0.0.1", self.port)) != 0
+        return port_closed(self.port)
 
     def close(self):
         if self.process.poll() is None:
@@ -172,6 +178,67 @@ def window_pid(hwnd):
     pid = win.w.DWORD()
     win.window_pid(hwnd, c.byref(pid))
     return pid.value
+
+
+def ready_webview_windows(data):
+    for marker in data.glob("DesktopWebView/window-*/" + READY):
+        try:
+            pid = int((marker.parent / PROCESS).read_text(encoding="ascii"))
+        except (OSError, ValueError):
+            continue
+        yield marker.parent, pid
+
+
+_READ_WEBVIEW_DOM = r"""
+const [url, predicate] = process.argv.slice(1);
+const socket = new WebSocket(url);
+const timeout = setTimeout(() => process.exit(3), 11000);
+socket.addEventListener("error", () => process.exit(4));
+socket.addEventListener("open", () => {
+  const expression = "new Promise(resolve => { const expire = Date.now() + 7000; function check() {"
+    + "if (" + predicate + ") resolve(true); else if (Date.now() >= expire) resolve(false);"
+    + "else setTimeout(check, 100); } check(); })";
+  socket.send(JSON.stringify({ id: 1, method: "Runtime.evaluate",
+    params: { expression, awaitPromise: true, returnByValue: true } }));
+});
+socket.addEventListener("message", (message) => {
+  const record = JSON.parse(message.data);
+  if (record.id !== 1) return;
+  clearTimeout(timeout);
+  socket.close();
+  process.exit(record.result?.result?.value === true ? 0 : 2);
+});
+"""
+
+
+def verify_webview_dom(data, app, hwnd, address, predicate, label):
+    pid = window_pid(hwnd)
+    signals = next((path for path, process in ready_webview_windows(data) if process == pid), None)
+    assert signals is not None, f"{label} did not report a native WebView2 HWND and ready marker"
+
+    def private_target():
+        for metadata in signals.rglob("DevToolsActivePort"):
+            try:
+                port = int(metadata.read_text(encoding="ascii").splitlines()[0])
+                with app.opener.open(f"http://127.0.0.1:{port}/json/list", timeout=0.5) as response:
+                    targets = json.load(response)
+                for target in targets:
+                    if target.get("url") != address or target.get("type") != "page":
+                        continue
+                    endpoint = urlsplit(target["webSocketDebuggerUrl"])
+                    if endpoint.scheme == "ws" and endpoint.hostname == "127.0.0.1" and endpoint.port == port:
+                        return endpoint.geturl()
+            except (OSError, ValueError, IndexError):
+                pass
+        return None
+
+    target = until(private_target, f"No WebView2 target for the isolated {label} runtime", 20)
+    result = subprocess.run(["node", "-e", _READ_WEBVIEW_DOM, target, predicate],
+                            creationflags=subprocess.CREATE_NO_WINDOW, timeout=15, check=False)
+    assert result.returncode == 0, f"The WebView2 {label} window did not render the expected app content"
+    assert win.window_visible(hwnd), f"The WebView2 {label} HWND closed before verification"
+    print(f"Verified native WebView2 {label}: visible process HWND, ready marker and rendered app DOM.", flush=True)
+    return urlsplit(target).port
 
 
 def owned_handle(hwnd):
@@ -203,6 +270,15 @@ def dialog_answer(host, answer):
     assert get_item(dialog, 1) and get_item(dialog, 2), "Quit confirmation did not provide both choices"
     assert win.post_message(dialog, win.WM_COMMAND, answer, get_item(dialog, answer))
     until(lambda: not win.window_visible(dialog), "Quit confirmation did not close")
+
+
+def check_hotkey(app):
+    desktop = app.api("state")["desktop"]
+    if not desktop["hotkeyRegistered"] and desktop["hotkey"] == "Ctrl+Alt+G":
+        # Registration is session-wide. Only the test's private preference may change.
+        app.api("settings", {"hotkeyChoice": "m"})
+        print("The default global shortcut did not register; using the supported alternate in the isolated profile.", flush=True)
+    return until(lambda: app.api("state")["desktop"].get("hotkeyRegistered"), "Global hotkey was not registered")
 
 
 def open_floating_panel(host, strip, app):
@@ -246,7 +322,7 @@ def startup_probe(data, launcher):
         host = until(lambda: win.find_window(_WINDOW_CLASS, identity_for(data)), "Startup notification owner missing")
         handle = owned_handle(host)
         strip = until(lambda: win.find_view(window_pid(host), "搞机灵唤起条"), "Startup floating strip missing")
-        hotkey = until(lambda: app.api("state")["desktop"].get("hotkeyRegistered"), "Startup hotkey was not registered")
+        hotkey = check_hotkey(app)
         assert hotkey and state["desktop"]["available"]
         panel = open_floating_panel(host, strip, app)
         print(f"Startup entry verified strip HWND and registered global hotkey; floating panel verified: {bool(panel)}", flush=True)
@@ -267,23 +343,22 @@ def startup_probe(data, launcher):
             win.close_handle(handle)
 
 
-def smoke(data, launcher, cli):
+def smoke(data, launcher, cli, require_webview2=False, require_edge_fallback=False):
     app = LocalApp(launcher, data)
     handles = []
+    webview_ports = []
     name = identity_for(data)
     main_title = f"搞机灵 V{MARKETING}"
+    overview_dom = ('document.querySelector(".page-header h1")?.textContent.trim() === "概览"'
+                    ' && document.querySelector(".viewport .section-title")?.textContent.trim() === "资源占用"')
 
     def tracked_window(title):
         matches = []
-        for marker in data.glob("DesktopWebView/window-*/" + READY):
-            try:
-                pid = int((marker.parent / PROCESS).read_text(encoding="ascii"))
-            except (OSError, ValueError):
-                continue
+        for _path, pid in ready_webview_windows(data):
             hwnd = win.find_view(pid, title)
             if hwnd:
                 matches.append(hwnd)
-        if not matches and app.api("state")["desktop"]["view"] == "edge-app":
+        if not matches and not require_webview2 and app.api("state")["desktop"]["view"] == "edge-app":
             window_class = win._api(win.user, "GetClassNameW", c.c_int, win.w.HWND, win.w.LPWSTR, c.c_int)
             caption = "搞机灵 " + display() if title == main_title else title
 
@@ -304,11 +379,18 @@ def smoke(data, launcher, cli):
         assert state["desktop"]["available"], state["desktop"]
         host = until(lambda: win.find_window(_WINDOW_CLASS, name), "Notification owner HWND was not found")
         handles.append(owned_handle(host))
-        main = until(lambda: tracked_window(main_title), "Normal entry did not open an owned native or Edge main window", 55)
+        expected_view = "a native WebView2" if require_webview2 else "an owned native or Edge"
+        main = until(lambda: tracked_window(main_title), f"Normal entry did not open {expected_view} main window", 55)
         handles.append(owned_handle(main))
-        print(f"Main window backend: {app.api('state')['desktop']['view']}", flush=True)
+        backend = app.api("state")["desktop"]["view"]
+        print(f"Main window backend: {backend}", flush=True)
+        if require_webview2:
+            assert backend == "webview2"
+            webview_ports.append(verify_webview_dom(data, app, main, app.url, overview_dom, "main view"))
+        if require_edge_fallback:
+            assert backend == "edge-app", "The isolated missing-runtime probe did not exercise Edge fallback"
         strip = until(lambda: win.find_view(window_pid(host), "搞机灵唤起条"), "The desktop strip was not shown")
-        hotkey = until(lambda: app.api("state")["desktop"].get("hotkeyRegistered"), "Global hotkey was not registered")
+        hotkey = check_hotkey(app)
         assert hotkey
         registered = app.api("state")["desktop"]["trayAvailable"]
         rectangle = shell_icon_rect(host)
@@ -331,6 +413,7 @@ def smoke(data, launcher, cli):
             until(lambda: not win.window_visible(panel), "The second hotkey did not collapse the floating panel")
 
         task = app.api("session/start", {"name": "隔离托盘验收"})["session"]
+        closed_view = main, window_pid(main)
         assert win.post_message(main, 0x10, 0, 0)  # WM_CLOSE closes only the view.
         until(lambda: not win.window_visible(main), "Closing the main window did not dismiss it")
         latest = until(lambda: app.api("state")["latest"], "The monitor did not produce an initial sample")
@@ -346,11 +429,22 @@ def smoke(data, launcher, cli):
         dispatch_host(host, win.WM_TRAY, win.NOTIFY_ID, win.WM_LBUTTONUP)
         reopened = until(lambda: tracked_window(main_title), "Tray selection did not reopen the native main window", 42)
         handles.append(owned_handle(reopened))
+        if require_webview2:
+            assert (reopened, window_pid(reopened)) != closed_view, "Tray activation did not create a replacement window"
+            webview_ports.append(verify_webview_dom(data, app, reopened, app.url, overview_dom,
+                                                   "main view reopened by tray selection"))
+        # In fallback mode post WM_CLOSE immediately after the first observed
+        # Edge HWND, before the host necessarily observes it in its own poll.
+        closed_view = reopened, window_pid(reopened)
         assert win.post_message(reopened, 0x10, 0, 0)
         until(lambda: not win.window_visible(reopened), "The reopened main window did not close")
         dispatch_host(host, win.WM_COMMAND, _TRAY_OPEN)
         reopened = until(lambda: tracked_window(main_title), "The tray menu did not reopen the main window", 42)
         handles.append(owned_handle(reopened))
+        if require_webview2:
+            assert (reopened, window_pid(reopened)) != closed_view, "Tray menu did not create a replacement window"
+            webview_ports.append(verify_webview_dom(data, app, reopened, app.url, overview_dom,
+                                                   "main view reopened by tray menu"))
         secondary = subprocess.run(app.arguments, timeout=35)
         assert secondary.returncode == 0, "A second launch did not forward to the original instance"
         time.sleep(0.6)
@@ -362,6 +456,16 @@ def smoke(data, launcher, cli):
         settings = until(lambda: tracked_window("搞机灵设置"), "Native settings did not open", 42)
         handles.append(owned_handle(settings))
         assert reopened != settings and app.api("state")["desktop"]["view"] in {"webview2", "edge-app"}
+        if require_edge_fallback:
+            assert app.api("state")["desktop"]["view"] == "edge-app"
+        if require_webview2:
+            assert app.api("state")["desktop"]["view"] == "webview2"
+            webview_ports.append(verify_webview_dom(
+                data, app, settings, app.url + "?settings=1&tab=data",
+                'document.querySelector(".settings-body h2")?.textContent.trim() === "数据"'
+                ' && document.querySelector(".settings-body .section-title")?.textContent.trim().length > 0',
+                "data settings",
+            ))
 
         dispatch_host(host, win.WM_COMMAND, _TRAY_QUIT)
         dialog_answer(host, 2)
@@ -378,6 +482,9 @@ def smoke(data, launcher, cli):
         dispatch_host(host, win.WM_COMMAND, _TRAY_QUIT)
         dialog_answer(host, 1)
         assert_exit(app, data, host, task["id"], state["desktop"]["hotkey"], handles, (reopened, settings, strip, panel))
+        if require_webview2:
+            until(lambda: all(port_closed(port) for port in webview_ports), "A private WebView2 debugging endpoint survived exit")
+            print("All four ephemeral WebView2 debugging endpoints closed after explicit exit.", flush=True)
         print("Normal native entry, background sampling and recording after WM_CLOSE, tray and menu reopen, "
               "forwarded second launch, Cancel and saved Quit, and HWND/process/hotkey/port cleanup verified.", flush=True)
     finally:
@@ -408,7 +515,10 @@ def launchers(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", type=Path)
-    parser.add_argument("--startup-probe", action="store_true", help="Check the background login entry and native quit without opening the main view.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--startup-probe", action="store_true", help="Check the background login entry and native quit without opening the main view.")
+    mode.add_argument("--require-webview2", action="store_true", help="Require the native WebView2 window and rendered local app content; requires Node.js 22+.")
+    mode.add_argument("--require-edge-fallback", action="store_true", help="Point only the test process at an empty WebView2 runtime folder and require the private Edge fallback.")
     parser.add_argument("--_desktop", help=argparse.SUPPRESS)
     parser.add_argument("--_scratch", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -423,22 +533,37 @@ def main():
                 verify_inactive(args._desktop)
                 # Any external-browser fallback returns quietly and cannot invoke a shared browser.
                 os.environ["BROWSER"] = f'"{Path(sys.executable).as_posix()}" -c pass %s'
+                if args.require_webview2:
+                    os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (
+                        "--remote-debugging-port=0 --remote-debugging-address=127.0.0.1"
+                    )
+                if args.require_edge_fallback:
+                    empty_runtime = args._scratch / "empty-webview2-runtime"
+                    empty_runtime.mkdir()
+                    os.environ["WEBVIEW2_BROWSER_EXECUTABLE_FOLDER"] = str(empty_runtime)
                 launcher, cli = launchers(args)
                 data = args._scratch / "data"
                 if args.startup_probe:
                     startup_probe(data, launcher)
                 else:
-                    smoke(data, launcher, cli)
+                    smoke(data, launcher, cli, require_webview2=args.require_webview2,
+                          require_edge_fallback=args.require_edge_fallback)
             except BaseException:
                 traceback.print_exc()
                 return 1
         return 0
     if not sys.platform.startswith("win"):
         parser.error("This smoke requires Windows")
+    if args.require_webview2 and not shutil.which("node"):
+        parser.error("--require-webview2 requires Node.js with WebSocket support")
     directory.mkdir(exist_ok=True)
     options = ["--exe", str(args.exe.resolve(strict=True))] if args.exe else []
     if args.startup_probe:
         options.append("--startup-probe")
+    if args.require_webview2:
+        options.append("--require-webview2")
+    if args.require_edge_fallback:
+        options.append("--require-edge-fallback")
     scratch = tempfile.TemporaryDirectory(prefix="desktop-smoke-", dir=directory)
     try:
         return run_isolated(Path(scratch.name), options)

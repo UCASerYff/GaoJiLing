@@ -425,6 +425,10 @@ class Desktop:
                 current.reopen = (target, backend)
                 self._dismiss_view(key, current)
                 return
+            if current.backend == "edge-app" and not hwnd:
+                # Edge has no ready marker. It may have opened and closed between polls.
+                current.reopen = (target, current.backend)
+                return
             if tab and current.backend == "webview2":
                 navigation = current.signals / NAVIGATION
                 temporary = navigation.with_suffix(".pending")
@@ -476,8 +480,14 @@ class Desktop:
                 if closing or (view.ready and not hwnd):
                     self._dismiss_view(key, view)
                 elif not view.ready and (not running or now >= view.deadline):
-                    view.reopen = (view.target, self._next_view_backend(view.backend))
+                    if view.reopen is None:
+                        view.reopen = (view.target, self._next_view_backend(view.backend))
                     self._dismiss_view(key, view)
+                elif hwnd and view.reopen is not None:
+                    view.reopen = None
+                    if win.is_iconic(hwnd):
+                        win.show_window(hwnd, 9)
+                    win.set_foreground(hwnd)
             if not running or (view.closing is not None and now >= view.closing):
                 self._drop_view(key, view)
                 if view.reopen:

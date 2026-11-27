@@ -13,6 +13,7 @@ from pathlib import Path
 
 from gaojiling.errors import AppError
 from gaojiling.jsonutil import dumps
+from gaojiling.sessioncompare import BACKUP_PREFIX, DETAIL_LIMIT, POINT_LIMIT, validate_detail
 from gaojiling.timeutil import check_unix, cocoa_to_unix, now_unix, unix_to_cocoa
 
 _TABLES = ("samples", "events", "sessions", "preferences")
@@ -24,6 +25,11 @@ CREATE TABLE samples(t REAL PRIMARY KEY, payload TEXT NOT NULL);
 CREATE TABLE events(id TEXT PRIMARY KEY, t REAL NOT NULL, payload TEXT NOT NULL);
 CREATE TABLE sessions(id TEXT PRIMARY KEY, t REAL NOT NULL, payload TEXT NOT NULL);
 CREATE TABLE preferences(id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL);
+"""
+_SESSION_COMPARISON_TABLE = """
+CREATE TABLE IF NOT EXISTS session_comparison(
+    id TEXT PRIMARY KEY, t REAL NOT NULL, end REAL NOT NULL, payload TEXT NOT NULL
+)
 """
 
 
@@ -468,11 +474,73 @@ class MonitorStore:
 
     def save_session(self, session: dict):
         self.require()
-        self.db.execute(
-            "INSERT OR REPLACE INTO sessions(id,t,payload) VALUES(?,?,?)",
-            (session["id"], session["start"], encode_session(session)),
-        )
-        self.db.commit()
+        with self.db:
+            self.db.execute(
+                "INSERT OR REPLACE INTO sessions(id,t,payload) VALUES(?,?,?)",
+                (session["id"], session["start"], encode_session(session)),
+            )
+            if "_comparison" in session:
+                self.db.execute(_SESSION_COMPARISON_TABLE)
+                self._save_session_detail(session, session["_comparison"])
+                self.db.execute("""
+                    DELETE FROM session_comparison WHERE id IN (
+                        SELECT id FROM session_comparison ORDER BY t DESC, id LIMIT -1 OFFSET ?
+                    )
+                """, (DETAIL_LIMIT,))
+
+    def _comparison_table_exists(self):
+        return self.db.execute("SELECT 1 FROM sqlite_master WHERE name='session_comparison' AND type='table'").fetchone() is not None
+
+    def _save_session_detail(self, session, detail):
+        self.db.execute("INSERT OR REPLACE INTO session_comparison(id,t,end,payload) VALUES(?,?,?,?)",
+                        (session["id"], session["start"], session["end"], dumps(detail)))
+
+    def session(self, identifier: str) -> dict | None:
+        self.require()
+        row = self.db.execute("SELECT payload FROM sessions WHERE id=?", (identifier,)).fetchone()
+        return decode_session(row["payload"]) if row else None
+
+    def session_detail(self, session):
+        if self._comparison_table_exists():
+            row = self.db.execute("SELECT t,end,payload FROM session_comparison WHERE id=?",
+                                  (session["id"],)).fetchone()
+            if row and abs(row["t"] - session["start"]) < 0.0001 and abs(row["end"] - session["end"]) < 0.0001:
+                try:
+                    detail = json.loads(row["payload"])
+                    if validate_detail(detail, session["end"] - session["start"]):
+                        return detail
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return None
+
+    def comparison_backup(self, sessions):
+        if not self._comparison_table_exists():
+            return {}
+        detail_ids = {row["id"] for row in self.db.execute(
+            "SELECT id FROM session_comparison ORDER BY t DESC, id LIMIT ?", (DETAIL_LIMIT,)
+        )}
+        result = {}
+        for item in sessions:
+            if item["id"] in detail_ids and item.get("end") is not None:
+                detail = self.session_detail(item)
+                if detail is None:
+                    raise AppError("任务比较资料读取失败，不能导出完整资料。")
+                result[BACKUP_PREFIX + item["id"].upper()] = dumps(detail)
+        return result
+
+    def history_for_comparison(self, start, end, bucket):
+        """Use the timestamp index for at most POINT_LIMIT reads per legacy run."""
+        for index in range(min(POINT_LIMIT, int((end - start) // bucket) + 1)):
+            lower = start + index * bucket
+            upper = lower + bucket
+            row = self.db.execute("""
+                SELECT t,payload FROM samples
+                WHERE t >= ? AND t < ? AND t <= ? ORDER BY t DESC LIMIT 1
+            """, (lower, upper, end)).fetchone()
+            if row:
+                payload = json.loads(row["payload"])
+                yield {"timestamp": row["t"], "cpuPercent": payload.get("cpuPercent"),
+                       "memoryUsed": payload.get("memoryUsed")}
 
     def history(self, since: float, until: float | None = None) -> list[dict]:
         self.require()
@@ -507,21 +575,28 @@ class MonitorStore:
         table = {"samples": "samples", "events": "events", "sessions": "sessions"}.get(scope)
         if table is None:
             raise AppError("未知的清理类别。")
-        if before is None:
-            cursor = self.db.execute(f"DELETE FROM {table}")
-        else:
-            cutoff = check_unix(before, "清理截止时间")
-            cursor = self.db.execute(f"DELETE FROM {table} WHERE t < ?", (cutoff,))
-        self.db.commit()
+        with self.db:
+            if before is None:
+                cursor = self.db.execute(f"DELETE FROM {table}")
+            else:
+                cutoff = check_unix(before, "清理截止时间")
+                cursor = self.db.execute(f"DELETE FROM {table} WHERE t < ?", (cutoff,))
+            if scope == "sessions" and self._comparison_table_exists():
+                self.db.execute("DELETE FROM session_comparison WHERE id NOT IN (SELECT id FROM sessions)")
         return cursor.rowcount
 
-    def replace_backup(self, samples: list[dict], events: list[dict], sessions: list[dict], settings: dict | None):
+    def replace_backup(self, samples: list[dict], events: list[dict], sessions: list[dict], settings: dict | None,
+                       session_details: dict | None = None):
         self.require()
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self.db.execute("DELETE FROM samples")
             self.db.execute("DELETE FROM events")
             self.db.execute("DELETE FROM sessions")
+            if session_details:
+                self.db.execute(_SESSION_COMPARISON_TABLE)
+            if self._comparison_table_exists():
+                self.db.execute("DELETE FROM session_comparison")
             for sample in samples:
                 self.db.execute("INSERT INTO samples(t,payload) VALUES(?,?)", (sample["timestamp"], encode_sample(sample)))
             for event in events:
@@ -531,6 +606,8 @@ class MonitorStore:
                     "INSERT INTO sessions(id,t,payload) VALUES(?,?,?)",
                     (session["id"], session["start"], encode_session(session)),
                 )
+                if session_details and session["id"] in session_details:
+                    self._save_session_detail(session, session_details[session["id"]])
             if settings is not None:
                 if not self.settings_writable:
                     raise AppError("原设置读取异常，暂不覆盖。")

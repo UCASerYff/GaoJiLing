@@ -49,8 +49,9 @@ Invoke-Python -m PyInstaller @common --name GaoJiLing-cli --console --exclude-mo
 
 $notice = Join-Path $build "ThirdPartyNotices.txt"
 $msiWork = Join-Path $build "msi"
-$package = (Invoke-Python .\package_msi.py $programs $msiWork $notice | Select-Object -Last 1)
-$final = Join-Path $dist (Split-Path $package -Leaf)
+$packageName = (Invoke-Python .\package_msi.py $programs $msiWork $notice | Select-Object -Last 1)
+$package = Join-Path $programs $packageName
+$final = Join-Path $dist $packageName
 Copy-Item -LiteralPath $package -Destination $final -Force
 $hash = (Get-FileHash -LiteralPath $final -Algorithm SHA256).Hash.ToLowerInvariant()
 "$hash  $(Split-Path $final -Leaf)" | Set-Content -LiteralPath ($final + ".sha256") -Encoding Ascii

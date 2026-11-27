@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+from ctypes import wintypes
 from pathlib import Path
 import sys
 import uuid
@@ -16,7 +18,7 @@ with warnings.catch_warnings():
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from gaojiling.autostart import SHORTCUT_NAME
-from gaojiling.version import BUILD, BUNDLE_ID, MARKETING
+from gaojiling.version import BUILD, BUNDLE_ID, MARKETING, display
 
 
 UPGRADE_CODE = uuid.UUID("cd8b39db-cd72-43fc-ae40-f295ed2ab543")
@@ -25,6 +27,25 @@ PRODUCT_VERSION = f"{MARKETING}.{BUILD}"
 
 def code(value):
     return "{" + str(uuid.uuid5(UPGRADE_CODE, value)).upper() + "}"
+
+
+def file_version(path: Path) -> tuple[str | None, str | None]:
+    if path.suffix.casefold() != ".exe":
+        return None, None
+    read_version = ctypes.WinDLL("msi").MsiGetFileVersionW
+    length_pointer = ctypes.POINTER(wintypes.DWORD)
+    read_version.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, length_pointer,
+                             wintypes.LPWSTR, length_pointer)
+    read_version.restype = wintypes.UINT
+    version = ctypes.create_unicode_buffer(64)
+    language = ctypes.create_unicode_buffer(64)
+    version_size = wintypes.DWORD(len(version))
+    language_size = wintypes.DWORD(len(language))
+    result = read_version(str(path), version, ctypes.byref(version_size),
+                          language, ctypes.byref(language_size))
+    if result != 0 or version.value != f"{PRODUCT_VERSION}.0":
+        raise ValueError(f"Unexpected PE file version for {path.name}: {version.value!r} ({result})")
+    return version.value, language.value or None
 
 
 def package(path, files, work):
@@ -90,7 +111,9 @@ def package(path, files, work):
     for index, (item, short_name) in enumerate(files, 1):
         identifier = f"File{index}"
         components.append((identifier, code("file-" + item.name), "INSTALLDIR", 256, None, identifier))
-        records.append((identifier, identifier, f"{short_name}|{item.name}", item.stat().st_size, None, None, 0x4000, index))
+        version, language = file_version(item)
+        records.append((identifier, identifier, f"{short_name}|{item.name}", item.stat().st_size,
+                        version, language, 0x4000, index))
         sources.append((str(item), identifier))
     components.append(("Registration", code("registration"), "INSTALLDIR", 256 | 4, "NOT GAOISOLATED", "AppRegistration"))
     add("Component", components)
@@ -120,7 +143,7 @@ if __name__ == "__main__":
     parser.add_argument("notices", type=Path)
     args = parser.parse_args()
     dist = args.dist.resolve()
-    output = dist / f"GaoJiLing-{MARKETING}-Windows-x64.msi"
+    output = dist / f"GaoJiLing-{display()}-Windows-x64.msi"
     package(output, [(dist / "GaoJiLing.exe", "GAOJL.EXE"), (dist / "GaoJiLing-cli.exe", "GAOJLCLI.EXE"),
                      (args.notices.resolve(), "NOTICES.TXT")], args.work.resolve())
-    print(output)
+    print(output.name)

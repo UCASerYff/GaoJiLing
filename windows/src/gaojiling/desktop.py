@@ -22,7 +22,8 @@ import webbrowser
 
 from gaojiling.errors import AppError
 from gaojiling.appwindow import CLOSE, NAVIGATION, PROCESS, READY
-from gaojiling.floating import FOOTER_HEIGHT, WIDTH, PanelContent, byte_size, content_height, percent, rounded_contains
+from gaojiling.floating import (FOOTER_HEIGHT, PALETTES, PANEL_RADIUS, WIDTH, PanelContent,
+                               byte_size, content_height, percent, rounded_contains)
 from gaojiling.geometry import (DRAG_THRESHOLD, PANEL_INSET, SNAP_DISTANCE, PanelAutoCollapse,
                               dragging_handle, handle_frame, horizontal_ratio, panel_placement, vertical_ratio)
 from gaojiling.resources import asset_root
@@ -195,7 +196,7 @@ class Desktop:
         self.root.withdraw()
         self.strip, self.strip_hwnd = _desktop_window(self.root, "搞机灵唤起条")
         self.panel, self.panel_hwnd = _desktop_window(self.root, "搞机灵监控面板")
-        self.strip_background = tk.Frame(self.strip, bg="#428c80", cursor="hand2")
+        self.strip_background = tk.Frame(self.strip, bg=PALETTES["light"]["accent"], cursor="hand2")
         self.strip_background.pack(fill="both", expand=True)
         self.strip_background.bind("<ButtonPress-1>", self._begin_strip)
         self.strip_background.bind("<B1-Motion>", lambda _event: self._move_strip())
@@ -459,8 +460,10 @@ class Desktop:
         inset = max(1, round(4 * scale))
         rect = (capsule_x, y + inset, max(1, ink_width), max(1, height - 2 * inset))
         # Track the visible physical strip, not its larger geometry anchor.
+        color = PALETTES[self.theme]["accent"]
+        if self.strip_background.cget("background") != color:
+            self.strip_background.configure(bg=color)
         if rect != self.strip_rect:
-            self.strip_background.configure(bg="#58aa9b" if hovered else "#428c80")
             win.show_rect(self.strip_hwnd, rect, max(1, ink_width // 2))
             self.strip_rect = rect
         self.strip_anchor = physical
@@ -506,8 +509,9 @@ class Desktop:
 
     def _open_panel(self, monitor, anchor, from_strip=False):
         visible = monitor[2]
-        height = max(320, content_height(self.service.latest or {}, self.settings, self.service.active) + FOOTER_HEIGHT)
-        size = dict(width=min(WIDTH, max(1, visible["width"] - 32)), height=height)
+        width = min(WIDTH, max(1, visible["width"] - 32))
+        size = dict(width=width, height=content_height(self.service.latest or {}, self.settings,
+                                                    self.service.active, width) + FOOTER_HEIGHT)
         placement = panel_placement(anchor, size, visible, self.settings["edge"])
         self.panel_monitor, self.panel_frame = monitor, placement["frame"]
         self.panel_open = True
@@ -517,6 +521,7 @@ class Desktop:
         win.show_window(self.strip_hwnd, win.SW_HIDE)
         self.strip_rect = None
         self.last_render_key = None
+        self.content.reset_view()
         self._render_panel(force=True)
         self.mouse_events.clear()
         self.mouse_hook = win.set_hook(14, self.hook_proc, self.module, 0)
@@ -548,7 +553,7 @@ class Desktop:
         self._open_panel(monitor, anchor)
 
     def _inside_panel(self, point):
-        return self.panel_rect is not None and rounded_contains(self.panel_rect, point, 20 * self.panel_monitor[3])
+        return self.panel_rect is not None and rounded_contains(self.panel_rect, point, PANEL_RADIUS * self.panel_monitor[3])
 
     def _begin_panel(self):
         if not self.panel_open:
@@ -606,7 +611,7 @@ class Desktop:
         frame, monitor = self.panel_frame, self.panel_monitor
         busy = getattr(self.service, "data_busy", False)
         if not self.panel_down:
-            desired = max(320, content_height(sample, self.settings, active) + FOOTER_HEIGHT)
+            desired = content_height(sample, self.settings, active, frame["width"]) + FOOTER_HEIGHT
             frame["height"] = min(desired, max(1, monitor[2]["height"] - 2 * PANEL_INSET))
             frame["y"] = min(frame["y"], max(PANEL_INSET, monitor[2]["height"] - PANEL_INSET - frame["height"]))
         rect = _physical(frame, monitor)
@@ -616,7 +621,7 @@ class Desktop:
             return
         self.last_render_key = key
         if force or rect != self.panel_rect:
-            win.show_rect(self.panel_hwnd, rect, max(1, round(20 * monitor[3])))
+            win.show_rect(self.panel_hwnd, rect, max(1, round(PANEL_RADIUS * monitor[3])))
         self.panel_rect = rect
         self.content.update(frame["width"], frame["height"], monitor[3], sample, self.settings, active, paused,
                             self.charts, self.theme, busy=busy)

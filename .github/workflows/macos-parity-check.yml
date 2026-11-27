@@ -1,0 +1,21 @@
+name: macOS parity validation
+on:
+  push:
+    branches: ['codex/macos-parity-verify-20261127-47346dc95d']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Compile and run focused macOS checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -m
+          xcodebuild -version
+          bash Scripts/verify-macos.sh

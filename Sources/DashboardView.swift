@@ -677,13 +677,13 @@ struct GLSparkline: View {
     let values: [Double]
     var color: Color = GLPalette.accent
     var body: some View {
-        Canvas { (context: GraphicsContext, size: CGSize) in
-            draw(context, size: size)
+        Canvas { context, size in
+            draw(&context, size: size)
         }
         .accessibilityLabel("近期变化趋势")
     }
 
-    private func draw(_ context: GraphicsContext, size: CGSize) {
+    private func draw(_ context: inout GraphicsContext, size: CGSize) {
         guard values.count > 1 else { return }
         let upper: Double = max(values.max() ?? 1, 1)
         let lastIndex: CGFloat = CGFloat(values.count - 1)

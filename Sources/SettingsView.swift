@@ -300,6 +300,7 @@ struct GLAboutView: View {
                             Text("V\(GLPalette.version)")
                                 .font(.system(size: 13, weight: .medium, design: .monospaced)).foregroundStyle(.secondary)
                         }.lineLimit(1).accessibilityElement(children: .combine)
+                        Text("构建 \(GLPalette.build)").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
                         Text("原生 macOS 系统监控").foregroundStyle(.secondary)
                         Text("电脑的小动静，一眼就知道。").foregroundStyle(GLPalette.accent)
                     }

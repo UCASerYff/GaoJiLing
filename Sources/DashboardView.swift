@@ -4,6 +4,7 @@ import Charts
 
 enum GLPalette {
     static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+    static let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
     static let accent = adaptive(
         light: NSColor(calibratedRed: 0.16, green: 0.48, blue: 0.43, alpha: 1),
         dark: NSColor(calibratedRed: 0.40, green: 0.76, blue: 0.67, alpha: 1))
@@ -523,7 +524,7 @@ struct DashboardView: View {
                         Image(systemName: "record.circle").font(.system(size: 32, weight: .light)).foregroundStyle(GLPalette.accent).padding(.top, 3)
                         VStack(alignment: .leading, spacing: 7) {
                             Text("开始一段任务记录").font(.system(size: 18, weight: .semibold))
-                            Text("从现在起，记录这项工作的时长、CPU 与内存峰值。").font(.system(size: 12)).foregroundStyle(.secondary)
+                            Text("记录这项工作的时长、CPU 与内存，便于再次运行后对比。").font(.system(size: 12)).foregroundStyle(.secondary)
                             HStack(spacing: 12) {
                                 TextField("例如：编译项目 / 视频导出", text: $sessionName).textFieldStyle(.roundedBorder).onSubmit(startSession)
                                 Button("开始记录", action: startSession).buttonStyle(.borderedProminent)
@@ -532,36 +533,7 @@ struct DashboardView: View {
                     }
                 }
             }
-            GLSectionTitle(title: "已完成的任务", detail: "保存在这台 Mac 上")
-            let completed = store.sessions.filter { $0.end != nil }.sorted { $0.start > $1.start }
-            if completed.isEmpty {
-                GLCard { GLEmptyState(icon: "tray", title: "第一份记录，从下一项工作开始", detail: "结束任务后，可以在这里查看汇总并导出。") }
-            } else {
-                ForEach(completed) { session in
-                    GLCard {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 5) {
-                                Text(session.name).font(.system(size: 15, weight: .semibold)).lineLimit(2).help(session.name)
-                                Text(session.start.formatted(date: .abbreviated, time: .shortened)).font(.system(size: 10)).foregroundStyle(.secondary)
-                                if session.interrupted == true {
-                                    Label("上次运行中断，已恢复至最后采样", systemImage: "arrow.clockwise.circle")
-                                        .font(.system(size: 10)).foregroundStyle(GLPalette.amber)
-                                }
-                            }
-                            Spacer()
-                            Text(Format.duration(session.duration)).font(.system(size: 13, design: .monospaced)).foregroundStyle(.secondary)
-                            Button { store.exportSession(session) } label: { Image(systemName: "square.and.arrow.up") }.buttonStyle(.borderless).help("导出任务记录").accessibilityLabel("导出任务：\(session.name)")
-                        }
-                        Divider().opacity(0.5).padding(.vertical, 3)
-                        HStack {
-                            GLSensor(label: "CPU 峰值", value: session.sampleCount > 0 ? Format.percent(session.peakCPU) : nil, fallback: "没有采样")
-                            GLSensor(label: "CPU 平均", value: session.sampleCount > 0 ? Format.percent(session.averageCPU) : nil, fallback: "没有采样")
-                            GLSensor(label: "内存峰值", value: session.peakMemory > 0 ? Format.bytes(session.peakMemory) : nil, fallback: "没有采样")
-                            GLSensor(label: "温度峰值", value: session.peakTemperature.map { String(format: "%.0f °C", $0) }, fallback: "未读取传感器")
-                        }
-                    }
-                }
-            }
+            GLCompletedSessions(store: store)
         }
     }
 

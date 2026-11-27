@@ -86,6 +86,8 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     private var hotkey: EventHotKeyRef?
     private var hotkeyHandler: EventHandlerRef?
     private var terminationSignal: DispatchSourceSignal?
+    private var signalRequestedTermination = false
+    private var presentingTerminationAlert = false
     private var pendingTermination = false
     private var panelMenuItem: NSMenuItem?
 
@@ -112,13 +114,18 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
             guard let self else { return false }
             return !self.pendingTermination && !self.store.dataBusy && !self.cleanup.isBusy && !self.analysis.isBusy && !self.duplicates.isBusy && !self.manager.isBusy && !self.exchange.isBusy
         }
-        store.dataActionsAllowed = { [weak self] in self?.diskStorage.isBusy == false }
+        store.dataActionsAllowed = { [weak self] in
+            guard let self else { return false }
+            return !self.pendingTermination && !self.diskStorage.isBusy
+        }
         business = GABusinessCoordinator(exchange: exchange, cleanup: cleanup, analysis: analysis, manager: manager, duplicates: duplicates,
-            externallyBusy: { [weak self] in guard let self else { return true }; return self.store.dataBusy || self.diskStorage.isBusy },
+            externallyBusy: { [weak self] in guard let self else { return true }; return self.pendingTermination || self.store.dataBusy || self.diskStorage.isBusy },
             navigate: { [weak self] action in self?.showBusiness(action) })
         signal(SIGTERM, SIG_IGN)
         terminationSignal = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-        terminationSignal?.setEventHandler { NSApp.terminate(nil) }
+        terminationSignal?.setEventHandler { [weak self] in
+            Task { @MainActor in self?.terminateFromSignal() }
+        }
         terminationSignal?.resume()
         configureMainMenu()
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 780), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
@@ -157,7 +164,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         configurePanelMouseMonitoring()
         store.$latest.sink { [weak self] sample in self?.updateStatus(sample); self?.maintenance.ingest(sample: sample) }.store(in: &subscriptions)
         store.$isPaused.sink { [weak self] _ in DispatchQueue.main.async { self?.updateStatus(self?.store.latest ?? .empty) } }.store(in: &subscriptions)
-        for publisher in [store.$dataBusy.eraseToAnyPublisher(), cleanup.$isBusy.eraseToAnyPublisher(), analysis.$isBusy.eraseToAnyPublisher(), diskStorage.$isBusy.eraseToAnyPublisher(), duplicates.$isBusy.eraseToAnyPublisher(), manager.$isBusy.eraseToAnyPublisher(), exchange.$isBusy.eraseToAnyPublisher(), store.$isPaused.eraseToAnyPublisher()] {
+        for publisher in [store.$dataBusy.eraseToAnyPublisher(), store.$isDiagnosing.eraseToAnyPublisher(), cleanup.$isBusy.eraseToAnyPublisher(), analysis.$isBusy.eraseToAnyPublisher(), diskStorage.$isBusy.eraseToAnyPublisher(), duplicates.$isBusy.eraseToAnyPublisher(), manager.$isBusy.eraseToAnyPublisher(), exchange.$isBusy.eraseToAnyPublisher(), store.$isPaused.eraseToAnyPublisher()] {
             publisher.sink { [weak self] _ in
                 DispatchQueue.main.async { self?.maintenanceStateChanged() }
             }.store(in: &subscriptions)
@@ -218,6 +225,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         NSApp.windowsMenu = windowsMenu
     }
     @objc func showDashboard() {
+        guard !pendingTermination, let window else { return }
         hidePanel()
         NSApp.activate(ignoringOtherApps: true)
         if window.isMiniaturized { window.deminiaturize(nil) }
@@ -238,12 +246,22 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     func windowDidChangeOcclusionState(_ notification: Notification) { updateSamplingDemand() }
     func applicationDidHide(_ notification: Notification) { updateSamplingDemand() }
     func applicationDidUnhide(_ notification: Notification) { updateSamplingDemand() }
-    private var operationsBusy: Bool { store?.dataBusy == true || cleanup?.isBusy == true || analysis?.isBusy == true || diskStorage?.isBusy == true || duplicates?.isBusy == true || manager?.isBusy == true || exchange?.isBusy == true }
+    private var dataOperationsBusy: Bool {
+        store?.dataBusy == true || cleanup?.isBusy == true || analysis?.isBusy == true || diskStorage?.isBusy == true
+            || duplicates?.isBusy == true || manager?.isBusy == true || exchange?.isBusy == true
+    }
+    private var operationsBusy: Bool { dataOperationsBusy || store?.isDiagnosing == true }
     private func maintenanceStateChanged() {
         updateSamplingDemand()
         maintenance?.setActionsSuspended(operationsBusy || store?.isPaused == true || pendingTermination)
-        guard pendingTermination, !operationsBusy else { return }
-        pendingTermination = false; NSApp.reply(toApplicationShouldTerminate: true)
+        guard pendingTermination, !dataOperationsBusy else { return }
+        let saved = store?.endSession() ?? true
+        pendingTermination = false
+        if !saved {
+            exchange?.resumeAfterTerminationCancelled()
+            maintenance?.setActionsSuspended(operationsBusy || store?.isPaused == true)
+        }
+        NSApp.reply(toApplicationShouldTerminate: saved)
     }
     private func showBusiness(_ record: GAInboxRecord) {
         switch record.manifest.action { case "storage.inspect":
@@ -256,6 +274,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     }
     @objc private func showExchange() { dashboardNavigation.page = .exchange; showDashboard() }
     func application(_ application: NSApplication, open urls: [URL]) {
+        guard !pendingTermination else { return }
         guard exchange != nil else { pendingPackages.append(contentsOf: urls.prefix(max(0, 16 - pendingPackages.count))); return }
         let limited = Array(urls.prefix(16))
         let images = limited.filter { $0.isFileURL && ["ntfs", "img", "raw", "dd"].contains($0.pathExtension.lowercased()) }
@@ -271,6 +290,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         showDashboard()
     }
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        guard !pendingTermination else { sender.reply(toOpenOrPrint: .failure); return }
         application(sender, open: filenames.map { URL(fileURLWithPath: $0) })
         sender.reply(toOpenOrPrint: .success)
     }
@@ -327,23 +347,68 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         if panelAutoCollapse.shouldCollapseOnFocusLoss(pressedMouseButtons: UInt(bitPattern: NSEvent.pressedMouseButtons)) { hidePanel() }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    private func terminateFromSignal() {
+        // The installer requests normal SIGTERM after verifying the original process.
+        // A pending prompt must keep its user decision, including when a signal arrives.
+        guard !presentingTerminationAlert, !pendingTermination else { return }
+        signalRequestedTermination = true
+        defer { signalRequestedTermination = false }
+        NSApp.terminate(nil)
+    }
+    @discardableResult private func runTerminationAlert(title: String, message: String, offersSave: Bool = false) -> Bool {
+        presentingTerminationAlert = true
+        defer { presentingTerminationAlert = false }
+        hidePanel()
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = message
+        let dismiss = alert.addButton(withTitle: offersSave ? "取消" : "知道了")
+        if offersSave {
+            dismiss.keyEquivalent = "\u{1b}"
+            alert.addButton(withTitle: "保存并退出")
+        }
+        return alert.runModal() == .alertSecondButtonReturn
+    }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if operationsBusy {
+        guard !presentingTerminationAlert else { return .terminateCancel }
+        guard !pendingTermination else { return .terminateLater }
+        let unattended = signalRequestedTermination
+        if !unattended, !operationsBusy, let session = store?.activeSession,
+           !runTerminationAlert(title: "结束当前任务并退出？",
+                                message: "「\(session.name)」正在记录。保存并退出会结束当前任务，取消会继续记录。",
+                                offersSave: true) { return .terminateCancel }
+        // A read-only network probe may exceed the installer wait and has no data to commit.
+        let mustWait = unattended ? dataOperationsBusy : operationsBusy
+        if mustWait {
+            guard unattended else {
+                runTerminationAlert(title: "暂时无法退出", message: "有操作正在进行，请等操作结束后再退出。")
+                return .terminateCancel
+            }
             pendingTermination = true
+            exchange?.suspendForTermination()
             cleanup?.cancel()
             analysis?.cancel()
             diskStorage?.cancel()
             duplicates?.cancel()
             manager?.cancel()
-            exchange?.prepareForTermination()
-            maintenance?.shutdown()
+            maintenance?.setActionsSuspended(true)
             return .terminateLater
+        }
+        guard store?.endSession() ?? true else {
+            if !unattended {
+                runTerminationAlert(title: "任务未能保存，搞机灵仍在运行",
+                                    message: store?.statusMessage ?? "请检查本地资料目录后重试。")
+            }
+            return .terminateCancel
         }
         return .terminateNow
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showDashboard(); return true }
     func applicationWillTerminate(_ notification: Notification) {
         finishPanelDrag()
+        exchange?.prepareForTermination()
         maintenance?.shutdown()
         edgeTimer?.invalidate()
         if let localMouseMonitor { NSEvent.removeMonitor(localMouseMonitor) }
@@ -431,13 +496,16 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         edgeHandle = handle
     }
     @objc func togglePanel() {
+        guard !pendingTermination, let panel else { return }
         if panel.isVisible { hidePanel() }
-        else {
-            let screen = currentScreen()
+        else if let screen = currentScreen() {
             showPanel(on: screen, manual: true, anchor: edgeHandle?.anchor(on: screen))
         }
     }
-    private func currentScreen() -> NSScreen { NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main ?? NSScreen.screens[0] }
+    private func currentScreen() -> NSScreen? {
+        let screens = NSScreen.screens
+        return screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main ?? screens.first
+    }
     private func updatePanelView() {
         let content = MonitorPanelContentView(rootView: PanelView(store: store,
             openDashboard: { [weak self] in self?.showDashboard() },

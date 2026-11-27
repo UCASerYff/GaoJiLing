@@ -18,12 +18,13 @@ spec.loader.exec_module(capabilities)
 class CapabilitiesTests(unittest.TestCase):
     def info(self, version="1.09"):
         return {"CFBundleIdentifier": capabilities.BUNDLE_ID, "CFBundleShortVersionString": version,
-                "CFBundleVersion": version.replace(".", ""), "CFBundleExecutable": "GaoJiLing"}
+                "CFBundleVersion": "117", "CFBundleExecutable": "GaoJiLing"}
 
     def test_version_and_identity_track_build_inputs(self):
         for version in ("1.09", "1.10", "1.99", "2.00"):
             result, plist = capabilities.resources(version, self.info(version))
             self.assertEqual(result["appVersion"], plist["CFBundleShortVersionString"])
+            self.assertEqual(plist["CFBundleVersion"], "117")
             self.assertEqual(result["bundleID"], plist["CFBundleIdentifier"])
             self.assertEqual(result["schemaVersion"], 1)
         for version in ("1.9", "1.100", "1.10\nextra", "nan"):

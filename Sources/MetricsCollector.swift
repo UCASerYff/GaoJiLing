@@ -21,6 +21,7 @@ final class MetricsCollector: @unchecked Sendable {
     private var lastUptime: TimeInterval?
     private var lastDate: Date?
     private var lastProcessUptime: TimeInterval?
+    private var lastProcessDate: Date?
     private var cachedProcesses: [ProcessMetric] = []
     private var cachedProcessCount = 0
     private var previousReadings: [String: MetricReading<Double>] = [:]
@@ -39,7 +40,10 @@ final class MetricsCollector: @unchecked Sendable {
         return "\(title.isEmpty ? "Mac" : title) · \(ProcessInfo.processInfo.processorCount) 核"
     }()
 
-    func sample() -> MetricsSample {
+    func sample() -> MetricsSample { sampleWithProcessBaseline().sample }
+
+    /// The baseline is returned only for a fresh process snapshot, never the cached inventory.
+    func sampleWithProcessBaseline() -> (sample: MetricsSample, processBaseline: Date?) {
         let now = Date()
         let uptime = ProcessInfo.processInfo.systemUptime
         let elapsed = lastUptime.map { uptime - $0 }
@@ -91,11 +95,12 @@ final class MetricsCollector: @unchecked Sendable {
         previousDisks = disks ?? [:]
         if !usableInterval {
             previousProcesses.removeAll(keepingCapacity: true)
-            lastProcessUptime = nil
+            lastProcessUptime = nil; lastProcessDate = nil
         }
         // Heavy process inspection is limited to once every four seconds.
+        var processBaseline: Date?
         if lastProcessUptime == nil || uptime - lastProcessUptime! >= 4 {
-            sampleProcesses(at: uptime, cores: count > 0 ? count : max(1, ProcessInfo.processInfo.processorCount))
+            processBaseline = sampleProcesses(at: uptime, date: now, cores: count > 0 ? count : max(1, ProcessInfo.processInfo.processorCount))
         }
         sample.processes = cachedProcesses
         sample.processCount = cachedProcessCount
@@ -126,7 +131,7 @@ final class MetricsCollector: @unchecked Sendable {
         for (key, value) in readings where value.value == nil { readings[key] = value.retaining(previousReadings[key]) }
         sample.readings = readings; previousReadings = readings
         lastUptime = uptime; lastDate = now
-        return sample
+        return (sample, processBaseline)
     }
 
     /// Discard baselines after suspension, clock discontinuity or a failed/late sample.
@@ -169,7 +174,7 @@ final class MetricsCollector: @unchecked Sendable {
         return (received / elapsed, sent / elapsed)
     }
 
-    private func sampleProcesses(at uptime: TimeInterval, cores: Int) {
+    private func sampleProcesses(at uptime: TimeInterval, date: Date, cores: Int) -> Date? {
         var pointer: UnsafeMutablePointer<GJLProcess>?
         var total: Int32 = 0
         let count = Int(gjl_process_snapshot(&pointer, &total))
@@ -177,13 +182,14 @@ final class MetricsCollector: @unchecked Sendable {
             cachedProcesses = cachedProcesses.map { value in
                 var old = value; old.availabilityReason = "进程读取失败；保留旧读数，非实时"; return old
             }
-            previousProcesses.removeAll(keepingCapacity: true); lastProcessUptime = nil
-            return
+            previousProcesses.removeAll(keepingCapacity: true); lastProcessUptime = nil; lastProcessDate = nil
+            return nil
         }
         defer { gjl_free_processes(pointer) }
         var baselines: [Int32: ProcessBaseline] = [:]
         var groups: [String: ProcessMetric] = [:]
         let interval = lastProcessUptime.map { uptime - $0 }
+        let baseline = Self.validInterval(interval, wallElapsed: lastProcessDate.map { date.timeIntervalSince($0) }) ? lastProcessDate : nil
         for index in 0..<count {
             var record = pointer[index]
             let path = withUnsafePointer(to: &record.path) { p in p.withMemoryRebound(to: CChar.self, capacity: 4096) { String(cString: $0) } }
@@ -199,7 +205,7 @@ final class MetricsCollector: @unchecked Sendable {
             let processIdentity = ProcessIdentity(pid: record.pid, startTime: record.start_time, uid: record.uid)
             let key = Self.groupKey(path: identity.path, bundleID: identity.bundleID, process: processIdentity)
             var group = groups[key] ?? ProcessMetric(name: identity.name, cpuPercent: 0, memoryBytes: 0, path: identity.path,
-                groupID: key, bundleID: identity.bundleID, identities: [], observedAt: Date(), cpuAvailable: true)
+                groupID: key, bundleID: identity.bundleID, identities: [], observedAt: date, cpuAvailable: true)
             group.cpuPercent = min(100, group.cpuPercent + cpu)
             group.memoryBytes += Double(record.memory_bytes)
             group.pids.append(record.pid)
@@ -210,9 +216,10 @@ final class MetricsCollector: @unchecked Sendable {
         previousProcesses = baselines
         cachedProcesses = groups.values.sorted { a, b in a.cpuPercent == b.cpuPercent ? a.memoryBytes > b.memoryBytes : a.cpuPercent > b.cpuPercent }
         cachedProcessCount = Int(total)
-        lastProcessUptime = uptime
+        lastProcessUptime = uptime; lastProcessDate = date
         // Bound metadata cache in very long sessions with many transient executables.
         if identities.count > 4096 { identities.removeAll(keepingCapacity: true) }
+        return baseline
     }
 
     private func appIdentity(path: String, fallback: String) -> AppIdentity {

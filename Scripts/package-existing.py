@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from macos_version import read_version
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("gjl_package_safety", ROOT / "Scripts/release-safety.py")
@@ -45,8 +46,8 @@ def receipt_and_candidate(path, checksum, approved_changes=None):
     if hashlib.sha256(raw).hexdigest() != checksum:
         raise RuntimeError("原构建收据摘要改变，未打包")
     value = json.loads(raw)
-    version = (ROOT / "VERSION").read_text().strip()
-    if not re.fullmatch(r"[0-9]+\.[0-9]{2}", version) or value.get("version") != version or value.get("build") != version.replace(".", ""):
+    version, build = read_version(ROOT)
+    if (value.get("version"), value.get("build")) != (version, build):
         raise RuntimeError("构建收据与当前版本/构建号不一致")
     if value.get("bundleID") != safety.IDENTIFIER or not value.get("buildInputsUnchanged"):
         raise RuntimeError("候选身份或原构建输入一致性不符")

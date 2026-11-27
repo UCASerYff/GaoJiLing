@@ -37,7 +37,9 @@ private struct GAInboxLedger: Codable { var version = 1; var records: [GAInboxRe
     private var savedState: Data?
     private var queue: [URL] = []
     private var selectedReferences: [String: GAReference] = [:]
-    private var terminating = false
+    private enum Lifecycle: Equatable { case active, suspended, terminating }
+    private var lifecycle = Lifecycle.active
+    private var acceptsNewWork: Bool { lifecycle == .active }
 
     init(dataDirectory: URL, clock: @escaping () -> Date = Date.init) {
         root = dataDirectory.appendingPathComponent("Exchange", isDirectory: true)
@@ -112,17 +114,18 @@ private struct GAInboxLedger: Codable { var version = 1; var records: [GAInboxRe
     private func validFolder(_ name: String) -> Bool { name.hasSuffix(".gaoaction") && UUID(uuidString: String(name.dropLast(10))) != nil && !name.contains("/") }
     var selected: GAInboxRecord? { records.first { $0.id == selectedID } }
     func importPackage() {
+        guard acceptsNewWork else { return }
         let panel = NSOpenPanel(); panel.title = "导入动作交接包"; panel.message = "只接收固定 GaoAction V1；接收不授予清理或卸载权限。"
         panel.canChooseFiles = true; panel.canChooseDirectories = true; panel.treatsFilePackagesAsDirectories = false; panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }; receive(url)
     }
     func receive(_ url: URL) {
-        guard writable, !terminating else { return }
+        guard writable, acceptsNewWork else { return }
         guard queue.count < 16 else { status = "待接收请求过多，请稍后逐个导入。"; return }
         queue.append(url); processNext()
     }
     private func processNext() {
-        guard !isBusy, !queue.isEmpty, writable, !terminating else { return }
+        guard !isBusy, !queue.isEmpty, writable, acceptsNewWork else { return }
         isBusy = true; let url = queue.removeFirst(), incoming = root.appendingPathComponent("Incoming", isDirectory: true), now = clock()
         Task {
             do {
@@ -167,12 +170,12 @@ private struct GAInboxLedger: Codable { var version = 1; var records: [GAInboxRe
         } catch { writable = false; throw error }
     }
     func chooseReference(_ id: String) {
-        guard !isBusy, businessIsBusy?() != true, let record = records.first(where: { $0.id == id }), ["received", "approved", "reviewing"].contains(record.phase), let ref = record.manifest.references.first else { return }
+        guard acceptsNewWork, !isBusy, businessIsBusy?() != true, let record = records.first(where: { $0.id == id }), ["received", "approved", "reviewing"].contains(record.phase), let ref = record.manifest.references.first else { return }
         let panel = NSOpenPanel(); panel.title = ref.kind == "application" ? "核对原应用" : "核对原目录"
         panel.message = "请选择请求中同一个原对象；不能用不同路径或被替换的对象代替。"
         panel.canChooseFiles = ref.kind == "application"; panel.canChooseDirectories = ref.kind == "directory"; panel.allowsMultipleSelection = false
         panel.treatsFilePackagesAsDirectories = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard panel.runModal() == .OK, let url = panel.url, acceptsNewWork else { return }
         do {
             let resolved = try GaoActionV1.resolveReference(ref, selected: url)
             var selected = ref
@@ -181,7 +184,7 @@ private struct GAInboxLedger: Codable { var version = 1; var records: [GAInboxRe
         } catch { status = error.localizedDescription }
     }
     func approve(_ id: String) {
-        guard writable, !isBusy, businessIsBusy?() != true, let record = records.first(where: { $0.id == id }), ["received", "approved", "reviewing"].contains(record.phase) else { return }
+        guard writable, acceptsNewWork, !isBusy, businessIsBusy?() != true, let record = records.first(where: { $0.id == id }), ["received", "approved", "reviewing"].contains(record.phase) else { return }
         isBusy = true
         Task {
             defer { processNext() }
@@ -197,7 +200,7 @@ private struct GAInboxLedger: Codable { var version = 1; var records: [GAInboxRe
                 let resolved = try await Task.detached(priority: .utility) {
                     try reference.map { try GaoActionV1.resolveReference($0, selected: selected) }
                 }.value
-                guard !terminating else { throw GAError.invalid("正在退出，本请求保留待下次复核") }
+                guard acceptsNewWork else { throw GAError.invalid("正在退出，本请求保留待下次复核") }
                 var updated = record; updated.phase = "approved"
                 var all = records; all[all.firstIndex(where: { $0.id == id })!] = updated
                 try persist(all)
@@ -207,7 +210,7 @@ private struct GAInboxLedger: Codable { var version = 1; var records: [GAInboxRe
         }
     }
     @discardableResult func markExecuting(_ id: String) -> Bool {
-        guard writable, !terminating, let index = records.firstIndex(where: { $0.id == id }), ["approved", "reviewing"].contains(records[index].phase) else { return false }
+        guard writable, acceptsNewWork, let index = records.firstIndex(where: { $0.id == id }), ["approved", "reviewing"].contains(records[index].phase) else { return false }
         var all = records; all[index].phase = "executing"; all[index].provenance["workflowState"] = .string("executing")
         do { try persist(all); return true }
         catch { status = "无法保存执行状态，业务未开始：\(error.localizedDescription)"; return false }
@@ -227,14 +230,22 @@ private struct GAInboxLedger: Codable { var version = 1; var records: [GAInboxRe
         catch { status = "流程结果无法写入交接记录；请在本 App 业务历史中核对，未自动重试：\(error.localizedDescription)" }
     }
     func cancelReview(_ id: String) {
-        guard businessIsBusy?() != true, let record = records.first(where: { $0.id == id }), ["received", "approved", "reviewing"].contains(record.phase) else { return }
+        guard acceptsNewWork, businessIsBusy?() != true, let record = records.first(where: { $0.id == id }), ["received", "approved", "reviewing"].contains(record.phase) else { return }
         outcome(id, status: "cancelled", provenance: ["workflowState": .string("cancelled"), "originalsModifiedByHandoff": .bool(false)])
     }
     func showBusiness(_ id: String) { if let record = records.first(where: { $0.id == id }) { onShowBusiness?(record) } }
-    func prepareForTermination() { terminating = true; queue.removeAll() }
+    func suspendForTermination() {
+        if acceptsNewWork { lifecycle = .suspended }
+    }
+    func resumeAfterTerminationCancelled() {
+        guard lifecycle == .suspended else { return }
+        lifecycle = .active
+        processNext()
+    }
+    func prepareForTermination() { lifecycle = .terminating; queue.removeAll() }
     /// Creates a local package only. Transport remains an explicit UI action.
     func prepareResultPackage(_ id: String) throws -> URL {
-        guard !isBusy, writable, !terminating, let record = records.first(where: { $0.id == id }) else { throw GAError.invalid("当前请求不可生成结果副本") }
+        guard !isBusy, writable, acceptsNewWork, let record = records.first(where: { $0.id == id }) else { throw GAError.invalid("当前请求不可生成结果副本") }
         return try resultPackage(record)
     }
     private func resultPackage(_ record: GAInboxRecord) throws -> URL {
@@ -262,7 +273,7 @@ private struct GAInboxLedger: Codable { var version = 1; var records: [GAInboxRe
         return url
     }
     func sendResult(_ id: String) {
-        guard !isBusy, writable, let record = records.first(where: { $0.id == id }) else { return }
+        guard !isBusy, writable, acceptsNewWork, let record = records.first(where: { $0.id == id }) else { return }
         do {
             guard let application = NSWorkspace.shared.urlForApplication(withBundleIdentifier: record.manifest.sourceBundleID),
                   Bundle(url: application)?.bundleIdentifier == record.manifest.sourceBundleID else { throw GAError.invalid("未找到声明的接收应用；可导出结果包后手动导入") }
@@ -274,7 +285,7 @@ private struct GAInboxLedger: Codable { var version = 1; var records: [GAInboxRe
         } catch { status = error.localizedDescription }
     }
     func exportResult(_ id: String) {
-        guard !isBusy, writable, let record = records.first(where: { $0.id == id }) else { return }
+        guard !isBusy, writable, acceptsNewWork, let record = records.first(where: { $0.id == id }) else { return }
         let panel = NSSavePanel(); panel.title = "导出 GaoAction 结果包"; panel.nameFieldStringValue = "搞机灵-结果.gaoaction"
         panel.message = "结果可能包含所选对象名称和本机维护状态；仅保存在你选择的位置，包的接收有效期为 120 秒。"
         panel.allowedContentTypes = [UTType(importedAs: "com.gaoseries.action-package")]; panel.canCreateDirectories = true
@@ -317,7 +328,7 @@ private struct GAInboxLedger: Codable { var version = 1; var records: [GAInboxRe
     }
 
     func cleanCompletedCopies() {
-        guard writable, !isBusy, !terminating, businessIsBusy?() != true, canCleanCompletedCopies else { return }
+        guard writable, !isBusy, acceptsNewWork, businessIsBusy?() != true, canCleanCompletedCopies else { return }
         isBusy = true; status = "正在核验并清理已完成请求的私有副本…"
         let candidates = records.filter { $0.phase == "finished" && $0.outcome == "completed" }
         let root = root

@@ -133,6 +133,28 @@ import Darwin
                                       "A queued package cannot require another receive event to resume after approval")
             }
         }
+        for resumes in [true, false] {
+            await check(resumes ? "cancelled termination resumes prior queued receive" : "approved termination keeps exchange intake closed") {
+                let suffix = resumes ? "resume" : "quit"
+                let controller = GAExchangeController(dataDirectory: try dataDirectory("Termination-" + suffix), clock: { GAFixtures.clock })
+                let queued = GAFixtures.request(92), late = GAFixtures.request(93)
+                let queuePackage = try GAFixtures.package(.init(name: "queued", manifest: queued), in: sourceRoot, name: "queued-" + suffix)
+                let latePackage = try GAFixtures.package(.init(name: "late", manifest: late), in: sourceRoot, name: "late-" + suffix)
+                controller.receive(duplicate)
+                controller.receive(queuePackage)
+                controller.suspendForTermination()
+                controller.receive(latePackage)
+                try await idle(controller)
+                try GAFixtures.require(controller.records.map(\.id) == [GAFixtures.id(4)],
+                                      "termination failed to wait for only the active receive")
+                if !resumes { controller.prepareForTermination() }
+                controller.resumeAfterTerminationCancelled()
+                try await idle(controller)
+                let expected = resumes ? [GAFixtures.id(4), queued.requestID] : [GAFixtures.id(4)]
+                try GAFixtures.require(controller.records.map(\.id) == expected,
+                                      "exchange did not preserve the prior queue while exit was pending")
+            }
+        }
         await check("approved long job survives original envelope expiry") {
             let data = try dataDirectory("LongJob")
             var now = GAFixtures.clock

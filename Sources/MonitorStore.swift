@@ -41,6 +41,8 @@ extension Notification.Name {
     private var sampling = false
     private var lastPersisted = Date.distantPast
     private var lastPruned = Date.distantPast
+    private var activeComparison = SessionComparisonDetails()
+    private var processBaselineFloor = Date.distantPast
     private let detector = EventDetector()
     private var settingsWritable = true
     private var dataGeneration = 0
@@ -90,15 +92,15 @@ extension Notification.Name {
         let collector = self.collector
         let generation = dataGeneration
         queue.async { [weak self] in
-            let value = collector.sample()
+            let observation = collector.sampleWithProcessBaseline()
             Task { @MainActor in
                 guard let self else { return }
                 guard self.dataGeneration == generation else { self.sampling = false; return }
-                self.receive(value)
+                self.receive(observation.sample, processBaseline: observation.processBaseline)
             }
         }
     }
-    private func receive(_ sample: MetricsSample) {
+    private func receive(_ sample: MetricsSample, processBaseline: Date?) {
         sampling = false
         guard !isPaused else { return }
         latest = sample
@@ -106,11 +108,15 @@ extension Notification.Name {
         let cutoff = sample.timestamp.addingTimeInterval(-86400)
         if history.count > 12000 { history = history.enumerated().filter { $0.offset % 2 == 0 || $0.element.timestamp > sample.timestamp.addingTimeInterval(-600) }.map(\.element) }
         history.removeAll { $0.timestamp < cutoff }
-        if var session = activeSession, sample.timestamp >= session.start {
-            session.peakCPU = max(session.peakCPU, sample.cpuPercent ?? 0)
-            session.peakMemory = max(session.peakMemory, sample.memoryUsed)
+        if var session = activeSession, sample.timestamp >= session.start,
+           session.lastObserved.map({ sample.timestamp > $0 }) ?? true {
+            let point = activeComparison.observe(sample, start: session.start, processBaseline: processBaseline, processFloor: processBaselineFloor)
+            if let cpu = point?.cpu {
+                session.peakCPU = max(session.peakCPU, cpu)
+                session.cpuTotal += cpu; session.sampleCount += 1
+            }
+            if let memory = point?.memory { session.peakMemory = max(session.peakMemory, memory) }
             if let temperature = sample.cpuTemperature { session.peakTemperature = max(session.peakTemperature ?? temperature, temperature) }
-            if let cpu = sample.cpuPercent { session.cpuTotal += cpu; session.sampleCount += 1 }
             session.lastObserved = sample.timestamp
             activeSession = session
         }
@@ -131,8 +137,8 @@ extension Notification.Name {
     }
     private func report(_ error: Error) { statusMessage = "保存失败：\(error.localizedDescription)。请检查可用空间。" }
     func checkpoint() { guard !dataBusy else { return }; do { if latest.memoryTotal > 0 { try database?.append(latest) }; if let activeSession { try database?.save(activeSession) } } catch { report(error) } }
-    func shutdown() { timer?.invalidate(); if activeSession != nil { endSession() }; checkpoint() }
-    func prepareForSleep() { detector.reset(); checkpoint() }
+    func shutdown() { timer?.invalidate(); timer = nil; dataGeneration += 1; checkpoint() }
+    func prepareForSleep() { processBaselineFloor = Date(); detector.reset(); checkpoint() }
     func saveSettings() {
         guard !dataBusy else { return }
         guard database != nil else { statusMessage = "数据存储不可用，设置未保存。请检查数据目录后重新打开应用。"; return }
@@ -144,18 +150,36 @@ extension Notification.Name {
         restartTimer()
         NotificationCenter.default.post(name: .monitorSettingsChanged, object: nil)
     }
-    func togglePause() { guard !dataBusy else { return }; isPaused.toggle(); detector.reset(); restartTimer(); if !isPaused { sampleNow() } }
+    func togglePause() {
+        guard !dataBusy else { return }
+        isPaused.toggle(); processBaselineFloor = Date(); detector.reset(); restartTimer()
+        if !isPaused { sampleNow() }
+    }
     func startSession(name: String) {
         guard activeSession == nil, !dataBusy else { return }
-        guard database != nil else { statusMessage = "数据存储不可用，无法开始持久保存的任务记录。请检查数据目录后重新打开应用。"; return }
-        activeSession = MonitorSession(name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "任务 \(Date().formatted(date: .omitted, time: .shortened))" : String(name.prefix(80)), start: Date())
-        checkpoint()
+        guard let database else { statusMessage = "数据存储不可用，无法开始持久保存的任务记录。请检查数据目录后重新打开应用。"; return }
+        let now = Date()
+        let cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let session = MonitorSession(name: cleaned.isEmpty ? "任务 \(now.formatted(date: .omitted, time: .shortened))" : String(cleaned.prefix(80)), start: now)
+        do { try database.save(session) } catch { report(error); return }
+        activeComparison = SessionComparisonDetails(); processBaselineFloor = now
+        activeSession = session
     }
-    func endSession() {
-        guard !dataBusy, var session = activeSession else { return }
-        session.end = Date(); activeSession = nil
+    @discardableResult
+    func endSession() -> Bool {
+        guard var session = activeSession else { return true }
+        guard !dataBusy, let database else { statusMessage = "任务暂时无法保存，仍在记录。"; return false }
+        session.end = max(Date(), session.lastObserved ?? session.start)
+        session.interrupted = false
+        do { try database.saveCompleted(session, comparison: activeComparison) }
+        catch { report(error); return false }
+        activeSession = nil; activeComparison = SessionComparisonDetails()
         sessions.insert(session, at: 0)
-        do { try database?.save(session) } catch { report(error) }
+        return true
+    }
+    func compareSessions(_ identifiers: [UUID]) throws -> [SessionComparisonRun] {
+        guard !dataBusy, let database else { throw SessionComparisonError.unavailable }
+        return try database.compareSessions(identifiers)
     }
     func focusEvent(_ event: MonitorEvent) {
         let start = event.date.addingTimeInterval(-86400), end = event.date.addingTimeInterval(300)

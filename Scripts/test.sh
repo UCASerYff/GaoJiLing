@@ -1,6 +1,11 @@
 #!/bin/zsh
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+MODE="${1:-}"
+if (( $# > 1 )) || [[ -n "$MODE" && "$MODE" != --session-comparison ]]; then
+  print -u2 '使用 test.sh 或 test.sh --session-comparison'
+  exit 1
+fi
 TEST_TEMP="$(python3 -c 'import tempfile; print(tempfile.mkdtemp(prefix="gaojiling-tests-", suffix=".noindex", dir="/private/tmp"))')"
 trap 'rm -rf "$TEST_TEMP"' EXIT
 trap 'exit 130' INT
@@ -17,10 +22,12 @@ SWIFT=(swiftc -swift-version 5 -Onone -sdk "$SDK" -module-cache-path "$TEST_TEMP
 NATIVE=(-import-objc-header Sources/NativeMetrics.h "$TEST_TEMP/NativeMetrics.o" -framework IOKit -framework CoreFoundation)
 HEADER=(-import-objc-header Sources/NativeMetrics.h)
 METRICS=(Sources/Models.swift Sources/MetricsCollector.swift Sources/Sensors.swift)
+STORE=(Sources/Models.swift Sources/SessionComparison.swift Sources/Storage.swift)
 STORAGE=(Sources/StorageAnalysis.swift Sources/StorageTree.swift)
 UNINSTALL=(Sources/UninstallFileSafety.swift Sources/UninstallEngine.swift)
 DUPLICATES=(Sources/DuplicateAnalysis.swift Sources/DuplicateRecovery.swift Sources/DuplicateAnalysisController.swift)
 MAINTENANCE=(Sources/Models.swift Sources/AppExitRules.swift Sources/BatteryCapabilities.swift Sources/MaintenanceMetricsState.swift)
+EXCHANGE_TEST=(Sources/GaoActionV1.swift Sources/GaoActionExchange.swift Tests/GaoActionFixtures.swift -framework AppKit -framework Security)
 TEST_SUITES=0
 
 run_swift_test() {
@@ -42,6 +49,26 @@ run_swift_test() {
   fi
   ((++TEST_SUITES))
 }
+
+run_store_test() {
+  local test_name="$1"
+  "${SWIFT[@]}" "${STORE[@]}" "Tests/$test_name.swift" -lsqlite3 -o "$TEST_TEMP/$test_name"
+  "$TEST_TEMP/$test_name" "$TEST_TEMP/$test_name.databases"
+  ((++TEST_SUITES))
+}
+
+python3 Tests/VersionTests.py
+((++TEST_SUITES))
+if [[ "$MODE" == --session-comparison ]]; then
+  run_store_test StoreTests
+  run_store_test SessionComparisonTests
+  run_swift_test FloatingGeometryTests Sources/FloatingGeometry.swift
+  run_swift_test PanelInteractionTests Sources/PanelInteraction.swift
+  run_swift_test SamplingDemandTests Sources/SamplingDemand.swift
+  run_swift_test GaoActionExchangeTests "${EXCHANGE_TEST[@]}"
+  print "定向测试完成：$TEST_SUITES 个套件，使用合成数据和私有临时目录。"
+  exit 0
+fi
 
 python3 Tests/AutomaticBackupRemovalTests.py
 python3 Tests/CapabilitiesTests.py
@@ -74,9 +101,8 @@ run_swift_test SamplingDemandTests Sources/SamplingDemand.swift
 run_swift_test DuplicateAnalysisTests Sources/DuplicateAnalysis.swift
 run_swift_test DuplicateRecoveryTests Sources/DuplicateAnalysis.swift Sources/DuplicateRecovery.swift Sources/UninstallFileSafety.swift -framework AppKit
 run_swift_test DuplicateAnalysisControllerTests "${DUPLICATES[@]}" Sources/UninstallFileSafety.swift -framework AppKit
-"${SWIFT[@]}" Sources/Models.swift Sources/Storage.swift Tests/StoreTests.swift -lsqlite3 -o "$TEST_TEMP/StoreTests"
-"$TEST_TEMP/StoreTests" "$TEST_TEMP/databases"
-((++TEST_SUITES))
+run_store_test StoreTests
+run_store_test SessionComparisonTests
 run_swift_test ExportTests Sources/Models.swift Sources/DataExport.swift
 
 run_swift_test UninstallEngineTests "${UNINSTALL[@]}" -framework AppKit
@@ -94,7 +120,7 @@ run_swift_test UninstallNativeTests "${UNINSTALL[@]}" -framework AppKit
 "$TEST_TEMP/GaoActionTests" "$TEST_TEMP/gaoaction-fixtures"
 ((++TEST_SUITES))
 run_swift_test GaoActionPackageTests Sources/GaoActionV1.swift Tests/GaoActionFixtures.swift -framework Security
-run_swift_test GaoActionExchangeTests Sources/GaoActionV1.swift Sources/GaoActionExchange.swift Tests/GaoActionFixtures.swift -framework AppKit -framework Security
+run_swift_test GaoActionExchangeTests "${EXCHANGE_TEST[@]}"
 # All native entry points here are fail-fast test stubs. Engine operations use
 # private fixture homes and an injected Trash; NativeMetrics.o is forbidden.
 run_swift_test GaoActionBusinessTests "${HEADER[@]}" \
@@ -115,23 +141,5 @@ run_swift_test AppExitRuntimeTests "${NATIVE[@]}" Sources/Models.swift Sources/A
 run_swift_test MaintenanceNativeTests "${NATIVE[@]}" "${METRICS[@]}"
 run_swift_test AppExitLivePrototypeTests "${NATIVE[@]}" Sources/Models.swift Sources/AppExitRules.swift Sources/AppExitRuntime.swift -framework AppKit -framework ApplicationServices
 
-mkdir -p "$TEST_TEMP/version-fixture/Scripts"
-cp Scripts/bump-version.py "$TEST_TEMP/version-fixture/Scripts/bump-version.py"
-for CASE in '1.00:1.01' '1.09:1.10' '1.99:2.00'; do
-  BEFORE="${CASE%%:*}"
-  EXPECTED="${CASE##*:}"
-  print -r -- "$BEFORE" > "$TEST_TEMP/version-fixture/VERSION"
-  python3 "$TEST_TEMP/version-fixture/Scripts/bump-version.py"
-  ACTUAL="$(tr -d '\n' < "$TEST_TEMP/version-fixture/VERSION")"
-  [[ "$ACTUAL" == "$EXPECTED" ]] || { print -u2 "FAIL: version $BEFORE expected $EXPECTED, received $ACTUAL"; exit 1; }
-  print "PASS: version $BEFORE → $EXPECTED"
-done
-print -r -- '1.9' > "$TEST_TEMP/version-fixture/VERSION"
-if python3 "$TEST_TEMP/version-fixture/Scripts/bump-version.py" >/dev/null 2>&1; then
-  print -u2 'FAIL: invalid version 1.9 was accepted'; exit 1
-fi
-[[ "$(tr -d '\n' < "$TEST_TEMP/version-fixture/VERSION")" == '1.9' ]] || { print -u2 'FAIL: invalid version was modified'; exit 1; }
-print 'PASS: invalid version is rejected without modifying the file'
-((++TEST_SUITES))
 print "测试入口完成：$TEST_SUITES 个套件；显式实机/GUI项目以各自 PASS / SKIP 为准。"
 print '测试数据库、可执行文件、私有诊断和编译缓存将在退出时清理。'

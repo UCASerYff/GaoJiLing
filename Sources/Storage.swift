@@ -16,7 +16,7 @@ final class MonitorDatabase {
         let file = self.directory.appendingPathComponent("monitor.sqlite")
         guard sqlite3_open_v2(file.path, &db, SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else { throw error() }
         sqlite3_busy_timeout(db, 1500)
-        try execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; CREATE TABLE IF NOT EXISTS samples(t REAL PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,t REAL NOT NULL,payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,t REAL NOT NULL,payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS preferences(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL);")
+        try execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; CREATE TABLE IF NOT EXISTS samples(t REAL PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,t REAL NOT NULL,payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,t REAL NOT NULL,payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS preferences(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS session_comparison(id TEXT PRIMARY KEY,t REAL NOT NULL,payload TEXT NOT NULL);")
     }
     deinit { if let db { sqlite3_close(db) } }
     private func error() -> Error { NSError(domain: "GaoJiLing.Storage", code: Int(sqlite3_errcode(db)), userInfo: [NSLocalizedDescriptionKey: db.map { String(cString: sqlite3_errmsg($0)) } ?? "无法打开历史数据库"]) }
@@ -61,6 +61,61 @@ final class MonitorDatabase {
     func lastSample(since: Date) throws -> MetricsSample? { try read(MetricsSample.self, sql: "SELECT payload FROM samples WHERE t >= \(since.timeIntervalSince1970) ORDER BY t DESC LIMIT 1").first }
     func save(_ event: MonitorEvent) throws { try put(event, sql: "INSERT OR REPLACE INTO events(id,t,payload) VALUES(?,?,?)", id: event.id.uuidString, time: event.date) }
     func save(_ session: MonitorSession) throws { try put(session, sql: "INSERT OR REPLACE INTO sessions(id,t,payload) VALUES(?,?,?)", id: session.id.uuidString, time: session.start) }
+    func saveCompleted(_ session: MonitorSession, comparison: SessionComparisonDetails) throws {
+        guard let end = session.end else { throw SessionComparisonError.missingSession }
+        let archive = ArchivedSessionComparison(id: session.id, start: session.start, end: end, details: comparison)
+        guard archive.matches(session) else { throw SessionComparisonError.unavailable }
+        try transaction(write: true) {
+            try save(session)
+            try saveComparison(archive)
+            try execute("DELETE FROM session_comparison WHERE id IN (SELECT id FROM session_comparison ORDER BY t DESC,id LIMIT -1 OFFSET \(SessionComparisonDetails.taskLimit));")
+        }
+    }
+
+    private func saveComparison(_ archive: ArchivedSessionComparison) throws {
+        try put(archive, sql: "INSERT OR REPLACE INTO session_comparison(id,t,payload) VALUES(?,?,?)", id: archive.id.uuidString, time: archive.start)
+    }
+
+    func compareSessions(_ identifiers: [UUID]) throws -> [SessionComparisonRun] {
+        guard identifiers.count == 2, identifiers[0] != identifiers[1] else { throw SessionComparisonError.invalidSelection }
+        return try transaction(write: false) {
+            try identifiers.map { id in
+                guard let session = try read(MonitorSession.self, sql: "SELECT payload FROM sessions WHERE id='\(id.uuidString)'").first,
+                      let end = session.end, end >= session.start, end.timeIntervalSince(session.start).isFinite else {
+                    throw SessionComparisonError.missingSession
+                }
+                let archive = try read(ArchivedSessionComparison.self, sql: "SELECT payload FROM session_comparison WHERE id='\(id.uuidString)'").first
+                let details = archive.flatMap { $0.matches(session) ? $0.details : nil }
+                let upper = min(end, session.lastObserved ?? end)
+                let history = details == nil ? try comparisonHistory(since: session.start, until: upper) : []
+                return SessionComparisonRun(session: session, end: end, details: details, history: history)
+            }
+        }
+    }
+
+    private func comparisonHistory(since start: Date, until end: Date) throws -> [SessionComparisonPoint] {
+        let duration = end.timeIntervalSince(start)
+        guard duration.isFinite, duration >= 0 else { return [] }
+        let width = SessionComparisonDetails.bucketWidth(for: duration)
+        let bucketCount = min(SessionComparisonDetails.pointLimit, Int(duration / width) + 1)
+        var statement: OpaquePointer?
+        let sql = "SELECT payload FROM samples WHERE t >= ? AND t < ? AND t <= ? ORDER BY t DESC LIMIT 1"
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { throw error() }
+        defer { sqlite3_finalize(statement) }
+        var points: [SessionComparisonPoint] = []
+        for index in 0..<bucketCount {
+            sqlite3_reset(statement)
+            sqlite3_bind_double(statement, 1, start.timeIntervalSince1970 + Double(index) * width)
+            sqlite3_bind_double(statement, 2, start.timeIntervalSince1970 + Double(index + 1) * width)
+            sqlite3_bind_double(statement, 3, end.timeIntervalSince1970)
+            let status = sqlite3_step(statement)
+            if status == SQLITE_DONE { continue }
+            guard status == SQLITE_ROW, let text = sqlite3_column_text(statement, 0) else { throw error() }
+            let sample = try decoder.decode(MetricsSample.self, from: Data(String(cString: text).utf8))
+            if sample.timestamp <= end, let point = SessionComparisonPoint(sample: sample, start: start) { points.append(point) }
+        }
+        return points
+    }
     func settings() throws -> AppSettings { try read(AppSettings.self, sql: "SELECT payload FROM preferences WHERE id=1").first ?? AppSettings() }
     func save(_ settings: AppSettings) throws { try put(settings, sql: "INSERT OR REPLACE INTO preferences(id,payload) VALUES(1,?)") }
     func prune(days: Int, now: Date = Date()) throws {
@@ -69,7 +124,7 @@ final class MonitorDatabase {
         try execute("DELETE FROM samples WHERE t < \(cutoff); DELETE FROM events WHERE t < \(cutoff); DELETE FROM samples WHERE t < \(yesterday) AND t NOT IN (SELECT MIN(t) FROM samples WHERE t < \(yesterday) GROUP BY CAST(t/60 AS INTEGER)); PRAGMA incremental_vacuum;")
     }
 
-    /// A connection is used serially. A read transaction makes all four tables one consistent snapshot,
+    /// A connection is used serially. A read transaction makes the database one consistent snapshot,
     /// including when another connection is recording new observations through WAL.
     private func transaction<T>(write: Bool, _ operation: () throws -> T) throws -> T {
         try execute(write ? "BEGIN IMMEDIATE" : "BEGIN DEFERRED")
@@ -127,11 +182,22 @@ final class MonitorDatabase {
     func exportBackup(to destination: URL, appVersion: String, auxiliaryPreferences: [String: String] = [:]) throws -> MonitorDataSummary {
         try validateExportDestination(destination)
         var backup: MonitorBackup = try transaction(write: false) {
-            MonitorBackup(appVersion: appVersion, exportedAt: Date(),
-                          samples: try read(MetricsSample.self, sql: "SELECT payload FROM samples ORDER BY t"),
-                          events: try allEvents(), sessions: try allSessions(),
-                          settings: try read(AppSettings.self, sql: "SELECT payload FROM preferences WHERE id=1").first,
-                          auxiliaryPreferences: auxiliaryPreferences.isEmpty ? nil : auxiliaryPreferences)
+            let sessions = try allSessions()
+            var preferences = auxiliaryPreferences
+            let byID = Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { existing, _ in existing })
+            let comparisonSQL = "SELECT c.payload FROM session_comparison c JOIN sessions s USING(id) ORDER BY c.t DESC,c.id LIMIT \(SessionComparisonDetails.taskLimit)"
+            for archive in try read(ArchivedSessionComparison.self, sql: comparisonSQL) {
+                guard let session = byID[archive.id], archive.matches(session) else {
+                    throw MonitorBackupError.invalid("无法核对已保存的任务对比明细。")
+                }
+                let data = try MonitorBackup.jsonEncoder().encode(archive)
+                preferences[SessionComparisonDetails.backupPrefix + archive.id.uuidString] = String(decoding: data, as: UTF8.self)
+            }
+            return MonitorBackup(appVersion: appVersion, exportedAt: Date(),
+                                 samples: try read(MetricsSample.self, sql: "SELECT payload FROM samples ORDER BY t"),
+                                 events: try allEvents(), sessions: sessions,
+                                 settings: try read(AppSettings.self, sql: "SELECT payload FROM preferences WHERE id=1").first,
+                                 auxiliaryPreferences: preferences.isEmpty ? nil : preferences)
         }
         try backup.seal()
         try backup.validate()
@@ -177,14 +243,16 @@ final class MonitorDatabase {
     @discardableResult
     func restoreBackup(_ backup: MonitorBackup) throws -> MonitorDataSummary {
         try backup.validate()
+        let comparisons = try backup.archivedComparisons()
         return try transaction(write: true) {
-            try execute("DELETE FROM samples; DELETE FROM events; DELETE FROM sessions; DELETE FROM preferences;")
+            try execute("DELETE FROM samples; DELETE FROM events; DELETE FROM sessions; DELETE FROM preferences; DELETE FROM session_comparison;")
             for sample in backup.samples {
                 // Preserve the exact archived payload; append() intentionally compacts live observations.
                 try put(sample, sql: "INSERT INTO samples(t,payload) VALUES(?,?)", time: sample.timestamp)
             }
             for event in backup.events { try save(event) }
             for session in backup.sessions { try save(session) }
+            for comparison in comparisons { try saveComparison(comparison) }
             if let settings = backup.settings { try save(settings) }
             return backup.summary
         }
@@ -204,6 +272,7 @@ final class MonitorDatabase {
             if let cutoff { sqlite3_bind_double(statement, 1, cutoff.timeIntervalSince1970) }
             guard sqlite3_step(statement) == SQLITE_DONE else { throw error() }
             let deleted = Int(sqlite3_changes(db))
+            if scope == .sessions { try execute("DELETE FROM session_comparison WHERE id NOT IN (SELECT id FROM sessions);") }
             return MonitorDataSummary(sampleCount: scope == .history ? deleted : 0,
                                       eventCount: scope == .events ? deleted : 0,
                                       sessionCount: scope == .sessions ? deleted : 0)
@@ -387,5 +456,24 @@ struct MonitorBackup: Codable {
             guard session.sampleCount >= 0, session.cpuTotal <= Double(session.sampleCount) * 100 + 0.0001 else { throw MonitorBackupError.invalid("任务采样计数与累计数值不一致。") }
         }
         guard sha256.count == 64, sha256 == (try contentDigest()) else { throw MonitorBackupError.integrity }
+        _ = try archivedComparisons()
+    }
+
+    fileprivate func archivedComparisons() throws -> [ArchivedSessionComparison] {
+        let prefix = SessionComparisonDetails.backupPrefix
+        let entries = (auxiliaryPreferences ?? [:]).filter { $0.key.hasPrefix(prefix) }
+        guard entries.count <= SessionComparisonDetails.taskLimit else {
+            throw MonitorBackupError.invalid("任务对比明细数量异常。")
+        }
+        guard !entries.isEmpty else { return [] }
+        let byID = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
+        return try entries.map { key, value in
+            guard let archive = try? JSONDecoder().decode(ArchivedSessionComparison.self, from: Data(value.utf8)),
+                  key == prefix + archive.id.uuidString,
+                  let session = byID[archive.id], archive.matches(session) else {
+                throw MonitorBackupError.invalid("任务对比明细与已保存任务不匹配。")
+            }
+            return archive
+        }
     }
 }

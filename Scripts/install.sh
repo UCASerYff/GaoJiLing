@@ -4,8 +4,10 @@ umask 077
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 export PYTHONDONTWRITEBYTECODE=1
 SAFETY="$PROJECT_DIR/Scripts/release-safety.py"
-APP_VERSION="$(tr -d '\n' < "$PROJECT_DIR/VERSION")"
-[[ "$APP_VERSION" =~ '^[0-9]+\.[0-9]{2}$' ]] || { print -u2 'VERSION 必须为 1.00 格式'; exit 1; }
+VERSION_TOOL="$PROJECT_DIR/Scripts/macos_version.py"
+RELEASE_VERSION="$(python3 "$VERSION_TOOL")"
+APP_VERSION="${RELEASE_VERSION% *}"
+BUILD_NUMBER="${RELEASE_VERSION##* }"
 PACKAGE="$PROJECT_DIR/Release/GaoJiLing-$APP_VERSION.dmg"
 DESTINATION="/Applications/搞机灵.app"
 IDENTIFIER='com.gaoseries.GaoJiLing'
@@ -123,7 +125,7 @@ MOUNT_ATTACHED=true
 hdiutil attach -quiet -nobrowse -mountpoint "$MOUNT" "$PACKAGE"
 validate "$SOURCE" || exit 1
 SOURCE_VALIDATED=true
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SOURCE/Contents/Info.plist")" == "$APP_VERSION" ]] || exit 1
+python3 "$VERSION_TOOL" --info-plist "$SOURCE/Contents/Info.plist" >/dev/null || exit 1
 if [[ -e "$DESTINATION" ]]; then validate "$DESTINATION" || exit 1; fi
 ditto "$SOURCE" "$NEW_APP"
 validate "$NEW_APP" || exit 1
@@ -142,6 +144,7 @@ else
 fi
 python3 "$SAFETY" move-app --app "$NEW_APP" --output "$DESTINATION" --expected-identity "$NEW_IDENTITY"
 validate "$DESTINATION" || exit 1
+python3 "$VERSION_TOOL" --info-plist "$DESTINATION/Contents/Info.plist" >/dev/null || exit 1
 if $RUN_SMOKE; then
   open "$DESTINATION" || exit 1
   sleep 2
@@ -162,5 +165,5 @@ if ! $DEFER_CLEANUP; then
     ! -name "GaoJiLing-$APP_VERSION.dmg" ! -name "GaoJiLing-$APP_VERSION.dmg.sha256" \
     ! -name "GaoJiLing-$APP_VERSION-source.zip" ! -name "GaoJiLing-$APP_VERSION-source.zip.sha256" -delete
 fi
-print "搞机灵 V$APP_VERSION 已安装；资料与偏好保持不变，唯一入口核验通过，未创建任何自动备份。"
+print "搞机灵 V$APP_VERSION 构建 $BUILD_NUMBER 已安装；资料与偏好保持不变，唯一入口核验通过，未创建任何自动备份。"
 if ! $RUN_SMOKE; then print '未自动启动或运行通用冒烟；主要业务由定向测试与静态安装核验覆盖。'; fi

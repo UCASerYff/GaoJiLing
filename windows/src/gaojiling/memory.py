@@ -80,6 +80,7 @@ def _linux_snapshot():
 def _windows_snapshot():
     import ctypes
     from ctypes import wintypes
+    from gaojiling.winmetrics import bind, kernel
 
     class MEMORYSTATUSEX(ctypes.Structure):
         _fields_ = [
@@ -92,19 +93,61 @@ def _windows_snapshot():
 
     status = MEMORYSTATUSEX()
     status.dwLength = ctypes.sizeof(status)
-    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+    api = kernel()
+    query = bind(api, "GlobalMemoryStatusEx", wintypes.BOOL, ctypes.POINTER(MEMORYSTATUSEX))
+    if not query(ctypes.byref(status)):
         return None
     total = int(status.ullTotalPhys)
     free = int(status.ullAvailPhys)
-    if total <= 0:
+    if total <= 0 or free > total:
         return None
     load = int(status.dwMemoryLoad)
     pressure = "正常" if load < 80 else "偏高" if load < 90 else "严重"
+    system_cache, swap = _windows_pages()
     return {
-        "used": total - free, "total": total, "free": free, "fileCache": None, "compressed": None,
-        "swap": None, "pressure": pressure,
-        "source": "Windows GlobalMemoryStatusEx。压力按内存负载估算，不是 macOS 内存压力；文件缓存和压缩内存不可用。",
+        "used": total - free, "total": total, "free": free, "fileCache": system_cache, "compressed": None,
+        "swap": swap, "pressure": pressure, "memoryLoad": load,
+        "source": "Windows GlobalMemoryStatusEx；压力按当前物理内存负载估算。",
+        "fileCacheSource": "Windows GetPerformanceInfo：系统工作集和待机页的合计",
+        "swapSource": "Windows EnumPageFilesW：所有分页文件实际在用页面",
     }
+
+
+def _windows_pages():
+    import ctypes as ct
+    from ctypes import wintypes as wt
+    from gaojiling.winmetrics import bind, kernel
+
+    class PerformanceInfo(ct.Structure):
+        _fields_ = [("size", wt.DWORD)] + [(name, ct.c_size_t) for name in (
+            "commitTotal", "commitLimit", "commitPeak", "physicalTotal", "physicalAvailable",
+            "systemCache", "kernelTotal", "kernelPaged", "kernelNonpaged", "pageSize",
+        )] + [("handles", wt.DWORD), ("processes", wt.DWORD), ("threads", wt.DWORD)]
+
+    class PageFileInfo(ct.Structure):
+        _fields_ = [
+            ("size", wt.DWORD), ("reserved", wt.DWORD), ("totalSize", ct.c_size_t),
+            ("totalInUse", ct.c_size_t), ("peakUsage", ct.c_size_t),
+        ]
+
+    query = bind(kernel(), "K32GetPerformanceInfo", wt.BOOL, ct.POINTER(PerformanceInfo), wt.DWORD)
+    info = PerformanceInfo()
+    info.size = ct.sizeof(info)
+    if not query(ct.byref(info), info.size) or not info.pageSize:
+        return None, None
+    callback_type = ct.WINFUNCTYPE(wt.BOOL, ct.c_void_p, ct.POINTER(PageFileInfo), wt.LPCWSTR)
+    enumerate_pages = bind(kernel(), "K32EnumPageFilesW", wt.BOOL, callback_type, ct.c_void_p)
+    pages = []
+
+    @callback_type
+    def count_pages(_, detail, _filename):
+        if not detail or detail.contents.totalInUse > detail.contents.totalSize:
+            return False
+        pages.append(detail.contents.totalInUse)
+        return True
+
+    swap = sum(pages) * info.pageSize if enumerate_pages(count_pages, None) else None
+    return info.systemCache * info.pageSize, swap
 
 
 def release_own() -> dict:
@@ -114,7 +157,14 @@ def release_own() -> dict:
     import sys
     if sys.platform == "win32":
         import ctypes
-        handle = ctypes.windll.kernel32.GetCurrentProcess()
-        ok = bool(ctypes.windll.kernel32.SetProcessWorkingSetSize(handle, ctypes.c_size_t(-1).value, ctypes.c_size_t(-1).value))
-        return own_report(before, ok, None)
+        from ctypes import wintypes
+        from gaojiling.winmetrics import bind, kernel
+
+        api = kernel()
+        current_process = bind(api, "GetCurrentProcess", wintypes.HANDLE)
+        empty = bind(api, "K32EmptyWorkingSet", wintypes.BOOL, wintypes.HANDLE)
+        ok = bool(empty(current_process()))
+        report = own_report(before, ok, None)
+        report["after"] = snapshot() if ok else None
+        return report
     return own_report(before, False, None)

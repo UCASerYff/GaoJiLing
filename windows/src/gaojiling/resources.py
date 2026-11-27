@@ -12,6 +12,10 @@ def asset_root() -> Path:
 
 def read_asset(name: str) -> bytes:
     path = asset_root() / name
+    if name == "AppIcon.png" and not path.is_file():
+        path = Path(__file__).resolve().parents[3] / "Assets" / name
+        if path.is_file():
+            return path.read_bytes()
     if path.parent != asset_root() or not path.is_file():
         raise AppError("没有这个页面资源。")
     return path.read_bytes()

@@ -30,7 +30,7 @@ def _sample_backup(sample: dict) -> dict:
             "name": process["name"],
             "pids": process.get("pids") or [],
         }
-        for key in ("availabilityReason", "bundleID", "cpuAvailable", "groupID", "path"):
+        for key in ("availabilityReason", "bundleID", "cpuAvailable", "groupID", "path", "memoryAvailabilityReason"):
             if process.get(key) is not None:
                 item[key] = process[key]
         if process.get("identities"):
@@ -187,12 +187,14 @@ def validate_backup(raw: dict) -> dict:
             raise AppError("完整资料校验失败：系统计量的数量或容量不一致。")
         if sample.get("diskFree") is not None and sample.get("diskTotal") is not None and sample["diskFree"] > sample["diskTotal"]:
             raise AppError("完整资料校验失败：系统计量的数量或容量不一致。")
-        names = set()
+        groups = set()
         for process in sample.get("processes") or []:
             _text(process.get("name", ""), 4096, "应用名称", allow_empty=False)
-            if process["name"] in names:
-                raise AppError("完整资料校验失败：应用排行包含重复名称或无效进程编号。")
-            names.add(process["name"])
+            group = process.get("groupID") or process.get("path") or process["name"]
+            _text(group, 32768, "应用标识", allow_empty=False)
+            if group in groups:
+                raise AppError("完整资料校验失败：应用排行包含重复标识。")
+            groups.add(group)
             _number(process.get("cpuPercent", 0), "应用 CPU", 0, 100)
         decoded_samples.append(decode_sample(dumps({**sample, "timestamp": sample["timestamp"]})))
     decoded_events = []

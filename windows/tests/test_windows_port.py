@@ -9,6 +9,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,7 +31,7 @@ from gaojiling.storageanal import analyze, compare_history
 from gaojiling.store import MonitorStore
 from gaojiling.textutil import csv_field, percent_text
 from gaojiling.version import display
-from gaojiling.volumes import collect
+from gaojiling.volumes import _physical_classification, collect
 from gaojiling.web import serve
 
 
@@ -257,7 +258,11 @@ def test_cleanup_lists_only_old_inactive_caches_and_restores_without_overwrite(t
     apple.mkdir()
     _touch(apple, 8 * 86400)
     link = home / "Library" / "Caches" / "com.example.link"
-    link.symlink_to(cache)
+    try:
+        link.symlink_to(cache, target_is_directory=True)
+    except OSError as error:
+        if getattr(error, "winerror", None) != 1314:
+            raise
     running = {}
     trash_dir = tmp_path / "trash"
     trash_dir.mkdir()
@@ -300,19 +305,37 @@ def test_cleanup_stops_when_the_journal_cannot_be_read(tmp_path):
     assert (journal / "journal.json").read_text(encoding="utf-8") == "{"
 
 
-def test_storage_analysis_does_not_read_file_contents_or_follow_links(tmp_path):
+def _link_or_reparse_metadata(link, target, monkeypatch):
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        if getattr(error, "winerror", None) not in {5, 1314}:
+            raise
+        link.touch()
+        real_lstat = os.lstat
+
+        def simulated_reparse(path, *args, **kwargs):
+            if isinstance(path, (Path, str)) and Path(path) == link:
+                return SimpleNamespace(st_file_attributes=0x400, st_mode=stat.S_IFREG)
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", simulated_reparse)
+
+
+def test_storage_analysis_does_not_read_file_contents_or_follow_links(tmp_path, monkeypatch):
     root = tmp_path / "project"
     root.mkdir()
     secret = root / "secret.bin"
     secret.write_bytes(b"SECRET-CONTENTS")
     link = root / "jump"
-    link.symlink_to(secret)
+    _link_or_reparse_metadata(link, secret, monkeypatch)
     excluded = root / "skip"
     excluded.mkdir()
     (excluded / "big.bin").write_bytes(b"x" * 200_000)
     result = analyze(root, exclusions=[str(excluded)])
     assert "SECRET-CONTENTS" not in json.dumps(result)
     assert result["complete"] is False
+    assert result["skipped"]["symlink"] == 1
     assert result["tree"]["allocatedBytes"] < 200_000
     history = [{"scopeKey": result["scopeKey"], "complete": False, "allocatedBytes": 10},
                {"scopeKey": result["scopeKey"], "complete": True, "allocatedBytes": 20},
@@ -320,6 +343,19 @@ def test_storage_analysis_does_not_read_file_contents_or_follow_links(tmp_path):
     trend = compare_history(history, result["scopeKey"])
     assert trend["deltaAllocatedBytes"] == 15
     assert trend["partialOmitted"] == 1
+
+
+def test_storage_tree_keeps_deep_allocation_and_exclusion_scopes_separate(tmp_path):
+    folder = tmp_path / "parent" / "child" / "leaf"
+    folder.mkdir(parents=True)
+    (folder / "fixture.bin").write_bytes(b"tree data")
+    result = analyze(tmp_path)
+    nested = result["tree"]["children"][0]["children"][0]["children"][0]["children"][0]
+    assert result["complete"] and nested["logicalBytes"] == 9 and nested["allocatedBytes"] >= 9
+    excluded = analyze(tmp_path, exclusions=[str(folder)])
+    assert excluded["complete"] and excluded["skipped"]["excluded"] == 1
+    assert excluded["scopeKey"] != result["scopeKey"]
+    assert excluded["tree"]["fileCount"] == 0
 
 
 def test_duplicates_keep_one_and_do_not_count_a_hard_link_twice(tmp_path):
@@ -332,7 +368,11 @@ def test_duplicates_keep_one_and_do_not_count_a_hard_link_twice(tmp_path):
     os.utime(first, (1_000, 1_000))
     os.utime(second, (2_000, 2_000))
     linked = scope / "link.bin"
-    os.link(first, linked)
+    try:
+        os.link(first, linked)
+    except OSError as error:
+        if getattr(error, "winerror", None) not in {5, 1314}:
+            raise
     trash_dir = tmp_path / "trash"
     trash_dir.mkdir()
 
@@ -347,7 +387,10 @@ def test_duplicates_keep_one_and_do_not_count_a_hard_link_twice(tmp_path):
     result = engine.scan(scope, True)
     assert result["complete"] is True
     assert len(result["groups"]) == 1
-    assert all(len(item["paths"]) == 1 for item in []) 
+    assert len(result["groups"][0]["files"]) == 2
+    assert all(row["allocatedBytes"] >= row["logicalBytes"] for row in result["groups"][0]["files"])
+    if linked.exists():
+        assert max(row["linkCount"] for row in result["groups"][0]["files"]) == 2
     keeper = result["groups"][0]["suggestedKeeperID"]
     moving = [item["id"] for item in result["groups"][0]["files"] if item["id"] != keeper]
     report = engine.move(moving)
@@ -358,19 +401,41 @@ def test_duplicates_keep_one_and_do_not_count_a_hard_link_twice(tmp_path):
     restored = engine.restore(report["batchID"])
     assert restored["failed"]
     assert second.read_bytes() == b"newer"
+    second.unlink()
+    assert engine.restore(report["batchID"])["restored"] == moving
+    assert second.read_bytes() == b"same-bytes"
+    assert engine.history()[0]["pending"] == 0
 
 
-def test_duplicate_scan_with_a_symlink_cannot_move(tmp_path):
+def test_duplicate_scan_with_a_symlink_cannot_move(tmp_path, monkeypatch):
     scope = tmp_path / "scope"
     scope.mkdir()
     (scope / "a.bin").write_bytes(b"same-bytes")
     (scope / "b.bin").write_bytes(b"same-bytes")
-    (scope / "shortcut").symlink_to(scope / "a.bin")
+    _link_or_reparse_metadata(scope / "shortcut", scope / "a.bin", monkeypatch)
     engine = DuplicateEngine(tmp_path / "dup", tmp_path / "stage", tmp_path, lambda path: path)
     result = engine.scan(scope, True)
     assert result["complete"] is False
     with pytest.raises(AppError, match="完整"):
         engine.move(["anything"])
+
+
+def test_duplicate_move_rechecks_the_retained_file_before_any_write(tmp_path):
+    scope = tmp_path / "scope"
+    scope.mkdir()
+    one, two = scope / "a.bin", scope / "b.bin"
+    one.write_bytes(b"equal")
+    two.write_bytes(b"equal")
+    engine = DuplicateEngine(tmp_path / "journal", tmp_path / "stage", tmp_path, lambda path: path)
+    result = engine.scan(scope, True)
+    selected = next(row["id"] for row in result["groups"][0]["files"] if row["name"] == "b.bin")
+    initial = one.stat()
+    one.write_bytes(b"other")
+    os.utime(one, ns=(initial.st_atime_ns, initial.st_mtime_ns))
+    report = engine.move([selected])
+    assert report["failed"] and not report["removedIDs"]
+    assert not engine.history()
+    assert two.read_bytes() == b"equal"
 
 
 def test_volumes_do_not_read_capacity_for_unknown_or_removable_disks():
@@ -399,6 +464,16 @@ def test_volumes_do_not_read_capacity_for_unknown_or_removable_disks():
     assert result["skipped"]["unknown"] == 1
 
 
+def test_windows_fixed_volume_requires_pci_and_nonremovable_topology():
+    pci = ["PCIROOT(0)#PCI(1700)#ATA(C00T00L00)"]
+    usb = ["PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(4)"]
+    assert _physical_classification({"Interface": "SCSI", "Capabilities": [3, 4]}, 1, pci)[0] == "internal"
+    assert _physical_classification({"Interface": "SCSI", "Capabilities": [3, 4]}, 1, usb)[0] == "external"
+    assert _physical_classification({"Interface": "IDE", "Capabilities": [3, 4]}, 2, pci)[0] == "external"
+    assert _physical_classification({"Interface": "SCSI"}, None, pci)[0] == "unknown"
+    assert _physical_classification({"Interface": "SCSI"}, 1, ["VMBUS(0)#SCSI(P00T00L00)"])[0] == "unknown"
+
+
 def _record(slot, sequence, flags, attributes):
     raw = bytearray(1024)
     raw[0:4] = b"FILE"
@@ -408,6 +483,7 @@ def _record(slot, sequence, flags, attributes):
     struct.pack_into("<H", raw, 18, 1)
     struct.pack_into("<H", raw, 20, 0x38)
     struct.pack_into("<H", raw, 22, flags | 1)
+    struct.pack_into("<I", raw, 44, slot)
     cursor = 0x38
     for attribute in attributes:
         raw[cursor:cursor + len(attribute)] = attribute
@@ -443,22 +519,45 @@ def _file_name(parent, sequence, name):
     return bytes(data)
 
 
-def test_ntfs_image_lists_a_resident_file_and_refuses_to_overwrite(tmp_path):
-    records = [b"\x00" * 1024 for _ in range(5)]
-    records.append(_record(5, 1, 0x02, [_resident(0x30, _file_name(5, 1, "."))]))
-    payload = b"hello-ntfs"
-    records.append(_record(6, 1, 0x01, [
-        _resident(0x30, _file_name(5, 1, "readme.txt")),
-        _resident(0x80, payload),
-    ]))
-    image = bytearray(4096 + len(records) * 1024)
+def _nonresident_data(runs, count, logical, initialized=None):
+    encoded = b"".join(bytes((0x11, length)) + struct.pack("<b", delta) for length, delta in runs) + b"\0"
+    attr = bytearray((64 + len(encoded) + 7) & ~7)
+    struct.pack_into("<II", attr, 0, 0x80, len(attr))
+    attr[8] = 1
+    struct.pack_into("<QQHH", attr, 16, 0, count - 1, 64, 0)
+    struct.pack_into("<QQQ", attr, 40, count * 4096, logical, logical if initialized is None else initialized)
+    attr[64:64 + len(encoded)] = encoded
+    return bytes(attr)
+
+
+def _ntfs_fixture(data_attribute, contents=None):
+    records = [b"\x00" * 1024 for _ in range(17)]
+    mft_data = _nonresident_data([(2, 1), (3, 11)], 5, len(records) * 1024)
+    records[0] = _record(0, 1, 0, [_resident(0x30, _file_name(5, 1, "$MFT")), mft_data])
+    records[5] = _record(5, 1, 0x02, [_resident(0x30, _file_name(5, 1, "."))])
+    records[16] = _record(16, 1, 0, [
+        _resident(0x30, _file_name(5, 1, "readme.txt")), data_attribute,
+    ])
+    image = bytearray(32 * 4096)
     image[3:11] = b"NTFS    "
     struct.pack_into("<H", image, 11, 512)
     image[13] = 8
     struct.pack_into("<Q", image, 40, len(image) // 512)
     struct.pack_into("<Q", image, 48, 1)
+    struct.pack_into("<Q", image, 56, 30)
     struct.pack_into("<b", image, 64, -10)
-    image[4096:4096 + len(records) * 1024] = b"".join(records)
+    image[510:512] = b"\x55\xAA"
+    image[4096:3 * 4096] = b"".join(records[:8])
+    image[12 * 4096:12 * 4096 + len(records[8:]) * 1024] = b"".join(records[8:])
+    for cluster, payload in (contents or {}).items():
+        start = cluster * 4096
+        image[start:start + len(payload)] = payload
+    return image
+
+
+def test_ntfs_image_lists_a_resident_file_and_refuses_to_overwrite(tmp_path):
+    payload = b"hello-ntfs"
+    image = _ntfs_fixture(_resident(0x80, payload))
     path = tmp_path / "sample.img"
     path.write_bytes(image)
     with pytest.raises(AppError, match="同意"):
@@ -475,6 +574,52 @@ def test_ntfs_image_lists_a_resident_file_and_refuses_to_overwrite(tmp_path):
     assert destination.read_bytes() == payload
     with pytest.raises(AppError, match="已存在"):
         extract(path, analysis, names["readme.txt"]["id"], destination, True)
+
+
+def test_ntfs_reads_fragmented_mft_and_nonresident_streams_with_signed_deltas(tmp_path):
+    wanted = b"A" * 4096 + b"second physical extent"
+    attr = _nonresident_data([(1, 20), (1, -2)], 2, len(wanted))
+    path = tmp_path / "fragmented.img"
+    path.write_bytes(_ntfs_fixture(attr, {20: wanted[:4096], 18: wanted[4096:]}))
+    result = analyze_image(path, True)
+    entry = next(row for row in result["entries"] if row["recordNumber"] == 16)
+    assert result["examinedRecordSlots"] == 17
+    assert entry["parentID"] == "5:1"
+    assert entry["canExtract"] and entry["logicalBytes"] == len(wanted)
+    out = tmp_path / "extracted.bin"
+    receipt = extract(path, result, entry["id"], out, True)
+    assert receipt["bytes"] == len(wanted)
+    assert out.read_bytes() == wanted
+    prefix = analyze_image(path, True, {"records": 16})
+    assert prefix["status"] == "有界前缀" and not prefix["directoryInventory"]
+    with pytest.raises(AppError, match="没有这条"):
+        extract(path, prefix, entry["id"], tmp_path / "partial.bin", True)
+    assert not (tmp_path / "partial.bin").exists()
+
+
+def test_ntfs_does_not_extract_uninitialized_or_invalid_runs(tmp_path):
+    path = tmp_path / "uninitialized.img"
+    path.write_bytes(_ntfs_fixture(_nonresident_data([(1, 20)], 1, 128, 32)))
+    result = analyze_image(path, True)
+    entry = next(row for row in result["entries"] if row["recordNumber"] == 16)
+    assert entry["logicalBytes"] == 128
+    assert not entry["canExtract"] and "初始化" in entry["extractionUnavailableReason"]
+    path = tmp_path / "out-of-volume.img"
+    path.write_bytes(_ntfs_fixture(_nonresident_data([(1, 35)], 1, 128)))
+    result = analyze_image(path, True)
+    assert not result["complete"]
+    assert any("超出卷" in row for row in result["warnings"])
+
+
+def test_image_identifies_bitlocker_without_an_extraction_workflow(tmp_path):
+    path = tmp_path / "encrypted.img"
+    boot = bytearray(512)
+    boot[3:11] = b"-FVE-FS-"
+    boot[-2:] = b"\x55\xAA"
+    path.write_bytes(boot)
+    result = analyze_image(path, True)
+    assert result["format"] == "BitLocker" and not result["complete"] and not result["entries"]
+    assert result["writeCapabilities"] == dict.fromkeys(("mount", "format", "repair", "write"), False)
 
 
 def test_network_diagnosis_uses_injected_lookups_and_rejects_urls():

@@ -1,2 +1,5 @@
 pytest==8.3.4
-pyinstaller==6.11.1
+pyinstaller==6.22.3
+Pillow==12.2.0
+pywebview==6.1; sys_platform == "win32"
+pythonnet==3.0.5; sys_platform == "win32"

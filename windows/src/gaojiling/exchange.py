@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from gaojiling.errors import AppError
@@ -206,15 +206,20 @@ class ExchangeInbox:
                     # 私有副本目录可以有请求文件夹。只拒绝既没有标记、目录又不空的情况。
                     if not self.marker.exists() and "inbox.json" not in names:
                         raise AppError("交接目录不空但没有初始化标记，已停止。")
-            if self.marker.exists() != self.path.exists() and (self.marker.exists() or self.path.exists()):
-                if self.path.exists() and not self.marker.exists():
-                    raise AppError("交接记录缺少初始化标记，已停止。")
+            if self.marker.exists() != self.path.exists():
+                raise AppError("交接记录与初始化标记不完整，已停止。")
             if not self.path.exists():
                 return
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if data.get("version") != 1 or not isinstance(data.get("records"), list):
                 raise AppError("版本无法识别")
             self.records = data["records"]
+            interrupted = [record for record in self.records if record.get("phase") == "executing"]
+            for record in interrupted:
+                record["phase"] = "result"
+                record["outcome"] = {"status": "failed", "provenance": {"workflowState": "interrupted"}, "errorCode": "interrupted"}
+            if interrupted:
+                self._save()
         except (OSError, json.JSONDecodeError, AppError) as error:
             self.failure = AppError(f"交接记录无法读取，已停止操作：{error}")
 
@@ -228,18 +233,27 @@ class ExchangeInbox:
 
     def receive_package(self, path: Path) -> dict:
         folder = Path(path)
-        if folder.is_symlink() or folder.suffix.lower() != ".gaoaction":
+        if folder.suffix.lower() != ".gaoaction":
             raise AppError("请选择 .gaoaction 目录包")
         try:
-            names = {item.name for item in folder.iterdir() if not item.is_symlink()}
+            for item in reversed((folder, *folder.parents)):
+                if item.is_symlink() or getattr(item.lstat(), "st_file_attributes", 0) & 0x400:
+                    raise AppError("交接包不能穿过符号链接或重解析目录。")
+            names = {item.name for item in folder.iterdir()}
         except OSError as error:
             raise AppError(f"无法读取交接包：{error}") from error
         if names != {"manifest.json", "payload"}:
             raise AppError("交接包必须由本用户持有且仅含 manifest.json 与 payload")
         payload = folder / "payload"
-        if not payload.is_dir() or payload.is_symlink():
+        manifest = folder / "manifest.json"
+        if not payload.is_dir() or not manifest.is_file() or any(
+                item.is_symlink() or getattr(item.lstat(), "st_file_attributes", 0) & 0x400
+                for item in (payload, manifest)):
             raise AppError("交接包必须由本用户持有且仅含 manifest.json 与 payload")
-        data = (folder / "manifest.json").read_bytes()
+        if next(payload.iterdir(), None) is not None:
+            raise AppError("本版的复核动作只接受空 payload 目录。")
+        with manifest.open("rb") as handle:
+            data = handle.read(MANIFEST_LIMIT + 1)
         return self.receive(data)
 
     def receive(self, manifest_bytes: bytes, now: datetime | None = None) -> dict:
@@ -270,6 +284,8 @@ class ExchangeInbox:
 
     def open_request(self, request_id: str) -> dict:
         record = self._record(request_id)
+        if record["phase"] not in {"received", "reviewing", "approved"}:
+            raise AppError("已执行的请求请查看结果。")
         record["opened"] = True
         if record["phase"] == "received":
             record["phase"] = "reviewing"
@@ -285,11 +301,23 @@ class ExchangeInbox:
         self._save()
         return record
 
+    def begin(self, request_id: str, action: str):
+        record = self._record(request_id)
+        if record["phase"] != "approved" or action != record["manifest"]["action"]:
+            raise AppError("只可执行已复核、尚未执行且动作匹配的请求。")
+        record["phase"] = "executing"
+        try:
+            self._save()
+        except Exception:
+            record["phase"] = "approved"
+            raise
+        return record
+
     def finish(self, request_id: str, status: str, provenance: dict, error_code: str | None = None):
         record = self._record(request_id)
-        if record["phase"] not in {"approved", "reviewing", "received"}:
+        if record["phase"] not in {"executing", "approved", "reviewing", "received"}:
             raise AppError("尚未接收的请求不能写出结果。")
-        if status == "completed" and record["phase"] != "approved":
+        if status == "completed" and record["phase"] not in {"approved", "executing"}:
             raise AppError("未批准的请求不能报告完成。")
         validate_outcome(record["manifest"]["action"], status, provenance, error_code)
         if status == "completed" and record["manifest"]["action"] != "storage.inspect":
@@ -299,6 +327,27 @@ class ExchangeInbox:
         record["phase"] = "result"
         self._save()
         return record
+
+    def result_document(self, request_id: str) -> dict:
+        record = self._record(request_id)
+        result = record.get("outcome")
+        if not result or record["phase"] != "result":
+            raise AppError("请求尚无可导出的业务结果。")
+        request = record["manifest"]
+        now = datetime.now(timezone.utc)
+        document = {
+            "schemaVersion": 1, "kind": "result", "requestID": str(uuid.uuid4()).upper(),
+            "sourceBundleID": BUNDLE_ID, "targetBundleID": request["sourceBundleID"],
+            "action": request["action"], "inReplyTo": request["requestID"],
+            "createdAt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "expiresAt": (now + timedelta(seconds=120)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "nonce": base64.b64encode(uuid.uuid4().bytes + uuid.uuid4().bytes).decode("ascii"),
+            "status": result["status"], "provenance": result["provenance"],
+            "items": [], "references": [],
+        }
+        if result.get("errorCode"):
+            document["errorCode"] = result["errorCode"]
+        return document
 
     def _record(self, request_id: str) -> dict:
         if self.failure:

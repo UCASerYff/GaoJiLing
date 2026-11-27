@@ -14,7 +14,8 @@ import uuid
 from pathlib import Path
 
 from gaojiling.errors import AppError
-from gaojiling.filesafety import atomic_text, rename_exclusive, stat_alloc
+from gaojiling.filemeta import allocation, blocked, checked_stat, identity, local_path
+from gaojiling.filesafety import atomic_text, owned_by_current_user, rename_exclusive, stat_alloc
 from gaojiling.textutil import valid_bundle_id
 
 CACHE_AGE = 7 * 24 * 60 * 60
@@ -43,10 +44,17 @@ def roots_for(home: Path, layout: str) -> dict:
             "nested_logs": False,
         }
     local = home / "AppData" / "Local"
+    roaming = home / "AppData" / "Roaming"
     return {
-        "caches": local,
-        "logs": local,
+        "caches": None,
+        "logs": None,
         "derived": None,
+        "known": [
+            ("windows.google.chrome", local / "Google" / "Chrome" / "User Data" / "Default" / "Cache"),
+            ("windows.google.chrome", local / "Google" / "Chrome" / "User Data" / "Default" / "Code Cache"),
+            ("windows.microsoft.vscode", roaming / "Code" / "Cache"),
+            ("windows.microsoft.vscode", roaming / "Code" / "CachedData"),
+        ],
         "dev": [
             ("developer.npm", local / "npm-cache" / "_cacache"),
             ("developer.pip", local / "pip" / "Cache"),
@@ -56,10 +64,6 @@ def roots_for(home: Path, layout: str) -> dict:
         "xcode": None,
         "nested_logs": True,
     }
-
-
-def _uid():
-    return os.getuid() if hasattr(os, "getuid") else None
 
 
 def _skipped_name(name: str) -> bool:
@@ -75,6 +79,7 @@ class CleanupEngine:
         self.home = Path(home)
         self.journal_dir = Path(journal_dir)
         self.stage_dir = Path(stage_dir)
+        self.layout = layout
         self.roots = roots_for(self.home, layout)
         self.running = running
         self.owner_lookup = owner_lookup
@@ -90,19 +95,34 @@ class CleanupEngine:
         try:
             if self.journal_dir.exists() and not path.exists() and any(self.journal_dir.iterdir()):
                 raise AppError("清理目录已有文件但没有恢复记录，已停止，不会当作空记录。")
-            if not path.exists():
+            if not os.path.lexists(path):
                 return
+            info = checked_stat(local_path(path))
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 32 * 1024 * 1024:
+                raise AppError("恢复记录文件属性不受支持")
             data = json.loads(path.read_text(encoding="utf-8"))
-            if data.get("version") != 1 or not isinstance(data.get("batches"), list):
+            if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("batches"), list):
                 raise AppError("版本无法识别")
+            for batch in data["batches"]:
+                if not isinstance(batch["id"], str) or not isinstance(batch["receipts"], list):
+                    raise AppError("清理批次格式无效")
+                for receipt in batch["receipts"]:
+                    if (not isinstance(receipt["itemID"], str) or not isinstance(receipt["footprint"], dict)
+                            or not isinstance(receipt["footprint"]["digest"], str)
+                            or not isinstance(receipt["footprint"]["bytes"], int)
+                            or not isinstance(receipt["footprint"]["inode"], int)
+                            or not isinstance(receipt["footprint"]["device"], int)
+                            or any(not isinstance(receipt[key], str) for key in ("original", "stage", "state", "category"))):
+                        raise AppError("清理回执格式无效")
             self.journal = data
-        except (OSError, json.JSONDecodeError, AppError) as error:
+        except (OSError, ValueError, TypeError, KeyError, AppError) as error:
             self.failure = AppError(f"清理恢复记录无法读取，已停止操作：{error}")
 
     def _save(self):
         if self.failure:
             raise self.failure
         self.journal_dir.mkdir(parents=True, exist_ok=True)
+        checked_stat(local_path(self.journal_dir))
         atomic_text(self.journal_dir / "journal.json", json.dumps(self.journal, ensure_ascii=False, indent=2))
 
     def history(self) -> list[dict]:
@@ -138,11 +158,12 @@ class CleanupEngine:
         notes = [
             "只检查归属明确、相关进程已退出且达到保留期的缓存或轮转日志。",
             "com.apple、com.gaoseries、com.microsoft 目录不列入候选。",
-            "Windows 上没有 Xcode DerivedData；不会把 Visual Studio 中间目录当作可清理构建缓存。",
             "旧轮转日志至少保留 30 天，移走后不能重新生成。",
             "占用是分配空间估算。移入废纸篓仍占空间，不能当成已经释放的磁盘容量。",
             "扫描在两次目录读取之间才能停下，不能打断已经发出的系统调用。",
         ]
+        if self.layout == "windows":
+            notes.append("仅检查核实安装归属的 Chrome 和 VS Code 指定缓存，以及已知开发工具缓存。没有核实的 Windows 轮转日志路径。")
         now = self.clock()
 
         def children(root: Path):
@@ -151,18 +172,20 @@ class CleanupEngine:
                 return []
             try:
                 names = []
+                checked_stat(local_path(root))
                 with os.scandir(root) as iterator:
                     for entry in iterator:
-                        if entry.is_symlink():
+                        if blocked(entry.stat(follow_symlinks=False)):
                             skipped += 1
                             continue
                         names.append(entry.name)
                         if len(names) > MAX_ENTRIES:
-                            raise AppError("目录条目过多，已跳过。")
+                            notes.append(f"{root} 条目超过上限，已跳过。")
+                            return []
                 return sorted(names)
             except FileNotFoundError:
                 return []
-            except OSError:
+            except (OSError, AppError):
                 notes.append(f"{root} 无法安全读取，已跳过。")
                 return []
 
@@ -171,10 +194,8 @@ class CleanupEngine:
             if cancelled():
                 return
             try:
-                info = os.lstat(path)
-                if stat.S_ISLNK(info.st_mode):
-                    skipped += 1
-                    return
+                path = local_path(path)
+                info = checked_stat(path)
                 expect_dir = category != "旧轮转日志"
                 if expect_dir and not stat.S_ISDIR(info.st_mode):
                     skipped += 1
@@ -185,8 +206,7 @@ class CleanupEngine:
                 if now - info.st_mtime < age:
                     skipped += 1
                     return
-                uid = _uid()
-                if uid is not None and info.st_uid != uid:
+                if not owned_by_current_user(path, info):
                     skipped += 1
                     return
                 if not expect_dir and info.st_nlink != 1:
@@ -210,11 +230,11 @@ class CleanupEngine:
                     "checkInstalled": check_installed,
                 }
                 items.append(item)
-            except AppError:
-                skipped += 1
-            except OSError:
+            except (AppError, OSError):
                 skipped += 1
 
+        for owner, path in self.roots.get("known", ()):
+            consider(path, owner, "应用缓存", CACHE_AGE, True)
         caches = self.roots["caches"]
         if caches and caches.is_dir() and not caches.is_symlink():
             for name in children(caches):
@@ -280,7 +300,7 @@ class CleanupEngine:
                 if self.clock() - current["newest"] < candidate["age"]:
                     raise AppError("项目未达到保留期限。")
                 self.stage_dir.mkdir(parents=True, exist_ok=True)
-                if os.lstat(self.stage_dir).st_dev != candidate["footprint"]["device"]:
+                if checked_stat(local_path(self.stage_dir)).st_dev != candidate["footprint"]["device"]:
                     raise AppError("暂存目录不在同一磁盘，已跳过。")
                 receipt_id = str(uuid.uuid4()).upper()
                 stage = self.stage_dir / f"GaoJiLing-{receipt_id}"
@@ -294,15 +314,18 @@ class CleanupEngine:
                 prepared = True
                 self._save()
                 self._inactive(candidate["owner"], candidate["checkInstalled"])
-                rename_exclusive(candidate["path"], stage)
+                rename_exclusive(candidate["path"], stage, candidate["footprint"]["identity"])
                 receipt["state"] = "staged"
                 self._save()
+                self._inactive(candidate["owner"], candidate["checkInstalled"])
                 if self._snapshot(stage, candidate["footprint"]["device"], candidate["item"]["category"] != "旧轮转日志", cancelled) != candidate["footprint"]:
                     raise AppError("移动期间文件发生变化，已停止并尝试放回。")
                 receipt["state"] = "trashing"
                 self._save()
                 destination = Path(self.trash_action(stage))
                 receipt["trash"] = str(destination)
+                if os.path.lexists(stage) or identity(checked_stat(local_path(destination))) != candidate["footprint"]["identity"]:
+                    raise AppError("回收位置无法核实，已保留待恢复记录。")
                 receipt["state"] = "trashed"
                 self._save()
                 removed.append(item_id)
@@ -332,17 +355,18 @@ class CleanupEngine:
         for receipt in chosen["receipts"]:
             if receipt["state"] in {"restored", "untouched"}:
                 continue
-            source = Path(receipt["trash"] or receipt["stage"])
-            original = Path(receipt["original"])
             try:
-                if not source.exists():
+                source = local_path(Path(receipt["trash"] or receipt["stage"]))
+                original = local_path(Path(receipt["original"]))
+                if not os.path.lexists(source):
                     raise AppError("废纸篓或暂存中已找不到原项目。")
-                if original.exists() or original.is_symlink():
+                if os.path.lexists(original):
                     raise AppError("原位置已有新文件，未覆盖。")
-                current = self._snapshot(source, receipt["footprint"]["device"], receipt["category"] != "旧轮转日志", lambda: False)
+                current = self._snapshot(source, receipt["footprint"]["device"], receipt["category"] != "旧轮转日志",
+                                         lambda: False, legacy="identity" not in receipt["footprint"])
                 if current["digest"] != receipt["footprint"]["digest"]:
                     raise AppError("内容或身份已变化，未覆盖。")
-                rename_exclusive(source, original)
+                rename_exclusive(source, original, current["identity"])
                 receipt["state"] = "restored"
                 self._save()
                 restored.append(receipt["itemID"])
@@ -353,15 +377,22 @@ class CleanupEngine:
     def _try_put_back(self, receipt: dict):
         stage = Path(receipt["stage"])
         original = Path(receipt["original"])
-        if not stage.exists():
+        if not os.path.lexists(stage):
+            try:
+                info = checked_stat(local_path(original))
+                if (info.st_dev, info.st_ino) == (receipt["footprint"]["device"], receipt["footprint"]["inode"]):
+                    receipt["state"] = "untouched"
+                    self._save()
+            except (OSError, AppError):
+                pass
             return
         try:
-            if original.exists() or original.is_symlink():
+            if os.path.lexists(original):
                 raise AppError("原位置已占用")
-            rename_exclusive(stage, original)
+            rename_exclusive(stage, original, receipt["footprint"]["identity"])
             receipt["state"] = "restored"
             self._save()
-        except AppError:
+        except (OSError, AppError):
             receipt["state"] = "staged"
             self._save()
 
@@ -374,15 +405,15 @@ class CleanupEngine:
         if active:
             raise AppError("所属应用或后台进程正在运行，已跳过。")
 
-    def _snapshot(self, path: Path, device: int, expect_dir: bool, cancelled) -> dict:
+    def _snapshot(self, path: Path, device: int, expect_dir: bool, cancelled, legacy=False) -> dict:
         digest = hashlib.sha256()
         total = 0
         newest = 0.0
         count = 0
 
-        def record(info, relative: str):
+        def record(path, info, relative: str):
             nonlocal total, newest
-            alloc = stat_alloc(info)
+            alloc = allocation(path, info) if os.name == "nt" and not legacy and stat.S_ISREG(info.st_mode) else stat_alloc(info)
             total += alloc
             newest = max(newest, info.st_mtime)
             line = f"{relative}|{info.st_dev}|{info.st_ino}|{info.st_mode}|{info.st_size}|{alloc}|{info.st_mtime_ns}\n"
@@ -396,34 +427,34 @@ class CleanupEngine:
             if count > MAX_ENTRIES or depth > 64:
                 raise AppError("项目目录过大或过深，已跳过。")
             info = os.lstat(current)
-            if stat.S_ISLNK(info.st_mode):
-                raise AppError("项目含符号链接，已跳过。")
+            if blocked(info):
+                raise AppError("项目含链接、挂载点或云端占位，已跳过。")
             if info.st_dev != device:
                 raise AppError("项目跨磁盘，已跳过。")
-            uid = _uid()
-            if uid is not None and info.st_uid != uid:
+            if not owned_by_current_user(current, info):
                 raise AppError("项目归属其他用户，已跳过。")
             if stat.S_ISREG(info.st_mode):
                 if info.st_nlink != 1:
                     raise AppError("项目含硬链接，已跳过。")
-                record(info, relative)
+                record(current, info, relative)
                 return
             if not stat.S_ISDIR(info.st_mode):
                 raise AppError("项目含特殊文件，已跳过。")
-            record(info, relative)
+            record(current, info, relative)
             with os.scandir(current) as iterator:
                 names = sorted(entry.name for entry in iterator)
             for name in names:
                 child = current / name
                 walk(child, name if not relative else relative + "/" + name, depth + 1)
 
-        info = os.lstat(path)
+        info = checked_stat(local_path(path))
         if expect_dir and not stat.S_ISDIR(info.st_mode):
             raise AppError("候选已不是目录。")
         walk(path, "", 0)
         return {
             "device": int(info.st_dev),
             "inode": int(info.st_ino),
+            "identity": identity(info),
             "digest": digest.hexdigest(),
             "bytes": total,
             "newest": newest,

@@ -16,6 +16,9 @@ from gaojiling.jsonutil import dumps
 from gaojiling.timeutil import check_unix, cocoa_to_unix, now_unix, unix_to_cocoa
 
 _TABLES = ("samples", "events", "sessions", "preferences")
+_VISIBLE_METRICS = ("cpu", "memory", "compressed", "swap", "pressure", "gpu", "temperature",
+                    "diskFree", "diskRead", "diskWrite", "networkDown", "networkUp")
+_METRIC_IDS = {*_VISIBLE_METRICS, "cpuPower", "gpuPower"}
 _CREATE = """
 CREATE TABLE samples(t REAL PRIMARY KEY, payload TEXT NOT NULL);
 CREATE TABLE events(id TEXT PRIMARY KEY, t REAL NOT NULL, payload TEXT NOT NULL);
@@ -37,6 +40,11 @@ def default_settings() -> dict:
         "showSensors": True,
         "menuBarCPU": True,
         "hotkeyChoice": "g",
+        "batteryNoticesEnabled": False,
+        "batteryLowPercent": 20,
+        "batteryHighPercent": 80,
+        "batteryHighTemperature": 45,
+        "visibleMetricIDs": list(_VISIBLE_METRICS),
     }
 
 
@@ -53,7 +61,7 @@ def normalize_settings(raw: dict) -> dict:
         raise AppError("设置选项无效。")
     if settings["hotkeyChoice"] not in {"g", "m"}:
         raise AppError("设置选项无效。")
-    for key in ("edgeEnabled", "launchAtLogin", "notificationsEnabled", "showSensors", "menuBarCPU"):
+    for key in ("edgeEnabled", "launchAtLogin", "notificationsEnabled", "showSensors", "menuBarCPU", "batteryNoticesEnabled"):
         if not isinstance(settings[key], bool):
             raise AppError("设置选项无效。")
     delay = float(settings["edgeDelay"])
@@ -64,6 +72,17 @@ def normalize_settings(raw: dict) -> dict:
     settings["edgeDelay"] = delay
     settings["sampleInterval"] = interval
     settings["retentionDays"] = days
+    for key, lower, upper in (("batteryLowPercent", 5, 50), ("batteryHighPercent", 50, 100), ("batteryHighTemperature", 30, 70)):
+        value = settings[key]
+        if type(value) not in (int, float) or not lower <= value <= upper:
+            raise AppError("电池提醒阈值无效。")
+    if settings["batteryLowPercent"] >= settings["batteryHighPercent"]:
+        raise AppError("低电量阈值须小于高电量阈值。")
+    metrics = settings["visibleMetricIDs"]
+    if (not isinstance(metrics, list) or len(metrics) > len(_METRIC_IDS)
+            or any(not isinstance(key, str) or key not in _METRIC_IDS for key in metrics)
+            or len(set(metrics)) != len(metrics)):
+        raise AppError("展示指标设置无效。")
     return settings
 
 
@@ -82,26 +101,34 @@ def _date_field(value, field: str) -> float:
 
 def encode_sample(sample: dict) -> str:
     processes = []
-    for process in (sample.get("processes") or [])[:6]:
+    ranked = sorted(sample.get("processes") or [], key=lambda item: (
+        item.get("cpuAvailable") is False or item.get("cpuPercent") is None,
+        -(item.get("cpuPercent") or 0), -(item.get("memoryBytes") or 0),
+    ))
+    for process in ranked[:6]:
         item = {
             "name": process["name"],
-            "cpuPercent": process.get("cpuPercent") if process.get("cpuAvailable") is not False else 0,
+            "cpuPercent": process.get("cpuPercent") or 0,
             "memoryBytes": process.get("memoryBytes") or 0,
             "pids": process.get("pids") or [],
         }
-        for key in ("path", "groupID", "bundleID", "availabilityReason", "cpuAvailable"):
+        for key in ("path", "groupID", "bundleID", "availabilityReason", "cpuAvailable", "memoryAvailabilityReason"):
             if process.get(key) is not None:
                 item[key] = process[key]
-        if process.get("identities"):
-            item["identities"] = process["identities"]
+        if process.get("cpuPercent") is None:
+            item["cpuAvailable"] = False
+        if process.get("memoryBytes") is None:
+            item["memoryAvailabilityReason"] = process.get("memoryAvailabilityReason") or "进程内存不可读取"
+        identities = process.get("identities")
+        if identities and all(isinstance(identity, dict) and "uid" in identity for identity in identities):
+            item["identities"] = identities
         if process.get("observedAt") is not None:
             item["observedAt"] = unix_to_cocoa(process["observedAt"])
         processes.append(item)
-    ordered = sorted(processes, key=lambda item: (-(item.get("cpuPercent") or 0), -(item.get("memoryBytes") or 0)))[:6]
     payload = {
         "timestamp": unix_to_cocoa(sample["timestamp"]),
         "cpuPercent": sample.get("cpuPercent"),
-        "corePercents": [],
+        "corePercents": sample.get("corePercents") or [],
         "memoryUsed": sample.get("memoryUsed"),
         "memoryTotal": sample.get("memoryTotal"),
         "memoryCompressed": sample.get("memoryCompressed"),
@@ -125,7 +152,7 @@ def encode_sample(sample: dict) -> str:
         "uptime": sample.get("uptime"),
         "processCount": sample.get("processCount"),
         "thermalState": sample.get("thermalState") or "未知",
-        "processes": ordered,
+        "processes": processes,
     }
     return dumps(payload)
 
@@ -135,6 +162,7 @@ def decode_sample(payload: str) -> dict:
     sample = {
         "timestamp": _date_field(raw["timestamp"], "采样时间"),
         "cpuPercent": raw.get("cpuPercent"),
+        "corePercents": raw.get("corePercents") or [],
         "memoryUsed": raw.get("memoryUsed"),
         "memoryTotal": raw.get("memoryTotal"),
         "memoryCompressed": raw.get("memoryCompressed"),
@@ -148,6 +176,9 @@ def decode_sample(payload: str) -> dict:
         "diskTotal": raw.get("diskTotal"),
         "gpuPercent": raw.get("gpuPercent"),
         "cpuTemperature": raw.get("cpuTemperature"),
+        "cpuPower": raw.get("cpuPower"),
+        "gpuPower": raw.get("gpuPower"),
+        "fanRPM": raw.get("fanRPM"),
         "batteryPercent": raw.get("batteryPercent"),
         "batteryCharging": bool(raw.get("batteryCharging") or False),
         "batteryHealth": raw.get("batteryHealth"),
@@ -158,19 +189,26 @@ def decode_sample(payload: str) -> dict:
         "processes": [],
     }
     for process in raw.get("processes") or []:
+        memory_reason = process.get("memoryAvailabilityReason")
+        if (not memory_reason and not process.get("memoryBytes")
+                and (process.get("availabilityReason") or "").startswith("Windows 进程列表只核对名称")):
+            memory_reason = "旧版采样未读取进程内存"
         item = {
             "name": process.get("name") or "",
-            "cpuPercent": process.get("cpuPercent"),
-            "memoryBytes": process.get("memoryBytes") or 0,
+            "cpuPercent": None if process.get("cpuAvailable") is False else process.get("cpuPercent"),
+            "memoryBytes": None if memory_reason else process.get("memoryBytes"),
             "pids": process.get("pids") or [],
             "path": process.get("path"),
             "groupID": process.get("groupID"),
             "bundleID": process.get("bundleID"),
             "availabilityReason": process.get("availabilityReason"),
             "cpuAvailable": process.get("cpuAvailable"),
+            "memoryAvailabilityReason": memory_reason,
         }
         if process.get("observedAt") is not None:
             item["observedAt"] = _date_field(process["observedAt"], "进程时间")
+        if process.get("identities") is not None:
+            item["identities"] = process["identities"]
         sample["processes"].append(item)
     return sample
 
@@ -255,7 +293,8 @@ class MonitorStore:
         existed = self.path.exists()
         if existed:
             try:
-                header = self.path.read_bytes()[:16]
+                with self.path.open("rb") as handle:
+                    header = handle.read(16)
             except OSError as error:
                 self.status = f"历史数据暂时无法读取，原文件已保留：{error}"
                 return
@@ -317,8 +356,15 @@ class MonitorStore:
             raise AppError("原设置读取异常，暂不覆盖。请先备份数据并检查数据库。")
         merged = dict(self.settings)
         merged.update(changes)
+        previous = self.settings
         self.settings = normalize_settings(merged)
-        self._write_settings()
+        try:
+            self._write_settings()
+        except Exception:
+            self.settings = previous
+            if self.db is not None:
+                self.db.rollback()
+            raise
         return self.settings
 
     def _load_panel(self):
@@ -381,7 +427,8 @@ class MonitorStore:
             ).fetchone()
             observed = session.get("lastObserved")
             if last is not None:
-                observed = decode_sample(last["payload"])["timestamp"]
+                saved = decode_sample(last["payload"])["timestamp"]
+                observed = max(observed, saved) if observed is not None else saved
             end = session["start"] if observed is None else max(session["start"], observed)
             session["end"] = end
             session["interrupted"] = True

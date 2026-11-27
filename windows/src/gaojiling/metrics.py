@@ -6,28 +6,208 @@
 from __future__ import annotations
 
 import os
+import ntpath
+import sys
+import threading
 import time
 
 
-def _unavailable(reason: str) -> dict:
-    return {"value": None, "reason": reason}
+def reading(value, unit, timestamp, source, reason="本次读取不可用"):
+    return {
+        "value": value, "unit": unit, "timestamp": timestamp, "source": source,
+        "availabilityReason": reason if value is None else None, "isStale": False,
+    }
+
+
+def _cpu_delta(previous, current):
+    if previous is None or current is None:
+        return None, None
+    total = current[0] - previous[0]
+    idle = current[1] - previous[1]
+    if total <= 0 or not 0 <= idle <= total:
+        return None, None
+    return (total - idle) / total * 100, total
+
+
+def _network_rates(previous, current, elapsed):
+    if previous is None or current is None or elapsed <= 0 or previous.keys() != current.keys():
+        return None, None
+    down = up = 0
+    for interface, (received, sent) in current.items():
+        before = previous[interface]
+        if received < before[0] or sent < before[1]:
+            return None, None
+        down += received - before[0]
+        up += sent - before[1]
+    return (down / elapsed, up / elapsed) if current else (None, None)
+
+
+def _group_processes(inventory, previous, capacity_ticks, now):
+    baselines, groups = {}, {}
+    for process in inventory or []:
+        pid, started, owner = process["pid"], process["startTicks"], process["ownerSID"]
+        path, package = process["path"], process["packageFamily"]
+        key = "package:" + package.casefold() if package else ntpath.normcase(path) if path else f"pid:{pid}"
+        group = groups.setdefault(key, {
+            "pid": pid, "name": process["name"], "path": path, "groupID": key, "pids": [],
+            "identities": [], "cpuPercent": 0.0, "cpuAvailable": True, "memoryBytes": 0,
+            "observedAt": now, "availabilityReason": None, "memoryAvailabilityReason": None,
+        })
+        group["pids"].append(pid)
+        if started is not None and owner is not None and process["cpuTicks"] is not None:
+            identity = (pid, started, owner)
+            group["identities"].append({"pid": pid, "startTime": started, "ownerSID": owner})
+            baselines[identity] = process["cpuTicks"]
+            before = previous.get(identity)
+            if capacity_ticks and before is not None and process["cpuTicks"] >= before:
+                group["cpuPercent"] += (process["cpuTicks"] - before) / capacity_ticks * 100
+            else:
+                group["availabilityReason"] = "等待完整 CPU 基线采样"
+        else:
+            group["availabilityReason"] = "进程身份或 CPU 时间不可读取"
+        memory = process["memoryBytes"]
+        if memory is None:
+            group["memoryAvailabilityReason"] = "进程工作集不可读取"
+        else:
+            group["memoryBytes"] += memory
+    for group in groups.values():
+        group["cpuAvailable"] = group["availabilityReason"] is None
+        group["cpuPercent"] = min(100.0, group["cpuPercent"]) if group["cpuAvailable"] else None
+        if group["memoryAvailabilityReason"] is not None:
+            group["memoryBytes"] = None
+    return sorted(groups.values(), key=lambda item: (
+        item["cpuPercent"] is None, -(item["cpuPercent"] or 0), -(item["memoryBytes"] or 0),
+        item["name"].casefold(), item["groupID"],
+    )), baselines
 
 
 class MetricCollector:
     def __init__(self):
+        self._lock = threading.RLock()
+        self._performance = None
+        self._last_readings = {}
         self.previous_cpu = None
         self.previous_net = None
         self.previous_disk = None
         self.previous_processes = None
         self.previous_at = None
+        self.previous_core_times = None
+        self.previous_core_count = None
+
+    def reset(self):
+        with self._lock:
+            if self._performance is not None:
+                self._performance.close()
+            self._last_readings.clear()
+            self.previous_cpu = self.previous_net = self.previous_disk = self.previous_processes = self.previous_at = None
+            self.previous_core_times = self.previous_core_count = None
 
     def sample(self) -> dict:
-        import sys
-        if sys.platform == "win32":
-            return self._windows()
-        if sys.platform.startswith("linux"):
-            return self._linux()
-        return self._empty("当前平台没有已实现的采样器")
+        with self._lock:
+            if sys.platform == "win32":
+                return self._windows()
+            if sys.platform.startswith("linux"):
+                return self._linux()
+            return self._empty("当前平台没有已实现的采样器")
+
+    def _windows(self):
+        from gaojiling import winmetrics as native
+        from gaojiling.memory import _windows_snapshot
+        from gaojiling.winbattery import battery_snapshot
+
+        now = time.time()
+        at = time.monotonic()
+        elapsed = at - self.previous_at if self.previous_at is not None else 0
+        if elapsed > 15 or elapsed < 0:
+            self.reset()
+            elapsed = 0
+        api = native.kernel()
+        logical_processors = api.GetActiveProcessorCount(0xFFFF)
+        cpu_now = native.cpu_times() if 0 < logical_processors <= 64 else None
+        core_times = native.logical_cpu_times(logical_processors)
+        same_topology = self.previous_core_count == logical_processors
+        usage, capacity = _cpu_delta(self.previous_cpu if same_topology else None, cpu_now)
+        counter = self._performance
+        if counter is None:
+            counter = self._performance = native.PerformanceCounters()
+        ready = counter.collect()
+        cores = native.core_percentages(counter.array("cores")) if ready and elapsed else []
+        if len(cores) != logical_processors:
+            cores = []
+        if not cores and core_times and self.previous_core_times and same_topology:
+            resolved = [_cpu_delta(old, new)[0] for old, new in zip(self.previous_core_times, core_times)]
+            if len(resolved) == logical_processors and None not in resolved:
+                cores = resolved
+        cpu_source = "Windows GetSystemTimes · 全机 0–100%"
+        if logical_processors > 64:
+            usage = counter.value("cpu") if ready and elapsed else None
+            cpu_source = "Windows PDH Processor Information(_Total) · 所有处理器组"
+            capacity = elapsed * 10_000_000 * logical_processors if elapsed and same_topology else None
+        cpu_reason = "等待有效 CPU 基线采样" if not elapsed else "本次 CPU 计数不可用或发生变化"
+        inventory = native.process_inventory()
+        groups, baselines = _group_processes(inventory, self.previous_processes or {}, capacity, now)
+        network = native.network_counters()
+        down, up = _network_rates(self.previous_net, network, elapsed)
+        self.previous_at, self.previous_cpu = at, cpu_now
+        self.previous_core_times, self.previous_core_count = core_times, logical_processors
+        self.previous_net, self.previous_processes = network, baselines
+        memory = _windows_snapshot() or {}
+        free, total = native.boot_disk()
+        battery = battery_snapshot(now, reading)
+        disk_read = counter.value("diskRead", uncapped=True) if ready and elapsed else None
+        disk_write = counter.value("diskWrite", uncapped=True) if ready and elapsed else None
+        gpu = native.busiest_gpu_engine(counter.array("gpu")) if ready and elapsed else None
+        zones = [
+            {"name": name, "reading": reading(value - 273.15, "°C", now, "Windows PDH Thermal Zone Information")}
+            for name, value in (counter.array("zones").items() if ready else [])
+            if 173.0 <= value <= 473.2
+        ]
+        throttling = [int(value) for value in (counter.array("throttle").values() if ready else [])]
+        thermal = ("热节流" if any(value & 1 for value in throttling) else "未检测到热节流") if throttling else None
+        network_source = "Windows GetIfTable2：活动物理网卡字节计数差值"
+        sensor_reason = "Windows 未提供经验证的跨机型 CPU 温度、转速或功率读数。热区数据按固件上报。"
+        network_reason = "等待可比的网卡基线" if network else "活动物理网卡计数不可用"
+        sample_readings = {
+            "cpu": reading(usage, "%", now, cpu_source, cpu_reason),
+            "memory": reading(memory.get("used"), "bytes", now, "Windows GlobalMemoryStatusEx"),
+            "compressed": reading(None, "bytes", now, "Windows", "无通用已验证的压缩字节接口"),
+            "swap": reading(memory.get("swap"), "bytes", now, "Windows EnumPageFilesW：分页文件实际在用页"),
+            "pressure": reading(memory.get("pressure"), "level", now, "Windows GlobalMemoryStatusEx：按物理内存负载估算"),
+            "gpu": reading(gpu, "%", now, "Windows PDH GPU Engine：最忙物理引擎", "等待 GPU 基线或驱动未提供可读计数"),
+            "temperature": reading(None, "°C", now, "Windows", "固件热区不提供已核实的 CPU 封装温度"),
+            "cpuPower": reading(None, "W", now, "Windows", "无通用已验证的 CPU 功率接口"),
+            "gpuPower": reading(None, "W", now, "Windows", "无通用已验证的 GPU 功率接口"),
+            "diskFree": reading(free, "bytes", now, "Windows GetDiskFreeSpaceExW：系统卷调用用户可用容量"),
+            "diskRead": reading(disk_read, "bytes/s", now, "Windows PDH PhysicalDisk(_Total)", "等待磁盘计数基线或计数器不可读"),
+            "diskWrite": reading(disk_write, "bytes/s", now, "Windows PDH PhysicalDisk(_Total)", "等待磁盘计数基线或计数器不可读"),
+            "networkDown": reading(down, "bytes/s", now, network_source, network_reason),
+            "networkUp": reading(up, "bytes/s", now, network_source, network_reason),
+            "thermalState": reading(thermal, "", now, "Windows PDH Thermal Zone Information", "平台未报告可读的固件热节流状态"),
+        }
+        for key, current in sample_readings.items():
+            if current["value"] is not None:
+                self._last_readings[key] = current
+            elif key in self._last_readings:
+                last = self._last_readings[key]
+                sample_readings[key] = dict(last, isStale=True, availabilityReason=current["availabilityReason"])
+        return {
+            "timestamp": now, "cpuPercent": usage, "cpuReason": cpu_reason if usage is None else None,
+            "corePercents": cores, "logicalProcessorCount": logical_processors or None,
+            "memoryUsed": memory.get("used"), "memoryTotal": memory.get("total"),
+            "memoryCompressed": None, "memoryPressure": memory.get("pressure") or "未知",
+            "memorySource": memory.get("source"), "swapUsed": memory.get("swap"),
+            "networkDown": down, "networkUp": up, "diskRead": disk_read, "diskWrite": disk_write,
+            "diskFree": free, "diskTotal": total, "gpuPercent": gpu, "cpuTemperature": None,
+            "cpuPower": None, "gpuPower": None, "fanRPM": None,
+            "batteryPercent": battery["percent"]["value"], "batteryCharging": battery["charging"]["value"],
+            "batteryHealth": battery["healthPercent"]["value"], "batteryCycles": battery["cycles"]["value"],
+            "batterySnapshot": battery, "uptime": api.GetTickCount64() / 1000,
+            "processCount": len(inventory) if inventory is not None else None,
+            "processes": groups, "processSource": "Windows GetProcessTimes（全机 0–100%）与 K32GetProcessMemoryInfo（工作集含共享页）",
+            "thermalState": thermal or "未知", "thermalZones": zones, "readings": sample_readings,
+            "fanDescriptors": [], "fanReason": "Windows 未提供经验证的通用实时风扇转速接口",
+            "sensorReason": sensor_reason,
+        }
 
     def _empty(self, reason: str) -> dict:
         return {
@@ -270,141 +450,3 @@ def _linux_battery():
             return {"percent": None, "charging": False}
         return {"percent": capacity, "charging": status == "Charging"}
     return {"percent": None, "charging": False}
-
-
-def _windows(self) -> dict:
-    # 绑定到类。放在模块级会在导入时就要求 ctypes 结构，Linux 测试不需要执行它。
-    return _windows_sample(self)
-
-
-MetricCollector._windows = _windows
-
-
-def _windows_sample(collector: MetricCollector) -> dict:
-    import ctypes
-    from ctypes import wintypes
-
-    class FILETIME(ctypes.Structure):
-        _fields_ = [("low", wintypes.DWORD), ("high", wintypes.DWORD)]
-
-    def ticks(value: FILETIME) -> int:
-        return (value.high << 32) + value.low
-
-    idle, kernel, user = FILETIME(), FILETIME(), FILETIME()
-    if not ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
-        cpu_now = None
-    else:
-        cpu_now = (ticks(kernel) + ticks(user), ticks(idle))
-    now = time.time()
-    usage = None
-    reason = "初次 CPU 基线不可用"
-    if collector.previous_cpu and cpu_now and collector.previous_at and now > collector.previous_at:
-        total = cpu_now[0] - collector.previous_cpu[0]
-        idle_delta = cpu_now[1] - collector.previous_cpu[1]
-        if total > 0:
-            usage = max(0.0, min(100.0, (total - idle_delta) / total * 100))
-            reason = None
-    collector.previous_cpu = cpu_now
-    collector.previous_at = now
-    from gaojiling.memory import _windows_snapshot
-    memory = _windows_snapshot() or {}
-    free_disk, total_disk = _windows_disk()
-    battery = _windows_battery()
-    return {
-        "timestamp": now,
-        "cpuPercent": usage,
-        "cpuReason": reason,
-        "memoryUsed": memory.get("used"),
-        "memoryTotal": memory.get("total"),
-        "memoryCompressed": None,
-        "swapUsed": memory.get("swap"),
-        "memoryPressure": memory.get("pressure") or "未知",
-        "memorySource": memory.get("source"),
-        "networkDown": None,
-        "networkUp": None,
-        "diskRead": None,
-        "diskWrite": None,
-        "diskFree": free_disk,
-        "diskTotal": total_disk,
-        "gpuPercent": None,
-        "cpuTemperature": None,
-        "batteryPercent": battery.get("percent"),
-        "batteryCharging": battery.get("charging") or False,
-        "uptime": ctypes.windll.kernel32.GetTickCount64() / 1000,
-        "processCount": None,
-        "thermalState": "未知",
-        "processes": _windows_processes(),
-        "sensorReason": "没有已验证的温度、风扇、GPU 或功率接口，不填 0。进程 CPU 需要两次采样；第一次不显示 0。",
-    }
-
-
-def _windows_disk():
-    import ctypes
-    free = ctypes.c_ulonglong()
-    total = ctypes.c_ulonglong()
-    if not ctypes.windll.kernel32.GetDiskFreeSpaceExW("C:\\", ctypes.byref(free), ctypes.byref(total), None):
-        return None, None
-    return int(free.value), int(total.value)
-
-
-def _windows_battery():
-    import ctypes
-    from ctypes import wintypes
-
-    class SYSTEM_POWER_STATUS(ctypes.Structure):
-        _fields_ = [
-            ("ACLineStatus", ctypes.c_byte), ("BatteryFlag", ctypes.c_byte),
-            ("BatteryLifePercent", ctypes.c_byte), ("SystemStatusFlag", ctypes.c_byte),
-            ("BatteryLifeTime", wintypes.DWORD), ("BatteryFullLifeTime", wintypes.DWORD),
-        ]
-
-    status = SYSTEM_POWER_STATUS()
-    if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
-        return {"percent": None, "charging": False}
-    if status.BatteryFlag == 128 or status.BatteryLifePercent == 255:
-        return {"percent": None, "charging": False}
-    percent = int(status.BatteryLifePercent)
-    if not 0 <= percent <= 100:
-        return {"percent": None, "charging": False}
-    return {"percent": percent, "charging": status.ACLineStatus == 1 and status.BatteryFlag & 8 == 8}
-
-
-def _windows_processes():
-    """进程表第一次没有 CPU 基线。这里只列名称和内存，CPU 留空。"""
-    import ctypes
-    from ctypes import wintypes
-    TH32CS_SNAPPROCESS = 0x00000002
-
-    class PROCESSENTRY32(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.c_void_p), ("th32ModuleID", wintypes.DWORD),
-            ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
-            ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
-            ("szExeFile", ctypes.c_wchar * 260),
-        ]
-
-    snapshot = ctypes.windll.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snapshot == ctypes.c_void_p(-1).value:
-        return []
-    entry = PROCESSENTRY32()
-    entry.dwSize = ctypes.sizeof(entry)
-    found = []
-    try:
-        ok = ctypes.windll.kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
-        while ok:
-            found.append({
-                "pid": int(entry.th32ProcessID),
-                "name": entry.szExeFile,
-                "path": None,
-                "memoryBytes": 0,
-                "pids": [int(entry.th32ProcessID)],
-                "groupID": entry.szExeFile,
-                "cpuPercent": None,
-                "cpuAvailable": False,
-                "availabilityReason": "Windows 进程列表只核对名称。没有打开进程句柄，CPU 不填 0。",
-            })
-            ok = ctypes.windll.kernel32.Process32NextW(snapshot, ctypes.byref(entry))
-    finally:
-        ctypes.windll.kernel32.CloseHandle(snapshot)
-    return found[:40]

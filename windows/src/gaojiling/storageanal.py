@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from gaojiling.errors import AppError
-from gaojiling.filesafety import stat_alloc, within
+from gaojiling.filemeta import allocation, blocked, checked_stat, directory_entries, local_path
 
 DOCUMENT_EXTENSIONS = {
     "txt", "md", "rtf", "rtfd", "doc", "docx", "odt", "pages", "pdf", "xls", "xlsx", "ods",
@@ -20,7 +20,7 @@ DOCUMENT_EXTENSIONS = {
 }
 
 
-def dev_targets(home: Path, system: str) -> list[dict]:
+def dev_targets(home: Path, system: str) -> tuple[list[dict], list[str]]:
     home = Path(home)
     local = home / "AppData" / "Local"
     roaming = home / "AppData" / "Roaming"
@@ -67,126 +67,121 @@ def _suggestion(path: Path, logical: int) -> str:
 
 def analyze(scope: Path, exclusions: list[str] | None = None, budget: dict | None = None,
             cancelled=lambda: False, clock=None) -> dict:
-    root = Path(scope)
-    if not root.is_dir() or root.is_symlink():
-        raise AppError("请选择一个本机普通目录。符号链接不会被当作分析根。")
-    limits = {"entries": 100_000, "depth": 64, "seconds": 20, "nodes": 5_000}
-    if budget:
-        limits.update(budget)
-    started = (clock or time.monotonic)()
+    root = local_path(scope)
+    root_info = checked_stat(root)
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise AppError("请选择一个本机普通目录。")
+    limits = {"entries": 100_000, "depth": 64, "seconds": 20, "nodes": 5_000} | (budget or {})
     now = clock or time.monotonic
-    root_info = os.lstat(root)
+    started = now()
     notes = [
-        "只读取名称、层级和分配空间，不打开文件内容，不跟随符号链接，不跨卷。",
+        "只读取名称、层级和系统报告的文件分配空间。硬链接只计一次。",
         "云端占位、权限不足和扫描预算都会让结果保持未完成。",
         "排除目录只跳过存储分析，不改变清理页的范围。",
     ]
-    skipped = {"symlink": 0, "cross": 0, "unreadable": 0, "excluded": 0}
-    complete = True
-    entries = []
+    skipped = dict.fromkeys(("symlink", "placeholder", "cross", "unreadable", "excluded", "duplicate"), 0)
     large = []
+    seen = set()
+    excluded_paths = {local_path(item) for item in exclusions or [] if item}
     visited = 0
+    stop_reason = None
 
-    def expired():
-        return cancelled() or now() - started >= limits["seconds"] or visited >= limits["entries"]
-
-    def excluded(path: Path) -> bool:
-        for item in exclusions or []:
-            if not item:
-                continue
-            other = Path(item)
-            if path == other or within(path, other):
-                return True
-        return False
+    def checkpoint():
+        nonlocal stop_reason
+        if cancelled():
+            stop_reason = "分析已取消。当前文件系统调用不能被强制打断。"
+        elif now() - started >= limits["seconds"]:
+            stop_reason = "达到扫描时间预算。"
+        elif visited >= min(limits["nodes"], limits["entries"]):
+            stop_reason = "已达到目录树节点或条目上限。"
+        return stop_reason is None
 
     def walk(path: Path, depth: int) -> dict | None:
-        nonlocal visited, complete
-        if expired():
-            complete = False
+        nonlocal visited
+        if not checkpoint():
             return None
         visited += 1
-        try:
-            info = os.lstat(path)
-        except OSError:
-            skipped["unreadable"] += 1
-            complete = False
-            return None
-        if stat.S_ISLNK(info.st_mode):
-            skipped["symlink"] += 1
-            complete = False
-            return None
-        if info.st_dev != root_info.st_dev:
-            skipped["cross"] += 1
-            complete = False
-            return None
-        if excluded(path) and path != root:
-            skipped["excluded"] += 1
-            return {"name": path.name, "path": str(path), "allocatedBytes": 0, "logicalBytes": 0,
-                    "fileCount": 0, "directoryCount": 0, "skipped": True, "children": []}
-        if not stat.S_ISDIR(info.st_mode):
-            logical = max(0, int(info.st_size))
-            allocated = stat_alloc(info)
-            if logical >= 100 * 1024 * 1024 and len(large) < 200:
-                large.append({"name": path.name, "path": str(path), "logicalBytes": logical, "allocatedBytes": allocated,
-                              "suggestion": _suggestion(path, logical)})
-            return {"name": path.name, "path": str(path), "allocatedBytes": allocated, "logicalBytes": logical,
-                    "fileCount": 1, "directoryCount": 0, "children": []}
-        children = []
-        allocated = stat_alloc(info)
-        logical = 0
-        files = 0
-        directories = 1
-        try:
-            with os.scandir(path) as iterator:
-                names = sorted(entry.name for entry in iterator)
-        except OSError:
-            skipped["unreadable"] += 1
-            complete = False
-            names = []
-        for name in names:
-            if len(entries) >= limits["nodes"]:
-                complete = False
-                notes.append("节点数量达到上限，更深的目录没有全部展开。")
-                break
-            if depth >= limits["depth"]:
-                complete = False
-                break
-            child = walk(path / name, depth + 1)
-            if child is None:
-                continue
-            if not child.get("skipped"):
-                allocated += child["allocatedBytes"]
-                logical += child["logicalBytes"]
-                files += child["fileCount"]
-                directories += child["directoryCount"]
-            if depth < 2:
-                children.append({key: child[key] for key in ("name", "path", "allocatedBytes", "logicalBytes", "fileCount", "directoryCount")})
         node = {
             "name": path.name or str(path),
             "path": str(path),
-            "allocatedBytes": allocated,
-            "logicalBytes": logical,
-            "fileCount": files,
-            "directoryCount": directories,
-            "children": children,
-            "suggestion": _suggestion(path, logical),
+            "allocatedBytes": 0, "logicalBytes": 0, "fileCount": 0, "directoryCount": 0,
+            "kind": "未知", "complete": True, "children": [],
         }
-        if depth <= 1:
-            entries.append(node)
+
+        def omit(reason, label):
+            skipped[reason] += 1
+            node.update(skipped=True, skipReason=label, suggestion=label, complete=reason in {"duplicate", "excluded"})
+            return node
+
+        if path != root and (path in excluded_paths or any(parent in excluded_paths for parent in path.parents)):
+            return omit("excluded", "排除目录")
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return omit("unreadable", "目录或文件元数据无法读取")
+        kind = blocked(info)
+        if kind:
+            return omit(kind, "云端占位" if kind == "placeholder" else "符号链接或重解析点")
+        if info.st_dev != root_info.st_dev:
+            return omit("cross", "跨卷")
+        directory = stat.S_ISDIR(info.st_mode)
+        if not directory and not stat.S_ISREG(info.st_mode):
+            return omit("unreadable", "非常规文件")
+        key = (info.st_dev, info.st_ino)
+        if info.st_ino and key in seen:
+            return omit("duplicate", "已计入同一实物")
+        if info.st_ino:
+            seen.add(key)
+        node["kind"] = "目录" if directory else "文件"
+        try:
+            node["allocatedBytes"] = allocation(path, info)
+        except (OSError, AppError):
+            skipped["unreadable"] += 1
+            node.update(complete=False, skipReason="系统未能读取分配空间")
+        if directory:
+            node["directoryCount"] = 1
+            try:
+                with directory_entries(path, info) as iterator:
+                    for item in iterator:
+                        if depth >= limits["depth"]:
+                            node.update(complete=False, skipReason="达到目录深度上限")
+                            break
+                        child = walk(path / item.name, depth + 1)
+                        if child is None:
+                            node.update(complete=False, skipReason=stop_reason)
+                            break
+                        node["children"].append(child)
+                        node["complete"] = node["complete"] and child["complete"]
+                        for key in ("allocatedBytes", "logicalBytes", "fileCount", "directoryCount"):
+                            node[key] += child[key]
+            except (OSError, AppError):
+                skipped["unreadable"] += 1
+                node.update(complete=False, skipReason="目录无法读取或发生变化")
+            node["children"].sort(key=lambda child: child["name"].casefold())
+        else:
+            node["logicalBytes"] = max(0, int(info.st_size))
+            node["fileCount"] = 1
+        node["suggestion"] = _suggestion(path, node["logicalBytes"])
+        if not directory and node["logicalBytes"] >= 100 * 1024 * 1024 and len(large) < 200:
+            large.append(node)
         return node
 
     tree = walk(root, 0)
-    if cancelled():
-        complete = False
-        notes.append("分析已取消。当前文件系统调用不能被强制打断。")
+    was_cancelled = bool(cancelled())
+    complete = bool(tree and tree["complete"] and not was_cancelled)
+    if stop_reason:
+        notes.append(stop_reason)
     if not complete:
         notes.append("这次扫描未完成，不能把它的合计当成整个范围，也不能画成实际增减。")
-    scope_key = hashlib.sha256(str(root).encode("utf-8")).hexdigest()
+    scope_parts = [os.path.normcase(str(root)), *sorted(os.path.normcase(str(item)) for item in excluded_paths)]
+    scope_key = hashlib.sha256("\0".join(scope_parts).encode("utf-8")).hexdigest()
+    entries = [{key: value for key, value in node.items() if key != "children"}
+               for node in tree["children"] if not node.get("skipped")] if tree else []
     return {
         "scope": str(root),
         "scopeKey": scope_key,
-        "complete": complete and tree is not None,
-        "cancelled": bool(cancelled()),
+        "complete": complete,
+        "cancelled": was_cancelled,
         "notes": notes,
         "tree": tree,
         "entries": entries,
@@ -200,24 +195,43 @@ def analyze_dev(home: Path, system: str, **kwargs) -> dict:
     targets, notes = dev_targets(home, system)
     parts = []
     complete = True
+    now = kwargs.get("clock") or time.monotonic
+    limits = kwargs.get("budget") or {}
+    deadline = now() + limits.get("seconds", 20)
+    cancelled = kwargs.get("cancelled", lambda: False)
     for target in targets:
         path = target["path"]
-        if not path.exists() or path.is_symlink():
+        remaining = deadline - now()
+        if remaining <= 0 or cancelled():
+            notes.append("开发环境分析在达到时间预算或取消后结束。")
+            complete = False
+            break
+        try:
+            info = checked_stat(local_path(path))
+            if not stat.S_ISDIR(info.st_mode):
+                raise AppError("目录类型无法核实")
+            if not target["descend"]:
+                parts.append({
+                    "label": target["label"], "path": str(path), "present": True, "complete": True,
+                    "tree": {"name": path.name, "path": str(path), "allocatedBytes": allocation(path, info),
+                             "logicalBytes": 0, "fileCount": 0, "directoryCount": 1, "children": []},
+                    "note": "未进入该目录。虚拟机磁盘不在这次分析里。",
+                })
+                continue
+            result = analyze(path, **(kwargs | {"budget": limits | {"seconds": remaining}}))
+        except FileNotFoundError:
             parts.append({"label": target["label"], "path": str(path), "present": False, "complete": True, "tree": None})
             continue
-        if not target["descend"]:
-            info = os.lstat(path)
-            parts.append({
-                "label": target["label"], "path": str(path), "present": True, "complete": True,
-                "tree": {"name": path.name, "path": str(path), "allocatedBytes": stat_alloc(info),
-                         "logicalBytes": max(0, int(info.st_size)), "fileCount": 0, "directoryCount": 1, "children": []},
-                "note": "未进入该目录。虚拟机磁盘不在这次分析里。",
-            })
+        except (OSError, AppError):
+            complete = False
+            parts.append({"label": target["label"], "path": str(path), "present": None, "complete": False, "tree": None,
+                          "notes": ["无法读取目录元数据、权限不足或存在重解析点。"]})
             continue
-        result = analyze(path, **kwargs)
         complete = complete and result["complete"]
-        parts.append({"label": target["label"], "path": str(path), "present": True, "complete": result["complete"], "tree": result["tree"], "notes": result["notes"]})
-    return {"kind": "dev", "complete": complete, "parts": parts, "notes": notes, "scopeKey": "dev:" + hashlib.sha256(str(Path(home)).encode("utf-8")).hexdigest()}
+        parts.append({"label": target["label"], "path": str(path), "present": True, "complete": result["complete"],
+                      "tree": result["tree"], "notes": result["notes"]})
+    return {"kind": "dev", "complete": complete, "cancelled": bool(cancelled()), "parts": parts, "notes": notes,
+            "scopeKey": "dev:" + hashlib.sha256(str(Path(home)).encode("utf-8")).hexdigest()}
 
 
 def compare_history(history: list[dict], scope_key: str) -> dict:

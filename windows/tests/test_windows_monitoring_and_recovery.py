@@ -119,18 +119,19 @@ def _fixture_trash(tmp_path):
 
 @pytest.fixture
 def isolated_portable_root(tmp_path, monkeypatch):
-    # The test runner's private temp directory sits below production AppData.
-    # Allow only the isolated fixture paths and keep the production guard in
-    # effect everywhere outside them.
+    # Checkout and runner paths can contain protected ancestor names such as
+    # GaoJiLing or AppData. Remap only the generated package for this path check.
     from gaojiling import apps
 
     protected = apps.is_protected
+    portable = tmp_path / "Portable"
+    neutral_path = Path(portable.anchor) / "synthetic-fixtures" / portable.name
     monkeypatch.setattr(apps, "is_protected", lambda name, path:
-                        None if Path(path).is_relative_to(tmp_path) else protected(name, path))
+                        protected(name, str(neutral_path) if Path(path) == portable else path))
     return tmp_path
 
 
-def test_portable_uninstall_rejects_user_data_and_restores_only_same_directory(isolated_portable_root):
+def test_portable_uninstall_rejects_user_data_and_restores_only_same_directory(isolated_portable_root, own_fixture_files):
     tmp_path = isolated_portable_root
     source = tmp_path / "Portable"
     source.mkdir()
@@ -138,7 +139,10 @@ def test_portable_uninstall_rejects_user_data_and_restores_only_same_directory(i
     shutil.copyfile(sys.executable, executable)
     document = source / "project.docx"
     document.write_text("fixture", encoding="utf-8")
+    own_fixture_files(source, executable, document)
     engine = AppInventory(tmp_path / "journal", _fixture_trash(tmp_path), catalog=[])
+    with pytest.raises(AppError, match="受保护"):
+        engine.add_portable(tmp_path / "AppData" / "Portable")
     with pytest.raises(AppError, match="程序包"):
         engine.add_portable(source)
     document.unlink()
@@ -156,11 +160,13 @@ def test_portable_uninstall_rejects_user_data_and_restores_only_same_directory(i
     assert reopened.history()[0]["restorableCount"] == 0
 
 
-def test_portable_uninstall_rechecks_process_state_after_staging(isolated_portable_root):
+def test_portable_uninstall_rechecks_process_state_after_staging(isolated_portable_root, own_fixture_files):
     tmp_path = isolated_portable_root
     source = tmp_path / "Portable"
     source.mkdir()
-    shutil.copyfile(sys.executable, source / "Fixture.exe")
+    executable = source / "Fixture.exe"
+    shutil.copyfile(sys.executable, executable)
+    own_fixture_files(source, executable)
     called = []
 
     def never_trash(path):
@@ -175,7 +181,7 @@ def test_portable_uninstall_rechecks_process_state_after_staging(isolated_portab
     assert source.is_dir() and called == []
 
 
-def test_windows_cleanup_scans_exact_owned_caches_and_rolls_back_recycle_failure(tmp_path):
+def test_windows_cleanup_scans_exact_owned_caches_and_rolls_back_recycle_failure(tmp_path, own_fixture_files):
     home = tmp_path / "home"
     local = home / "AppData" / "Local"
     source = local / "Google" / "Chrome" / "User Data" / "Default" / "Cache"
@@ -183,6 +189,7 @@ def test_windows_cleanup_scans_exact_owned_caches_and_rolls_back_recycle_failure
     (source / "sample").write_text("fixture", encoding="utf-8")
     other = local / "UnknownVendor"
     other.mkdir()
+    own_fixture_files(source, source / "sample", other)
     old = time.time() - 9 * 86400
     for path in (source / "sample", source, other):
         os.utime(path, (old, old))

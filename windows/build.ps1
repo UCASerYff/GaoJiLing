@@ -1,6 +1,7 @@
 param(
     [string]$Python = "python",
-    [switch]$SkipInstallDependencies
+    [switch]$SkipInstallDependencies,
+    [switch]$TestsOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,9 +16,20 @@ Invoke-Python -c "import platform, sys; assert sys.version_info[:2] == (3, 12) a
 if (-not $SkipInstallDependencies) {
     Invoke-Python -m pip install --disable-pip-version-check -r requirements-dev.txt
 }
-Invoke-Python -m pytest -q
+$buildRoot = (New-Item -ItemType Directory -Path (Join-Path $PSScriptRoot "build") -Force).FullName
+$testRoot = Join-Path $buildRoot ("pytest-" + [guid]::NewGuid().ToString("n"))
+try {
+    Invoke-Python -B -m pytest -q -p no:cacheprovider --basetemp $testRoot
+} finally {
+    $created = Get-Item -LiteralPath $testRoot -ErrorAction SilentlyContinue
+    if ($created -and $created.FullName -eq $testRoot -and $created.Parent.FullName -eq $buildRoot -and
+        -not ($created.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Remove-Item -LiteralPath $created.FullName -Recurse -Force
+    }
+}
+if ($TestsOnly) { return }
 
-$build = Join-Path $PSScriptRoot "build\package"
+$build = Join-Path $buildRoot "package"
 $dist = Join-Path $PSScriptRoot "dist"
 $programs = Join-Path $build "programs"
 New-Item -ItemType Directory -Path $build,$dist,$programs -Force | Out-Null

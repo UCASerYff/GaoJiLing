@@ -247,15 +247,17 @@ def _touch(path: Path, age: float):
     os.utime(path, (moment, moment))
 
 
-def test_cleanup_lists_only_old_inactive_caches_and_restores_without_overwrite(tmp_path):
+def test_cleanup_lists_only_old_inactive_caches_and_restores_without_overwrite(tmp_path, own_fixture_files):
     home = tmp_path / "home"
     cache = home / "Library" / "Caches" / "com.example.tool"
     cache.mkdir(parents=True)
     (cache / "data").write_text("old", encoding="utf-8")
+    own_fixture_files(cache, cache / "data")
     _touch(cache / "data", 8 * 86400)
     _touch(cache, 8 * 86400)
     apple = home / "Library" / "Caches" / "com.apple.finder"
     apple.mkdir()
+    own_fixture_files(apple)
     _touch(apple, 8 * 86400)
     link = home / "Library" / "Caches" / "com.example.link"
     try:
@@ -358,13 +360,14 @@ def test_storage_tree_keeps_deep_allocation_and_exclusion_scopes_separate(tmp_pa
     assert excluded["tree"]["fileCount"] == 0
 
 
-def test_duplicates_keep_one_and_do_not_count_a_hard_link_twice(tmp_path):
+def test_duplicates_keep_one_and_do_not_count_a_hard_link_twice(tmp_path, own_fixture_files):
     scope = tmp_path / "scope"
     scope.mkdir()
     first = scope / "a.bin"
     second = scope / "b.bin"
     first.write_bytes(b"same-bytes")
     second.write_bytes(b"same-bytes")
+    own_fixture_files(first, second)
     os.utime(first, (1_000, 1_000))
     os.utime(second, (2_000, 2_000))
     linked = scope / "link.bin"
@@ -394,7 +397,7 @@ def test_duplicates_keep_one_and_do_not_count_a_hard_link_twice(tmp_path):
     keeper = result["groups"][0]["suggestedKeeperID"]
     moving = [item["id"] for item in result["groups"][0]["files"] if item["id"] != keeper]
     report = engine.move(moving)
-    assert report["removedIDs"] == moving
+    assert report["removedIDs"] == moving, report["failed"]
     assert first.exists()
     assert not second.exists()
     second.write_bytes(b"newer")
@@ -420,12 +423,13 @@ def test_duplicate_scan_with_a_symlink_cannot_move(tmp_path, monkeypatch):
         engine.move(["anything"])
 
 
-def test_duplicate_move_rechecks_the_retained_file_before_any_write(tmp_path):
+def test_duplicate_move_rechecks_the_retained_file_before_any_write(tmp_path, own_fixture_files):
     scope = tmp_path / "scope"
     scope.mkdir()
     one, two = scope / "a.bin", scope / "b.bin"
     one.write_bytes(b"equal")
     two.write_bytes(b"equal")
+    own_fixture_files(one, two)
     engine = DuplicateEngine(tmp_path / "journal", tmp_path / "stage", tmp_path, lambda path: path)
     result = engine.scan(scope, True)
     selected = next(row["id"] for row in result["groups"][0]["files"] if row["name"] == "b.bin")
@@ -433,7 +437,8 @@ def test_duplicate_move_rechecks_the_retained_file_before_any_write(tmp_path):
     one.write_bytes(b"other")
     os.utime(one, ns=(initial.st_atime_ns, initial.st_mtime_ns))
     report = engine.move([selected])
-    assert report["failed"] and not report["removedIDs"]
+    assert not report["removedIDs"]
+    assert "准备保留的实物已变化" in report["failed"][0]["message"]
     assert not engine.history()
     assert two.read_bytes() == b"equal"
 

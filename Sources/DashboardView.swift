@@ -677,21 +677,36 @@ struct GLSparkline: View {
     let values: [Double]
     var color: Color = GLPalette.accent
     var body: some View {
-        Canvas { context, size in
-            guard values.count > 1 else { return }
-            let upper = max(values.max() ?? 1, 1)
-            var line = Path()
-            for (index, value) in values.enumerated() {
-                let point = CGPoint(x: size.width * Double(index) / Double(values.count - 1), y: size.height - max(0, value) / upper * (size.height - 3) - 1)
-                if index == 0 { line.move(to: point) } else { line.addLine(to: point) }
-            }
-            var area = line
-            area.addLine(to: CGPoint(x: size.width, y: size.height))
-            area.addLine(to: CGPoint(x: 0, y: size.height)); area.closeSubpath()
-            context.fill(area, with: .linearGradient(Gradient(colors: [color.opacity(0.16), color.opacity(0.01)]), startPoint: .zero, endPoint: CGPoint(x: 0, y: size.height)))
-            context.stroke(line, with: .color(color), style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
+        Canvas { (context: GraphicsContext, size: CGSize) in
+            draw(context, size: size)
         }
         .accessibilityLabel("近期变化趋势")
+    }
+
+    private func draw(_ context: GraphicsContext, size: CGSize) {
+        guard values.count > 1 else { return }
+        let upper: Double = max(values.max() ?? 1, 1)
+        let lastIndex: CGFloat = CGFloat(values.count - 1)
+        let plotHeight: CGFloat = size.height - 3
+        var line = Path()
+        for (index, value) in values.enumerated() {
+            let fraction: Double = max(0, value) / upper
+            let x: CGFloat = size.width * CGFloat(index) / lastIndex
+            let y: CGFloat = size.height - CGFloat(fraction) * plotHeight - 1
+            let point = CGPoint(x: x, y: y)
+            if index == 0 { line.move(to: point) } else { line.addLine(to: point) }
+        }
+        let bottomLeft = CGPoint(x: 0, y: size.height)
+        let bottomRight = CGPoint(x: size.width, y: size.height)
+        var area = line
+        area.addLine(to: bottomRight)
+        area.addLine(to: bottomLeft)
+        area.closeSubpath()
+        let gradient = Gradient(colors: [color.opacity(0.16), color.opacity(0.01)])
+        let fill: GraphicsContext.Shading = .linearGradient(gradient, startPoint: .zero, endPoint: bottomLeft)
+        let stroke = StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round)
+        context.fill(area, with: fill)
+        context.stroke(line, with: .color(color), style: stroke)
     }
 }
 
@@ -723,7 +738,9 @@ enum GLChartPresentation {
             previous = sample.timestamp
         }
         guard all.count > targetCount else { return all }
-        let bucketSize = max(1, Int(ceil(Double(all.count) / Double(max(targetCount / 2, 1)))))
+        let bucketCount: Int = max(targetCount / 2, 1)
+        let samplesPerBucket: Double = Double(all.count) / Double(bucketCount)
+        let bucketSize: Int = max(1, Int(ceil(samplesPerBucket)))
         var kept = Set([0, all.count - 1])
         for start in stride(from: 0, to: all.count, by: bucketSize) {
             let end = min(start + bucketSize, all.count)
@@ -759,7 +776,6 @@ struct GLTrendChart: View {
     }
     var body: some View {
         let points = GLChartPresentation.points(from: samples, metric: metric)
-        let segmentCounts = Dictionary(grouping: points, by: \.segment).mapValues(\.count)
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
                 Circle().fill(color).frame(width: 5, height: 5)
@@ -771,26 +787,44 @@ struct GLTrendChart: View {
                 Text(eventDate != nil ? "当前回看范围没有历史采样" : isPaused ? "采样已暂停，恢复后显示趋势" : "正在等待有效采样")
                     .font(.system(size: 11)).foregroundStyle(.secondary).frame(maxWidth: .infinity).frame(height: height)
             } else {
-                Chart {
-                    ForEach(points) { point in
-                        AreaMark(x: .value("时间", point.timestamp), y: .value("占用", point.value),
-                                 series: .value("采样段", point.segment), stacking: .unstacked)
-                            .foregroundStyle(LinearGradient(colors: [color.opacity(0.12), color.opacity(0.015)], startPoint: .top, endPoint: .bottom))
-                        LineMark(x: .value("时间", point.timestamp), y: .value("占用", point.value),
-                                 series: .value("采样段", point.segment))
-                            .foregroundStyle(color).lineStyle(StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
-                        if segmentCounts[point.segment] == 1 {
-                            PointMark(x: .value("时间", point.timestamp), y: .value("占用", point.value)).foregroundStyle(color).symbolSize(18)
-                        }
-                    }
-                    if let eventDate { RuleMark(x: .value("事件", eventDate)).foregroundStyle(GLPalette.amber).lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4])) }
-                }
-                .chartYScale(domain: 0...100)
-                .chartYAxis { AxisMarks(position: .leading, values: [0, 50, 100]) { _ in AxisGridLine().foregroundStyle(Color.primary.opacity(0.055)); AxisValueLabel().font(.system(size: 8)).foregroundStyle(Color.secondary) } }
-                .chartXAxis { AxisMarks(values: .automatic(desiredCount: 3)) { _ in AxisValueLabel(format: timeFormat).font(.system(size: 9)).foregroundStyle(Color.secondary) } }
-                .frame(height: height)
+                trend(points)
             }
         }.frame(maxWidth: .infinity)
+    }
+
+    private func trend(_ points: [GLChartPoint]) -> some View {
+        let segmentCounts: [Int: Int] = Dictionary(grouping: points, by: \.segment).mapValues(\.count)
+        let areaFill = LinearGradient(colors: [color.opacity(0.12), color.opacity(0.015)], startPoint: .top, endPoint: .bottom)
+        let trendStroke = StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round)
+        let eventStroke = StrokeStyle(lineWidth: 1, dash: [4, 4])
+        return Chart {
+            ForEach(points) { point in
+                let time: PlottableValue<Date> = .value("时间", point.timestamp)
+                let usage: PlottableValue<Double> = .value("占用", point.value)
+                let segment: PlottableValue<Int> = .value("采样段", point.segment)
+                AreaMark(x: time, y: usage, series: segment, stacking: .unstacked).foregroundStyle(areaFill)
+                LineMark(x: time, y: usage, series: segment).foregroundStyle(color).lineStyle(trendStroke)
+                if segmentCounts[point.segment] == 1 {
+                    PointMark(x: time, y: usage).foregroundStyle(color).symbolSize(18)
+                }
+            }
+            if let eventDate {
+                RuleMark(x: .value("事件", eventDate)).foregroundStyle(GLPalette.amber).lineStyle(eventStroke)
+            }
+        }
+        .chartYScale(domain: 0...100)
+        .chartYAxis {
+            AxisMarks(position: .leading, values: [0, 50, 100]) { _ in
+                AxisGridLine().foregroundStyle(Color.primary.opacity(0.055))
+                AxisValueLabel().font(.system(size: 8)).foregroundStyle(Color.secondary)
+            }
+        }
+        .chartXAxis {
+            AxisMarks(values: .automatic(desiredCount: 3)) { _ in
+                AxisValueLabel(format: timeFormat).font(.system(size: 9)).foregroundStyle(Color.secondary)
+            }
+        }
+        .frame(height: height)
     }
 }
 

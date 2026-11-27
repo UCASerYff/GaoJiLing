@@ -82,6 +82,9 @@ function Invoke-InstalledApp([string]$Version, [string]$TaskName, [string]$Previ
         if ($state.version -ne $Version -or $state.panel.horizontalRatio -ne 0.61 -or $state.panel.verticalRatio -ne 0.37) {
             throw "Installed GUI did not read the expected version and saved panel position"
         }
+        if ($state.desktop.available -or $state.desktop.trayAvailable) {
+            throw "The headless smoke entry unexpectedly started the desktop host or a tray icon"
+        }
         if ($PreviousTaskId) {
             $oldTask = @($state.sessions | Where-Object { $_.id -eq $PreviousTaskId -and $_.name -eq 'Prior build smoke' -and $_.end })
             if ($oldTask.Count -ne 1 -or $state.settings.appearance -ne 'dark' -or
@@ -100,6 +103,13 @@ function Invoke-InstalledApp([string]$Version, [string]$TaskName, [string]$Previ
         Invoke-RestMethod -Uri "$url/api/session/stop" @post -Body '{}' | Out-Null
         Invoke-RestMethod -Uri "$url/api/shutdown" @post -Body '{}' | Out-Null
         if (-not $app.WaitForExit(20000) -or $app.ExitCode -ne 0) { throw "Installed GUI did not exit normally" }
+        $probe = [Net.Sockets.TcpClient]::new()
+        try {
+            try { $probe.Connect([Net.IPAddress]::Loopback, $port) } catch [Net.Sockets.SocketException] {}
+            if ($probe.Connected) { throw "The loopback port remained open after shutdown" }
+        } finally {
+            $probe.Dispose()
+        }
         return $taskId
     } finally {
         if (-not $app.HasExited) {
@@ -151,7 +161,7 @@ try {
     }
     $verified = $true
     if ($previous) { Write-Output "Verified private MSI major upgrade $($previous.version) to $($candidate.version), saved task and settings." }
-    Write-Output 'Verified MSI SHA-256, private install, x64 launcher, task round-trip, orderly exit and data-preserving uninstall.'
+    Write-Output 'Verified MSI SHA-256, private install, x64 headless launcher without tray, task round-trip, loopback shutdown and data-preserving uninstall.'
 } finally {
     foreach ($entry in @($candidate, $previous)) {
         if ($entry -and [GaoJiLingInstallerSmoke]::MsiQueryProductState($entry.product) -eq 5) {

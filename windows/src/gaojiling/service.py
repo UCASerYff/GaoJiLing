@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import json
 import platform
+import sqlite3
 import threading
 import time
 import uuid
@@ -110,9 +111,51 @@ class Service:
         self._stop.set()
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join()
-        with self._data_lock:
+        with self._mutation_lock, self._data_lock:
             self._reset_collector()
             self.store.close()
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop.is_set()
+
+    @property
+    def data_busy(self) -> bool:
+        with self._work_guard:
+            return self._mutation_lock.locked() or bool(self._work)
+
+    @contextmanager
+    def mutation(self):
+        if not self._mutation_lock.acquire(blocking=False):
+            raise AppError("另一个工作正在进行。")
+        try:
+            if self.stopping:
+                raise AppError("搞机灵正在退出。")
+            yield
+        finally:
+            self._mutation_lock.release()
+
+    def prepare_shutdown(self, confirm_active=None) -> bool:
+        """Prevent new mutations, then finalize the task before stopping sampling."""
+        if self.stopping:
+            return True
+        with self.mutation():
+            with self._work_guard:
+                if self._work:
+                    raise AppError("另一个工作正在进行。")
+            with self._data_lock:
+                name = self.active["name"] if self.active is not None else None
+            # Sampling can continue while the user decides. Task mutations are held.
+            if name is not None and confirm_active is not None and not confirm_active(name):
+                return False
+            with self._data_lock:
+                if self.active is not None:
+                    try:
+                        self._stop_session()
+                    except sqlite3.Error as error:
+                        raise AppError(f"任务未能保存，搞机灵仍在运行。{error}") from error
+                self._stop.set()
+        return True
 
     def _reset_collector(self):
         reset = getattr(self.collector, "reset", None)
@@ -159,7 +202,7 @@ class Service:
 
     def sample_once(self, sample: dict | None = None) -> dict:
         with self._data_lock:
-            if self.paused:
+            if self.paused or self.stopping:
                 return self.latest
             current = sample if sample is not None else self.collector.sample()
             moment = current["timestamp"] = current.get("timestamp") or now_unix()

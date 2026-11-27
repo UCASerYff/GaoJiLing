@@ -1,14 +1,18 @@
 # 搞机灵 V1.16 for Windows
 
-面向 Windows 10/11 x64。桌面窗口显示 V1.16，关于页显示构建 2，命令行显示 1.16+2。使用按用户安装的 x64 MSI，无需管理员权限。安装包未进行 Authenticode 签名。
+面向 Windows 10/11 x64。桌面窗口显示 V1.16，关于页显示构建 3，命令行显示 1.16+3。使用按用户安装的 x64 MSI，无需管理员权限。安装包未进行 Authenticode 签名。
 
 ## 安装与运行
 
-从发布页下载 `GaoJiLing-1.16+2-Windows-x64.msi` 和同名 `.sha256`，用 `Get-FileHash -Algorithm SHA256` 核对后运行 MSI。升级前先从通知区域退出旧版。若旧版使用自定义安装目录，请继续用 `INSTALLDIR` 指定原目录。从开始菜单打开搞机灵。主窗口优先使用本机 WebView2 Runtime，系统未提供该组件时使用 Microsoft Edge 应用窗口或系统浏览器。
+从发布页下载 `GaoJiLing-1.16+3-Windows-x64.msi` 和同名 `.sha256`，用 `Get-FileHash -Algorithm SHA256` 核对后运行 MSI。升级前先从通知区域退出旧版。若旧版使用自定义安装目录，请继续用 `INSTALLDIR` 指定原目录。从开始菜单打开搞机灵。主窗口优先使用本机 WebView2 Runtime，系统未提供该组件时使用独立的 Microsoft Edge 应用窗口或系统浏览器。
 
-关闭主窗口后继续采样。在 Windows 通知区域右键图标，可打开主窗口、设置或退出。在桌面唤起条上点击或短暂停留，或按 Ctrl+Alt+G（可改为 Ctrl+Alt+M）可打开浮层。拖动唤起条或浮层顶部的 CPU 区域可以移动位置。鼠标移出或点击外部可收起，也可按 Esc。Ctrl+, 打开设置，Ctrl+Shift+E 打开数据设置。全局快捷键冲突、通知投递和登录启动状态由 Windows 报告。
+关闭主窗口后，搞机灵在 Windows 通知区域保留一个图标，并继续采样和记录任务。单击图标或右键选择「打开 搞机灵」恢复主窗口。Windows 可能把图标放在通知区域的溢出菜单。
 
-构建 1 的卸载流程会移除旧登录快捷方式。如果之前开启了登录启动，升级后可在模块设置里核对 Windows 登记状态并重新开启。
+右键选择「退出」结束程序。正在录制任务时，可以选择结束并保存，或取消退出并继续记录。已有操作正在提交时，等操作完成再退出。退出后通知区域图标、全局快捷键、唤起条、浮窗及本机监控服务一并关闭。系统浏览器后备模式的标签页属于浏览器，应用只关闭本机服务。
+
+点击、悬停桌面唤起条，或按 Ctrl+Alt+G（可改为 Ctrl+Alt+M）可打开浮窗。拖动唤起条或浮窗顶部的 CPU 区域可以移动位置。鼠标移出、外部点击或按 Esc 可收起。Ctrl+, 打开设置，Ctrl+Shift+E 打开数据设置。全局快捷键冲突、通知投递和登录启动状态由 Windows 报告。
+
+旧 MSI 的卸载流程会移除旧登录快捷方式。如果之前开启了登录启动，升级后可在模块设置里核对 Windows 登记状态并重新开启。
 
 ## 工作区
 
@@ -51,9 +55,17 @@ Windows 通知由系统通知设置及专注模式决定是否显示。登录启
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Python <虚拟环境中的 python.exe>
 ```
 
-脚本运行测试并在 `windows/dist` 生成安装包和 SHA-256 文件。隔离冒烟用 `smoke-installed.ps1 -Package <MSI 路径> -Python <python.exe>`。传入 `-PreviousPackage <构建 1 的 MSI 路径>` 可核对 Windows Installer 从旧构建升级。冒烟校验原包摘要，使用独立的 MSI 标识与合成资料执行安装、运行和卸载。
+脚本运行测试并在 `windows/dist` 生成安装包和 SHA-256 文件。隔离冒烟用 `smoke-installed.ps1 -Package <MSI 路径> -Python <python.exe>`。传入 `-PreviousPackage <构建 2 的 MSI 路径>` 可核对 Windows Installer 从旧构建升级。冒烟校验原包摘要，使用独立的 MSI 标识与合成资料执行安装、运行和卸载。
+
+用 `<python.exe> smoke-desktop.py --exe <构建目录中的 GaoJiLing.exe>` 在独立的非活动 Windows 桌面验证通知区域回调、窗口和退出流程。用 `<python.exe> tests/smoke_tray_shell.py build/package/AppIcon.ico` 在运行 Explorer 的 Windows 会话验证实际的 Shell 图标登记、重新登记和移除。测试使用自己的隐藏窗口和图标，不修改通知区域偏好。
 
 运行 `GaoJiLing-cli.exe --version` 查看版本。用 `--inspect` 查看资料条数，或用 `--serve --no-browser --data-dir <隔离目录> --port <本机端口>` 进行独立调试。
+
+## 构建 3 验收
+
+- 通过 56 项 Windows 回归。在 Windows 11 用真实 Windows Installer 验证隔离的构建 2 到构建 3 升级。新版读回旧任务、主题、保留期、快捷键和浮窗位置，能写入新任务，卸载保留资料。
+- 在非活动桌面运行打包后的应用，通过 Windows 消息核对闭窗后的采样和记录、托盘选择和菜单恢复、第二次启动转发、浮窗热键、取消退出和保存退出。退出后进程、应用窗口和回环端口关闭，全局快捷键可以重新登记。命令行无桌面入口时不创建通知区域窗口。
+- 使用同一应用图标在真实 Shell 中验证登记、删除、重新登记和最终移除。在非活动桌面向实际应用发送 `TaskbarCreated`，核对消息路径。现场未重启 Explorer 或操作真实通知区域。独立窗口验收走 Edge 后备路径，原生 WebView2 和 Windows 10 实机未在本轮复测。
 
 ## 构建 2 验收
 

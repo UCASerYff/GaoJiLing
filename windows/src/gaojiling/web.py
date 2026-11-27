@@ -104,22 +104,25 @@ def serve(service, port: int = 0, open_browser: bool = False, token: str | None 
                     result = dispatch(service, method, path, payload)
                 elif path in {"/api/cancel", "/api/history"}:
                     result = dispatch(service, method, path, payload)
-                else:
-                    if not service._mutation_lock.acquire(blocking=False):
-                        raise AppError("另一个工作正在进行。")
+                elif path == "/api/shutdown":
+                    if service.desktop:
+                        service.desktop.request_quit()
+                        self._json(200, {"ok": True, "pending": True})
+                        return
+                    service.prepare_shutdown()
                     try:
-                        result = dispatch(service, method, path, payload)
+                        self._json(200, {"ok": True})
                     finally:
-                        service._mutation_lock.release()
+                        threading.Thread(target=holder["httpd"].shutdown, daemon=True).start()
+                    return
+                else:
+                    with service.mutation():
+                        result = dispatch(service, method, path, payload)
             except AppError as error:
                 self._json(400, {"error": error.message})
                 return
             except Exception as error:
                 self._json(500, {"error": str(error)})
-                return
-            if path == "/api/shutdown":
-                self._json(200, {"ok": True})
-                threading.Thread(target=holder["httpd"].shutdown, daemon=True).start()
                 return
             self._json(200, result if isinstance(result, dict) else {"result": result})
 
@@ -263,6 +266,4 @@ def dispatch(service, method, path, payload):
         if target:
             os.startfile(str(target))
             return {"ok": True}
-    if path == "/api/shutdown":
-        return {"ok": True}
     raise AppError("没有这个接口。")

@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import threading
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -9,7 +10,57 @@ from gaojiling.errors import AppError
 from gaojiling.service import Service
 from gaojiling.timeutil import now_unix
 from gaojiling.web import dispatch, serve
+from gaojiling.store import MonitorStore
 from test_windows_port import _manifest, _sample
+
+
+def test_cancel_exit_keeps_sampling_and_accepting_exit_finishes_the_same_task(tmp_path):
+    service = Service(tmp_path / "data", home=tmp_path, collector=object())
+    session = service.start_session("托盘退出测试")
+
+    def cancel(name):
+        assert name == session["name"]
+        with pytest.raises(AppError, match="工作正在进行"):
+            with service.mutation():
+                pytest.fail("an operation must not start during the confirmation")
+        service.sample_once(_sample(now_unix()))
+        return False
+
+    try:
+        assert not service.prepare_shutdown(cancel)
+        assert not service.stopping and service.active["id"] == session["id"]
+        assert service.active["sampleCount"] == 1
+        assert service.prepare_shutdown(lambda _name: True)
+        assert service.stopping and service.active is None
+        with pytest.raises(AppError, match="正在退出"):
+            with service.mutation():
+                pytest.fail("an operation must not start when stopping")
+    finally:
+        service.close()
+    reopened = MonitorStore(tmp_path / "data")
+    try:
+        saved = reopened.sessions()[0]
+        assert saved["id"] == session["id"] and saved["end"] and saved["interrupted"] is False
+    finally:
+        reopened.close()
+
+
+def test_exit_waits_for_existing_work_and_leaves_task_active_if_save_failed(tmp_path, monkeypatch):
+    service = Service(tmp_path, home=tmp_path, collector=object())
+    service.start_session("保存失败测试")
+
+    def fail(_):
+        raise sqlite3.OperationalError("fixture write failed")
+
+    try:
+        with service.job("cleanup"), pytest.raises(AppError, match="工作正在进行"):
+            service.prepare_shutdown()
+        monkeypatch.setattr(service.store, "save_session", fail)
+        with pytest.raises(AppError, match="任务未能保存"):
+            service.prepare_shutdown()
+        assert not service.stopping and service.active is not None
+    finally:
+        service.close()
 
 
 def test_history_task_and_export_through_http(tmp_path):

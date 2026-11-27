@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import os
 from pathlib import Path
 import tempfile
 from threading import Event
@@ -17,6 +16,7 @@ READY = "gaojiling-view-ready"
 PROCESS = "gaojiling-view-process"
 NAVIGATION = "gaojiling-view-tab"
 CLOSE = "gaojiling-view-close"
+CLOSING = "gaojiling-view-closing"
 
 
 def run(url: str, signals: Path, dark: bool) -> int:
@@ -45,6 +45,7 @@ def run(url: str, signals: Path, dark: bool) -> int:
     closed = Event()
     window.events.loaded += lambda: (signals / READY).touch()
     window.events.closed += closed.set
+    window.events.closing += lambda: (signals / CLOSING).touch()
 
     def check_commands():
         request = signals / NAVIGATION

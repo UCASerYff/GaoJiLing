@@ -92,7 +92,7 @@ def run_desktop(service, args, instance):
             try:
                 httpd.serve_forever()
             finally:
-                desktop.request_quit()
+                desktop.server_stopped()
 
         server = threading.Thread(target=run_server, name="gaojiling-local-web", daemon=True)
         server.start()

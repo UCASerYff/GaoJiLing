@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -103,3 +104,35 @@ def test_floating_footer_requires_same_enabled_button_at_150_percent():
     panel._footer_press(event(pause))
     panel._footer_release(event(pause))
     assert actions == ["open"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 notification area")
+def test_tray_reuses_its_id_after_taskbar_created_and_deletes_once(monkeypatch):
+    import ctypes
+
+    from gaojiling import win32 as win
+
+    calls = []
+    replies = iter([True, True, False, True, True, False, True, True, True])
+    monkeypatch.setattr(win, "new_icon", lambda path: (42, True))
+    destroyed = []
+    monkeypatch.setattr(win, "destroy_icon", destroyed.append)
+
+    def notify(command, pointer):
+        data = ctypes.cast(pointer, ctypes.POINTER(win.NotifyData)).contents
+        calls.append((command, data.hwnd, data.id))
+        return next(replies)
+
+    monkeypatch.setattr(win, "notify_icon", notify)
+    tray = win.Tray(23, None)
+    assert tray.available and tray.version4
+    assert tray.register()
+    tray.tooltip("fixture")
+    assert not tray.available and not tray.version4
+    assert tray.register()
+    tray.close()
+    tray.close()
+    assert not tray.register()
+    assert [action for action, _, _ in calls] == [0, 4, 0, 1, 4, 1, 0, 4, 2]
+    assert {(hwnd, icon_id) for _, hwnd, icon_id in calls} == {(23, win.NOTIFY_ID)}
+    assert destroyed == [42]

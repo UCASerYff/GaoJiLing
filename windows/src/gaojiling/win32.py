@@ -104,6 +104,8 @@ window_text = _api(user, "GetWindowTextW", c.c_int, w.HWND, w.LPWSTR, c.c_int)
 window_pid = _api(user, "GetWindowThreadProcessId", w.DWORD, w.HWND, c.POINTER(w.DWORD))
 window_visible = _api(user, "IsWindowVisible", w.BOOL, w.HWND)
 set_foreground = _api(user, "SetForegroundWindow", w.BOOL, w.HWND)
+allow_foreground = _api(user, "AllowSetForegroundWindow", w.BOOL, w.DWORD)
+message_box = _api(user, "MessageBoxW", c.c_int, w.HWND, w.LPCWSTR, w.LPCWSTR, w.UINT)
 monitor_nearest = _api(user, "MonitorFromPoint", w.HANDLE, w.POINT, w.DWORD)
 get_monitor = _api(user, "GetMonitorInfoW", w.BOOL, w.HANDLE, c.POINTER(MonitorInfo))
 get_dpi = _api(shcore, "GetDpiForMonitor", w.LONG, w.HANDLE, c.c_int, c.POINTER(w.UINT), c.POINTER(w.UINT))
@@ -226,6 +228,7 @@ class Tray:
         self.icon, self.owns_icon = new_icon(icon)
         self.available = False
         self.version4 = False
+        self.closed = False
         self.tip = "搞机灵"
         self.register()
 
@@ -233,23 +236,31 @@ class Tray:
         return NotifyData(size=c.sizeof(NotifyData), hwnd=self.hwnd, id=NOTIFY_ID)
 
     def register(self):
+        if self.closed:
+            return False
         data = self._data()
         data.flags = 1 | 2 | 4 | 0x80
         data.message = WM_TRAY
         data.icon = self.icon
         data.tip = self.tip[:100]
-        self.available = bool(notify_icon(0, c.byref(data)))
+        # The taskbar message is also sent for DPI changes, when this ID can still exist.
+        self.available = bool(notify_icon(0, c.byref(data)) or notify_icon(1, c.byref(data)))
+        self.version4 = False
         if self.available:
             data.version = 4
             self.version4 = bool(notify_icon(4, c.byref(data)))
+        return self.available
 
     def tooltip(self, tip):
         if tip != self.tip:
             self.tip = tip
+            if not self.available:
+                return
             data = self._data()
             data.flags = 4 | 0x80
             data.tip = tip[:100]
-            notify_icon(1, c.byref(data))
+            if not notify_icon(1, c.byref(data)):
+                self.available = self.version4 = False
 
     def notify(self, title, detail):
         data = self._data()
@@ -266,6 +277,10 @@ class Tray:
         return notify_rect(c.byref(identifier), c.byref(rect)) == 0 and rect.left <= x < rect.right and rect.top <= y < rect.bottom
 
     def close(self):
+        if self.closed:
+            return
+        self.closed = True
         notify_icon(2, c.byref(self._data()))
+        self.available = self.version4 = False
         if self.owns_icon:
             destroy_icon(self.icon)

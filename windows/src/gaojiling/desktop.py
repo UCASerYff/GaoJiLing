@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from collections import deque
 import ctypes as c
+from dataclasses import dataclass
 import hashlib
 import math
 import os
 from pathlib import Path
 from queue import Empty, SimpleQueue
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -21,12 +21,13 @@ from urllib.parse import urlencode
 import webbrowser
 
 from gaojiling.errors import AppError
-from gaojiling.appwindow import CLOSE, NAVIGATION, PROCESS, READY
+from gaojiling.appwindow import CLOSE, CLOSING, NAVIGATION, PROCESS, READY
 from gaojiling.floating import (FOOTER_HEIGHT, PALETTES, PANEL_RADIUS, WIDTH, PanelContent,
                                byte_size, content_height, percent, rounded_contains)
 from gaojiling.geometry import (DRAG_THRESHOLD, PANEL_INSET, SNAP_DISTANCE, PanelAutoCollapse,
                               dragging_handle, handle_frame, horizontal_ratio, panel_placement, vertical_ratio)
 from gaojiling.resources import asset_root
+from gaojiling.ownedview import OwnedView
 from gaojiling.version import MARKETING
 from gaojiling import win32 as win
 
@@ -34,6 +35,7 @@ from gaojiling import win32 as win
 _WINDOW_CLASS = "GaoJiLing.Desktop"
 _ACTIVATE_MESSAGE = win.register_message("com.gaoseries.GaoJiLing.Activate")
 _EXPLORER_RESTART = win.register_message("TaskbarCreated")
+_TRAY_OPEN, _TRAY_PANEL, _TRAY_PAUSE, _TRAY_SETTINGS, _TRAY_DATA, _TRAY_ABOUT, _TRAY_QUIT = range(1, 8)
 _TABS = {"module", "appearance", "data", "about"}
 _PICK_OPTIONS = {
     "directory": ("directory", "选择目录", None),
@@ -62,8 +64,13 @@ class DesktopInstance:
     def activate(self):
         for _ in range(80):
             hwnd = win.find_window(_WINDOW_CLASS, self.name)
-            if hwnd and win.post_message(hwnd, _ACTIVATE_MESSAGE, 0, 0):
-                return True
+            if hwnd:
+                owner = win.w.DWORD()
+                win.window_pid(hwnd, c.byref(owner))
+                if owner.value:
+                    win.allow_foreground(owner.value)
+                if win.post_message(hwnd, _ACTIVATE_MESSAGE, 0, 0):
+                    return True
             time.sleep(0.1)
         return False
 
@@ -148,12 +155,28 @@ def _edge_program():
     return None
 
 
-def _view_handle(process, signals, key):
+@dataclass
+class _View:
+    process: OwnedView
+    signals: Path
+    target: str
+    deadline: float
+    backend: str
+    ready: bool = False
+    closing: float | None = None
+    reopen: tuple[str, str] | None = None
+
+
+def _view_handle(view, key):
+    if view.backend == "edge-app":
+        return view.process.edge_window()
     try:
-        pid = int((signals / PROCESS).read_text(encoding="ascii"))
+        pid = int((view.signals / PROCESS).read_text(encoding="ascii"))
     except (OSError, ValueError):
-        pid = process.pid
-    return win.find_view(pid, "搞机灵设置" if key == "settings" else f"搞机灵 V{MARKETING}")
+        return None
+    if view.process.owns(pid):
+        return win.find_view(pid, "搞机灵设置" if key == "settings" else f"搞机灵 V{MARKETING}")
+    return None
 
 
 class Desktop:
@@ -169,6 +192,7 @@ class Desktop:
         self.shortcut = None
         self.notification_status = {"state": "ready", "reason": None}
         self.stopping = False
+        self.quitting = False
         self.panel_open = False
         self.bridge = None
         self.strip_rect = self.panel_rect = None
@@ -177,7 +201,8 @@ class Desktop:
         self.strip_hovered_since = None
         self.reenter_required = False
         self.esc_down = False
-        self.tray_click_collapsed = 0.0
+        self.next_tray_retry = 0.0
+        self.last_tray_click = (0, 0.0)
         self.last_appearance_check = 0.0
         self.last_shell_refresh = 0.0
         self.last_sample_stamp = None
@@ -291,22 +316,35 @@ class Desktop:
         raise AppError("文件对话框未返回结果。")
 
     def _window_message(self, hwnd, message, wparam, lparam):
-        if message == win.WM_HOTKEY:
+        if message == win.WM_HOTKEY and wparam == 1:
             self.commands.put(self._toggle_panel)
             return 0
         if message == win.WM_TRAY:
             event = lparam & 0xFFFF
-            if event in (win.NIN_SELECT, win.NIN_KEYSELECT) or (event == win.WM_LBUTTONUP and not self.tray.version4):
-                if time.monotonic() - self.tray_click_collapsed >= 0.6:
-                    self.commands.put(self._toggle_panel)
-            elif event in (win.WM_CONTEXTMENU, win.WM_RBUTTONUP):
+            modern = self.tray.version4
+            identifier = (lparam >> 16) & 0xFFFF if modern else wparam
+            if identifier != win.NOTIFY_ID:
+                return 0
+            if event in (win.WM_LBUTTONUP, win.NIN_SELECT):
+                previous, last = self.last_tray_click
+                now = time.monotonic()
+                self.last_tray_click = (event, now)
+                # Some Shell versions send both forms for one mouse click.
+                if event == previous or now - last > 0.2:
+                    self.commands.put(self._show_main)
+            elif modern and event == win.NIN_KEYSELECT:
+                self.commands.put(self._show_main)
+            elif event == (win.WM_CONTEXTMENU if modern else win.WM_RBUTTONUP):
                 self.commands.put(self._tray_menu)
+            return 0
+        if message == win.WM_COMMAND and not lparam and _TRAY_OPEN <= (wparam & 0xFFFF) <= _TRAY_QUIT:
+            self.commands.put(lambda: self._tray_command(wparam & 0xFFFF))
             return 0
         if message == _ACTIVATE_MESSAGE:
             self.commands.put(self._show_main)
             return 0
         if message == _EXPLORER_RESTART:
-            self.commands.put(self.tray.register)
+            self.commands.put(self._register_tray)
             return 0
         if message in (0x7E, 0x219):  # display topology and work area
             self.commands.put(self._display_changed)
@@ -335,94 +373,139 @@ class Desktop:
                 continue
             if down:
                 if self.collapse.mouse_down(button, self._inside_panel(point)):
-                    if button == 0 and self.tray.contains(*point):
-                        self.tray_click_collapsed = time.monotonic()
                     self._close_panel()
             else:
                 self.collapse.mouse_up(button)
 
     def _tray_menu(self):
-        entries = (("打开搞机灵", self._show_main), ("显示 / 收起面板", self._toggle_panel),
-                   ("继续监控" if self.service.paused else "暂停监控", self._pause),
-                   (None, None), ("设置…", self.open_settings), ("导出数据…", lambda: self.open_settings("data")),
-                   ("关于搞机灵…", lambda: self.open_settings("about")), (None, None), ("退出搞机灵", self.root.quit))
+        entries = ((_TRAY_OPEN, "打开 搞机灵"), (_TRAY_PANEL, "显示 / 收起面板"),
+                   (_TRAY_PAUSE, "继续监控" if self.service.paused else "暂停监控"),
+                   (0, None), (_TRAY_SETTINGS, "设置…"), (_TRAY_DATA, "导出数据…"),
+                   (_TRAY_ABOUT, "关于搞机灵…"), (0, None), (_TRAY_QUIT, "退出"))
         menu = win.create_menu()
         if not menu:
             return
-        for index, (label, _) in enumerate(entries, 1):
-            win.append_menu(menu, 0 if label else 0x800, index, label)
+        for identifier, label in entries:
+            win.append_menu(menu, 0 if label else 0x800, identifier, label)
         try:
             win.set_foreground(self.hwnd)
-            command = win.track_menu(menu, 0x102, *win.cursor(), 0, self.hwnd, None)
-            if 0 < command <= len(entries):
-                function = entries[command - 1][1]
-                if function:
-                    function()
+            win.track_menu(menu, 0x2, *win.cursor(), 0, self.hwnd, None)
             win.post_message(self.hwnd, 0, 0, 0)
         finally:
             win.destroy_menu(menu)
 
+    def _tray_command(self, identifier):
+        actions = {
+            _TRAY_OPEN: self._show_main, _TRAY_PANEL: self._toggle_panel, _TRAY_PAUSE: self._pause,
+            _TRAY_SETTINGS: self.open_settings, _TRAY_DATA: lambda: self.open_settings("data"),
+            _TRAY_ABOUT: lambda: self.open_settings("about"), _TRAY_QUIT: self._quit_from_ui,
+        }
+        actions[identifier]()
+
+    def _register_tray(self):
+        self.next_tray_retry = time.monotonic() + 2
+        if self.tray.register():
+            if self.notification_status["state"] == "unavailable":
+                self.notification_status = {"state": "ready", "reason": None}
+        else:
+            self.notification_status = {"state": "unavailable", "reason": "Windows 暂未接受通知区域图标登记。"}
+
     def _open_view(self, tab=None):
+        if self.stopping:
+            return
         target = self.url if tab is None else self.url + "?" + urlencode({"settings": 1, "tab": tab})
         key = "settings" if tab else "main"
         current = self.views.get(key)
-        if current and current[0].poll() is None:
-            if tab:
-                navigation = current[1] / NAVIGATION
+        if current and current.process.is_running():
+            hwnd = _view_handle(current, key)
+            if (current.closing is not None or (current.signals / CLOSING).is_file()
+                    or ((current.ready or (current.signals / READY).is_file()) and not hwnd)
+                    or (current.backend == "edge-app" and current.target != target)):
+                backend = current.reopen[1] if current.reopen else current.backend
+                current.reopen = (target, backend)
+                self._dismiss_view(key, current)
+                return
+            if tab and current.backend == "webview2":
+                navigation = current.signals / NAVIGATION
                 temporary = navigation.with_suffix(".pending")
                 temporary.write_text(tab, encoding="ascii")
                 temporary.replace(navigation)
-            hwnd = _view_handle(current[0], current[1], key)
+                current.target = target
             if hwnd:
                 if win.is_iconic(hwnd):
                     win.show_window(hwnd, 9)
                 win.set_foreground(hwnd)
             return
         if current:
-            shutil.rmtree(current[1], ignore_errors=True)
-            del self.views[key]
+            self._drop_view(key, current)
+        self._launch_view(key, target, self.view_backend)
+
+    def _launch_view(self, key, target, backend):
+        if backend == "browser" or (backend == "edge-app" and not self.backend):
+            self.view_backend = "browser"
+            webbrowser.open(target)
+            return
         signals = None
         try:
             self.profile.mkdir(parents=True, exist_ok=True)
             signals = Path(tempfile.mkdtemp(dir=self.profile, prefix="window-"))
-            launcher = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, str(Path(sys.argv[0]).resolve())]
-            process = subprocess.Popen([*launcher, "--app-window", target, str(signals), self.theme],
-                                       env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"})
-        except OSError:
+            if backend == "webview2":
+                launcher = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, str(Path(sys.argv[0]).resolve())]
+                process = OwnedView([*launcher, "--app-window", target, str(signals), self.theme],
+                                    env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"})
+            else:
+                size = "1100,780" if key == "main" else "760,740"
+                process = OwnedView([str(self.backend), f"--app={target}", f"--user-data-dir={signals / 'EdgeApp'}",
+                                     f"--window-size={size}", "--no-first-run", "--disable-sync", "--disable-background-mode"])
+        except OSError as error:
             if signals:
                 shutil.rmtree(signals, ignore_errors=True)
-            self._fallback_view(target, tab)
+            self.service.message = f"Windows 无法打开独立窗口：{error}"
+            self._fallback_view(key, target, backend)
             return
-        self.views[key] = (process, signals, time.monotonic() + 25, target)
+        self.view_backend = backend
+        self.views[key] = _View(process, signals, target, time.monotonic() + 25, backend)
 
     def _poll_views(self, now):
-        for key, (process, signals, deadline, target) in list(self.views.items()):
-            status = process.poll()
-            if status is None and ((signals / READY).is_file() or now < deadline):
-                continue
-            if status is None:
-                (signals / CLOSE).touch()
-                hwnd = _view_handle(process, signals, key)
-                if hwnd:
-                    win.post_message(hwnd, 0x10, 0, 0)
-            if not (signals / READY).is_file():
-                self._fallback_view(target, key == "settings")
-            if status is not None:
-                shutil.rmtree(signals, ignore_errors=True)
-            del self.views[key]
+        for key, view in list(self.views.items()):
+            running = view.process.is_running()
+            closing = (view.signals / CLOSING).is_file()
+            if view.closing is None:
+                hwnd = _view_handle(view, key) if running else None
+                view.ready = view.ready or (view.signals / READY).is_file() or bool(view.backend == "edge-app" and hwnd)
+                if closing or (view.ready and not hwnd):
+                    self._dismiss_view(key, view)
+                elif not view.ready and (not running or now >= view.deadline):
+                    view.reopen = (view.target, self._next_view_backend(view.backend))
+                    self._dismiss_view(key, view)
+            if not running or (view.closing is not None and now >= view.closing):
+                self._drop_view(key, view)
+                if view.reopen:
+                    self._launch_view(key, *view.reopen)
 
-    def _fallback_view(self, target, tab):
-        self.view_backend = "edge-app" if self.backend else "browser"
-        if not self.backend:
-            webbrowser.open(target)
+    def _next_view_backend(self, backend):
+        return "edge-app" if backend == "webview2" and self.backend else "browser"
+
+    def _fallback_view(self, key, target, backend):
+        self._launch_view(key, target, self._next_view_backend(backend))
+
+    def _dismiss_view(self, key, view):
+        if view.closing is not None:
             return
-        try:
-            size = "1100,780" if tab is None else "760,740"
-            subprocess.Popen([str(self.backend), f"--app={target}", f"--user-data-dir={self.profile / 'EdgeApp'}",
-                              f"--window-size={size}", "--no-first-run", "--disable-sync", "--disable-background-mode"])
-        except OSError as error:
-            self.service.message = f"Windows 无法打开独立窗口：{error}"
-            webbrowser.open(target)
+        view.closing = time.monotonic() + 4
+        if view.backend == "webview2":
+            try:
+                (view.signals / CLOSE).touch()
+            except OSError:
+                pass
+        hwnd = _view_handle(view, key)
+        if hwnd:
+            win.post_message(hwnd, 0x10, 0, 0)  # WM_CLOSE
+
+    def _drop_view(self, key, view):
+        view.process.close()
+        shutil.rmtree(view.signals, ignore_errors=True)
+        del self.views[key]
 
     def _show_main(self):
         self._close_panel()
@@ -649,7 +732,9 @@ class Desktop:
             cpu = f" · CPU {percent(sample.get('cpuPercent'))}" if self.settings.get("menuBarCPU") else ""
             paused = " · 暂停" if self.service.paused else ""
             memory = f" · 内存 {byte_size(sample.get('memoryUsed'))}"
-            self.tray.tooltip("搞机灵" + paused + cpu + memory + "\n单击打开面板，右键更多选项")
+            self.tray.tooltip("搞机灵" + paused + cpu + memory + "\n单击打开主窗口，右键更多选项")
+            if not self.tray.available and now >= self.next_tray_retry:
+                self._register_tray()
             self._poll_views(now)
             self.last_shell_refresh = now
         if self.last_edge != self.settings["edge"]:
@@ -665,7 +750,8 @@ class Desktop:
             self._tick_desktop()
         except (AppError, OSError, tk.TclError) as error:
             self.service.message = f"桌面监控操作失败：{error}"
-        self.root.after(33, self._tick)
+        if not self.stopping:
+            self.root.after(33, self._tick)
 
     def _tick_desktop(self):
         for _ in range(20):
@@ -674,6 +760,8 @@ class Desktop:
             except Empty:
                 break
             command()
+            if self.stopping:
+                return
         self._process_mouse()
         now, point = time.monotonic(), win.cursor()
         self._refresh_shell(now)
@@ -722,34 +810,60 @@ class Desktop:
             self.root.mainloop()
         finally:
             self.stopping = True
-            self._close_panel()
-            self._close_views()
-            if self.shortcut_registered:
-                win.unregister_hotkey(self.hwnd, 1)
-            self.tray.close()
-            win.destroy_window(self.hwnd)
-            win.unregister_class(_WINDOW_CLASS, self.module)
-            self.root.destroy()
+            try:
+                self._close_panel()
+                win.show_window(self.strip_hwnd, win.SW_HIDE)
+                if self.shortcut_registered:
+                    win.unregister_hotkey(self.hwnd, 1)
+                    self.shortcut_registered = False
+                self._close_views()
+            finally:
+                self.tray.close()
+                win.destroy_window(self.hwnd)
+                win.unregister_class(_WINDOW_CLASS, self.module)
+                self.root.destroy()
 
     def _close_views(self):
-        for key, (process, signals, _, _) in self.views.items():
-            (signals / CLOSE).touch()
-            hwnd = _view_handle(process, signals, key)
-            if hwnd:
-                win.post_message(hwnd, 0x10, 0, 0)
-        deadline = time.monotonic() + 12
-        for process, signals, _, _ in self.views.values():
-            try:
-                process.wait(timeout=max(0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                continue
-            shutil.rmtree(signals, ignore_errors=True)
+        try:
+            for key, view in self.views.items():
+                self._dismiss_view(key, view)
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline and any(view.process.is_running() for view in self.views.values()):
+                time.sleep(0.05)
+        except OSError:
+            # Losing the ability to query a job must not skip the rest of desktop teardown.
+            pass
+        finally:
+            for key, view in list(self.views.items()):
+                self._drop_view(key, view)
+
+    def _quit_from_ui(self):
+        if self.stopping or self.quitting:
+            return
+        self.quitting = True
+        try:
+            if self.service.prepare_shutdown(self._confirm_active_task):
+                self.stopping = True
+                self.root.quit()
+        except AppError as error:
+            self.service.message = str(error)
+            win.message_box(self.hwnd, str(error), "退出搞机灵", 0x30)
+        finally:
+            self.quitting = False
+
+    def _confirm_active_task(self, name):
+        return win.message_box(
+            self.hwnd,
+            f"「{name}」正在记录。退出会结束并保存当前任务。\n\n选择取消可继续记录。",
+            "退出搞机灵", 0x121,  # OK / Cancel, question icon, Cancel by default.
+        ) == 1
 
     def request_quit(self):
+        self.commands.put(self._quit_from_ui)
+
+    def server_stopped(self):
         self.commands.put(self.root.quit)
 
 
 def report_error(message):
-    ctypes_message_box = win.user.MessageBoxW
-    ctypes_message_box.argtypes = (win.w.HWND, win.w.LPCWSTR, win.w.LPCWSTR, win.w.UINT)
-    ctypes_message_box(None, str(message), "搞机灵", 0x10)
+    win.message_box(None, str(message), "搞机灵", 0x10)

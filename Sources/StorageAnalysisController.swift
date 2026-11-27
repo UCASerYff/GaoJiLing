@@ -195,11 +195,16 @@ private final class StorageAnalysisCancellation: @unchecked Sendable {
             }
             if let session = result.session {
                 for node in session.nodes.values.sorted(by: { $0.path < $1.path }) {
-                    lines.append(["目录树", node.name, node.category, node.path,
-                                  node.allocatedBytes.map(String.init) ?? "", String(node.fileCount), "仅分析", "", date,
-                                  node.complete ? "是" : "否", node.logicalBytes.map(String.init) ?? "",
-                                  node.device.map(String.init) ?? "", node.inode.map(String.init) ?? "",
-                                  node.skipReasons.joined(separator: "；")].map(csv).joined(separator: ","))
+                    let allocatedBytes: String = node.allocatedBytes.map { String($0) } ?? ""
+                    let logicalBytes: String = node.logicalBytes.map { String($0) } ?? ""
+                    let device: String = node.device.map { String($0) } ?? ""
+                    let inode: String = node.inode.map { String($0) } ?? ""
+                    let completeness: String = node.complete ? "是" : "否"
+                    let skipReasons: String = node.skipReasons.joined(separator: "；")
+                    let fields: [String] = ["目录树", node.name, node.category, node.path, allocatedBytes,
+                                            String(node.fileCount), "仅分析", "", date, completeness,
+                                            logicalBytes, device, inode, skipReasons]
+                    lines.append(fields.map(csv).joined(separator: ","))
                 }
             }
             for note in result.notes { lines.append(["跳过说明", note, "", "", "", "", "", "", date, result.complete ? "是" : "否", "", "", "", ""].map(csv).joined(separator: ",")) }

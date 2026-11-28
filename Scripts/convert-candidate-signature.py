@@ -56,10 +56,10 @@ def execute(args):
     before_macho = {name: row["sha256"] for name, row in signer.inventory(output).items() if name == "Contents/MacOS/GaoJiLing"}
     # This is the sole intentional resource text change, exactly pinned by the plan.
     usage = output / "Contents/Resources/使用说明.txt"
-    change = plan["postBuildChanges"]["使用说明.txt"]
-    if backup.file_digest(usage) != change["from"] or backup.file_digest(package.ROOT / "使用说明.txt") != change["to"]:
+    change = plan["postBuildChanges"]["README.md"]
+    if backup.file_digest(usage) != change["from"] or backup.file_digest(package.ROOT / "README.md") != change["to"]:
         raise RuntimeError("候选签名说明的旧/新字节不符；原候选未动")
-    package.run(["/bin/cp", str(package.ROOT / "使用说明.txt"), str(usage)])
+    package.run(["/bin/cp", str(package.ROOT / "README.md"), str(usage)])
     changed_tree = backup.tree_manifest(output, allow_links=True)
     if old_tree.keys() != changed_tree.keys() or any(old_tree[name] != changed_tree[name] for name in old_tree if name != "Contents/Resources/使用说明.txt"):
         raise RuntimeError("签名前出现说明文件以外的非预期变更")

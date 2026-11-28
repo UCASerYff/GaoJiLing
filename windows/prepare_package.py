@@ -40,6 +40,7 @@ def stage_icons(build: Path):
 
 def main(build: Path):
     stage_icons(build)
+    (build / "help.txt").write_bytes((ROOT / "README.md").read_bytes())
 
     major, minor = map(int, MARKETING.split("."))
     version = f"({major}, {minor}, {BUILD}, 0)"

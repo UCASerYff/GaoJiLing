@@ -39,8 +39,9 @@ $assetMapping = "{0};gaojiling_assets" -f $assetDir
 $pngMapping = "{0};gaojiling_assets" -f (Join-Path $build "AppIcon.png")
 $ico = Join-Path $build "AppIcon.ico"
 $icoMapping = "{0};gaojiling_assets" -f $ico
+$helpMapping = "{0};gaojiling_assets" -f (Join-Path $build "help.txt")
 $common = @('--noconfirm', '--clean', '--onefile', '--paths', 'src', '--add-data', $assetMapping,
-    '--add-data', $pngMapping, '--add-data', $icoMapping, '--icon', $ico, '--version-file',
+    '--add-data', $pngMapping, '--add-data', $icoMapping, '--add-data', $helpMapping, '--icon', $ico, '--version-file',
     (Join-Path $build "FileVersion.txt"), '--distpath', $programs)
 $guiWork = Join-Path $build "gui"
 $cliWork = Join-Path $build "cli"

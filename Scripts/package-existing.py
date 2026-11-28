@@ -55,7 +55,7 @@ def receipt_and_candidate(path, checksum, approved_changes=None):
     if not isinstance(hashes, dict) or not hashes or len(hashes) > 512:
         raise RuntimeError("原构建图缺失或超过预算")
     changes = approved_changes if approved_changes is not None else value.get("postBuildChanges", {})
-    if not isinstance(changes, dict) or set(changes) - {"Scripts/build.sh", "使用说明.txt"}:
+    if not isinstance(changes, dict) or set(changes) - {"Scripts/build.sh", "README.md"}:
         raise RuntimeError("未经明确绑定的构建后改动")
     if changes and approved_changes is None:
         parent = value.get("originalBuildReceipt")

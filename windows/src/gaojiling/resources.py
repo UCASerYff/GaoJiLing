@@ -1,13 +1,19 @@
 from pathlib import Path
+import sys
 
 from gaojiling.errors import AppError
 
 
 def asset_root() -> Path:
-    import sys
     if getattr(sys, "frozen", False):
         return Path(sys._MEIPASS) / "gaojiling_assets"
     return Path(__file__).resolve().parent / "assets"
+
+
+def guide_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return asset_root() / "help.txt"
+    return Path(__file__).resolve().parents[2] / "README.md"
 
 
 def read_asset(name: str) -> bytes:

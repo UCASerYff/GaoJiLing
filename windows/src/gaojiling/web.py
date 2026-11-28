@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from gaojiling.errors import AppError
-from gaojiling.resources import asset_root, read_asset
+from gaojiling.resources import guide_path, read_asset
 from gaojiling.version import display
 
 
@@ -63,7 +63,7 @@ def serve(service, port: int = 0, open_browser: bool = False, token: str | None 
                 self._bytes(200, read_asset("AppIcon.png"), "image/png")
                 return
             if parsed.path == "/help.txt":
-                self._bytes(200, read_asset("help.txt"), "text/plain; charset=utf-8")
+                self._bytes(200, guide_path().read_bytes(), "text/plain; charset=utf-8")
                 return
             if parsed.path.startswith("/api/"):
                 self._api("GET", parsed.path, b"")
@@ -263,7 +263,7 @@ def dispatch(service, method, path, payload):
             "/api/system/last-export": service.last_export.parent if service.last_export else None,
             "/api/system/task-manager": os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "Taskmgr.exe"),
             "/api/system/installed-apps": "ms-settings:appsfeatures",
-            "/api/system/guide": asset_root() / "help.txt",
+            "/api/system/guide": guide_path(),
         }.get(path)
         if target:
             os.startfile(str(target))

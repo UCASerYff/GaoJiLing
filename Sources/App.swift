@@ -243,8 +243,14 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     func windowDidMiniaturize(_ notification: Notification) { updateSamplingDemand() }
     func windowDidDeminiaturize(_ notification: Notification) { updateSamplingDemand() }
     func windowDidChangeOcclusionState(_ notification: Notification) { updateSamplingDemand() }
-    func applicationDidHide(_ notification: Notification) { updateSamplingDemand() }
-    func applicationDidUnhide(_ notification: Notification) { updateSamplingDemand() }
+    func applicationDidHide(_ notification: Notification) {
+        updateEdgeTimer()
+        updateSamplingDemand()
+    }
+    func applicationDidUnhide(_ notification: Notification) {
+        updateEdgeTimer()
+        updateSamplingDemand()
+    }
     private var dataOperationsBusy: Bool {
         store?.dataBusy == true || cleanup?.isBusy == true || analysis?.isBusy == true || diskStorage?.isBusy == true
             || duplicates?.isBusy == true || manager?.isBusy == true || exchange?.isBusy == true
@@ -505,7 +511,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         edgeHandle = handle
     }
     @objc func togglePanel() {
-        guard !pendingTermination, let panel else { return }
+        guard !pendingTermination, !sleeping, let panel else { return }
         if panel.isVisible { hidePanel() }
         else if let screen = currentScreen() {
             showPanel(on: screen, manual: true, anchor: edgeHandle?.anchor(on: screen))
@@ -614,7 +620,8 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         suppressEdgeUntil = Date().addingTimeInterval(0.8); edgeHandle?.setExpanded(false)
     }
     private func updateEdgeTimer() {
-        guard !sleeping, store.settings.edgeEnabled || panel?.isVisible == true else {
+        let panelVisible = panel?.isVisible == true && !NSApp.isHidden
+        guard !sleeping, store.settings.edgeEnabled || panelVisible else {
             edgeTimer?.invalidate()
             edgeTimer = nil
             return

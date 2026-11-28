@@ -2,8 +2,8 @@
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MODE="${1:-}"
-if (( $# > 1 )) || [[ -n "$MODE" && "$MODE" != --session-comparison ]]; then
-  print -u2 '使用 test.sh 或 test.sh --session-comparison'
+if (( $# > 1 )) || [[ -n "$MODE" && "$MODE" != --session-comparison && "$MODE" != --network-diagnostics ]]; then
+  print -u2 '使用 test.sh、test.sh --session-comparison 或 test.sh --network-diagnostics'
   exit 1
 fi
 TEST_TEMP="$(python3 -c 'import tempfile; print(tempfile.mkdtemp(prefix="gaojiling-tests-", suffix=".noindex", dir="/private/tmp"))')"
@@ -57,6 +57,17 @@ run_store_test() {
   ((++TEST_SUITES))
 }
 
+run_network_test() {
+  "${SWIFT[@]}" Sources/Models.swift Sources/NetworkDiagnostics.swift Tests/NetworkDiagnosticsTests.swift -o "$TEST_TEMP/NetworkDiagnosticsTests"
+  python3 Tests/network-diagnostics-fixture.py "$TEST_TEMP/NetworkDiagnosticsTests"
+  ((++TEST_SUITES))
+}
+
+if [[ "$MODE" == --network-diagnostics ]]; then
+  run_network_test
+  exit 0
+fi
+
 python3 Tests/VersionTests.py
 ((++TEST_SUITES))
 if [[ "$MODE" == --session-comparison ]]; then
@@ -104,6 +115,7 @@ run_swift_test DuplicateAnalysisControllerTests "${DUPLICATES[@]}" Sources/Unins
 run_store_test StoreTests
 run_store_test SessionComparisonTests
 run_swift_test ExportTests Sources/Models.swift Sources/DataExport.swift
+run_network_test
 
 run_swift_test UninstallEngineTests "${UNINSTALL[@]}" -framework AppKit
 # This test supplies its own native process symbol. Do not link NativeMetrics.o.

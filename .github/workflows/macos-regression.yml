@@ -1,0 +1,46 @@
+name: macOS regression
+on:
+  push:
+    branches: [codex/macos-regression-20261128-41b2364cee]
+permissions:
+  contents: read
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+jobs:
+  production-compile:
+    name: ARM64 release-equivalent compile and bundle validation
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Confirm the native toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          test -x "$DEVELOPER_DIR/usr/bin/xcodebuild"
+          xcodebuild -version
+      - name: Compile, link and validate the temporary app bundle
+        shell: bash
+        run: /bin/zsh Scripts/build.sh --verify-only
+
+  safe-native-tests:
+    name: Full isolated macOS regression
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Confirm the native toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          test -x "$DEVELOPER_DIR/usr/bin/xcodebuild"
+          xcodebuild -version
+      - name: Run the version, native and synthetic tests
+        shell: bash
+        run: /bin/zsh Scripts/test.sh

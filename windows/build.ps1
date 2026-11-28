@@ -36,7 +36,7 @@ New-Item -ItemType Directory -Path $build,$dist,$programs -Force | Out-Null
 Invoke-Python .\prepare_package.py $build
 $assetDir = Join-Path $PSScriptRoot "src\gaojiling\assets"
 $assetMapping = "{0};gaojiling_assets" -f $assetDir
-$pngMapping = "{0};gaojiling_assets" -f (Join-Path (Split-Path $PSScriptRoot -Parent) "Assets\AppIcon.png")
+$pngMapping = "{0};gaojiling_assets" -f (Join-Path $build "AppIcon.png")
 $ico = Join-Path $build "AppIcon.ico"
 $icoMapping = "{0};gaojiling_assets" -f $ico
 $common = @('--noconfirm', '--clean', '--onefile', '--paths', 'src', '--add-data', $assetMapping,

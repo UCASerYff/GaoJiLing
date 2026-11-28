@@ -1,4 +1,4 @@
-"""Reuse the project's app icon and stage version metadata and redistribution notices."""
+"""Stage Windows icon resources, version metadata, and redistribution notices."""
 
 from importlib import metadata
 from pathlib import Path
@@ -17,9 +17,29 @@ from gaojiling.version import BUILD, MARKETING, display
 ICON_SIZES = (16, 20, 24, 25, 28, 30, 32, 35, 36, 40, 42, 48, 56, 60, 64, 72, 84, 96, 128, 256)
 
 
-def main(build: Path):
+def stage_icons(build: Path):
     with Image.open(ROOT.parent / "Assets" / "AppIcon.png") as image:
-        image.convert("RGBA").save(build / "AppIcon.ico", sizes=[(size, size) for size in ICON_SIZES])
+        original = image.convert("RGBA")
+    # The shared artwork includes transparent space for macOS. Crop to its
+    # visible plate on Windows and retain the original corners and lettering.
+    plate = original.getchannel("A").point(lambda alpha: 255 if alpha >= 128 else 0).getbbox()
+    if plate is None:
+        raise ValueError("The source icon has no visible plate")
+    brand = original.crop(plate)
+    brand.save(build / "AppIcon.png")
+    sizes = [(size, size) for size in ICON_SIZES]
+    remove_halo = [0] * 4 + list(range(4, 256))
+    frames = []
+    for size in sizes:
+        frame = brand.resize(size, Image.Resampling.LANCZOS)
+        # Suppress faint resampling halos in the transparent corners.
+        frame.putalpha(frame.getchannel("A").point(remove_halo))
+        frames.append(frame)
+    brand.save(build / "AppIcon.ico", sizes=sizes, append_images=frames)
+
+
+def main(build: Path):
+    stage_icons(build)
 
     major, minor = map(int, MARKETING.split("."))
     version = f"({major}, {minor}, {BUILD}, 0)"

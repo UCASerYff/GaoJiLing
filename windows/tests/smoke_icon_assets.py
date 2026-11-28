@@ -128,6 +128,20 @@ def verify_device_sizes(icon_path, frames):
               f" and large {large[0]}x{large[1]} package frames.")
 
 
+def verify_plate(frame):
+    width, height = frame.size
+    alpha = frame.getchannel("A")
+    assert alpha.getextrema() == (0, 255)
+    assert all(alpha.getpixel(corner) == 0 for corner in
+               ((0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1)))
+    left, top, right, bottom = alpha.point(lambda value: 255 if value >= 128 else 0).getbbox()
+    assert right - left >= width * .96 and bottom - top >= height * .96
+    assert abs(left + right - width) <= 2 and abs(top + bottom - height) <= 2
+    if width == 48:
+        coverage = sum(alpha.histogram()[128:]) / (width * height)
+        assert .95 <= coverage <= .98, f"Unexpected 48 px plate coverage: {coverage:.2%}"
+
+
 def bundled_asset(path, name):
     archive = CArchiveReader(str(path))
     entries = [entry for entry in archive.toc if entry.replace("\\", "/") == "gaojiling_assets/" + name]
@@ -147,15 +161,19 @@ def main():
         assert image.format == "ICO" and image.info["sizes"] == frames.keys()
         for size in frames:
             frame = image.ico.getimage(size).convert("RGBA")
-            assert frame.size == size and frame.getchannel("A").getextrema() == (0, 255)
-    original = (_WINDOWS.parent / "Assets" / "AppIcon.png").read_bytes()
+            assert frame.size == size
+            verify_plate(frame)
+    brand_path = icon.with_suffix(".png")
+    with Image.open(brand_path) as brand:
+        verify_plate(brand.convert("RGBA"))
     contents = icon.read_bytes()
+    brand_contents = brand_path.read_bytes()
     for item in args.executable:
         path = item.resolve(strict=True)
         assert executable_frames(path) == frames, f"PE icon differs in {path.name}"
         assert bundled_asset(path, "AppIcon.ico") == contents, f"Runtime icon differs in {path.name}"
-        assert bundled_asset(path, "AppIcon.png") == original, f"Brand PNG differs in {path.name}"
-        print(f"{path.name}: {len(frames)} PE frames and bundled ICO match output; original brand PNG matches.")
+        assert bundled_asset(path, "AppIcon.png") == brand_contents, f"Brand PNG differs in {path.name}"
+        print(f"{path.name}: {len(frames)} exact PE and bundled ICO frames; bundled Windows brand PNG matches.")
     verify_device_sizes(icon, frames)
     print("DPI-specific Win32 API requests used; the physical display setting did not change.")
 

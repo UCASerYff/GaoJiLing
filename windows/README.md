@@ -1,10 +1,12 @@
 # 搞机灵 V1.16 for Windows
 
-面向 Windows 10/11 x64。桌面窗口显示 V1.16，关于页显示构建 6，命令行显示 1.16+6。使用按用户安装的 x64 MSI，无需管理员权限。安装包未进行 Authenticode 签名。
+面向 Windows 10/11 x64。桌面窗口显示 V1.16，关于页显示构建 7，命令行显示 1.16+7。使用按用户安装的 x64 MSI，无需管理员权限。安装包未进行 Authenticode 签名。
 
 ## 安装与运行
 
-从发布页下载 `GaoJiLing-1.16+6-Windows-x64.msi` 和同名 `.sha256`，用 `Get-FileHash -Algorithm SHA256` 核对后运行 MSI。升级前先从通知区域退出旧版。若旧版使用自定义安装目录，请继续用 `INSTALLDIR` 指定原目录。从开始菜单打开搞机灵。主窗口优先使用本机 WebView2 Runtime，系统未提供该组件时使用独立的 Microsoft Edge 应用窗口或系统浏览器。
+从发布页下载 `GaoJiLing-1.16+7-Windows-x64.msi` 和同名 `.sha256`，用 `Get-FileHash -Algorithm SHA256` 核对后运行 MSI。升级前先从通知区域退出旧版。若旧版使用自定义安装目录，请继续用 `INSTALLDIR` 指定原目录。从开始菜单打开搞机灵。主窗口优先使用本机 WebView2 Runtime，系统未提供该组件时使用独立的 Microsoft Edge 应用窗口或系统浏览器。
+
+构建 7 从高清书法原图裁去 Windows 图标底板外的透明留边，保留原有字迹、黑色底板和透明圆角。桌面所用的 48、60、72、84 和 96 像素帧独立生成，主窗口、托盘和安装快捷方式采用同一批资源。
 
 构建 6 从 Windows 路由表确认默认 IPv4 网关。遇到同优先级的不同网关或没有明确下一跳的路由时显示不可用。HTTPS 探测报告输入主机的首次响应，收到重定向时保留该状态码并结束。
 
@@ -65,7 +67,7 @@ Windows 通知由系统通知设置及专注模式决定是否显示。登录启
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Python <虚拟环境中的 python.exe>
 ```
 
-脚本运行测试并在 `windows/dist` 生成安装包和 SHA-256 文件。隔离冒烟用 `smoke-installed.ps1 -Package <MSI 路径> -Python <python.exe>`。传入 `-PreviousPackage <构建 5 的 MSI 路径>` 可核对 Windows Installer 从旧构建升级。冒烟校验原包摘要，使用独立的 MSI 标识与合成资料执行安装、运行和卸载。
+脚本运行测试并在 `windows/dist` 生成安装包和 SHA-256 文件。隔离冒烟用 `smoke-installed.ps1 -Package <MSI 路径> -Python <python.exe>`。传入 `-PreviousPackage <构建 6 的 MSI 路径>` 可核对 Windows Installer 从旧构建升级。冒烟校验原包摘要，使用独立的 MSI 标识与合成资料执行安装、运行和卸载。
 
 用 `<python.exe> smoke-desktop.py --exe <构建目录中的 GaoJiLing.exe>` 在独立的非活动 Windows 桌面验证通知区域回调、窗口和退出流程。加 `--require-webview2` 可要求原生 WebView2 窗口和实际页面内容都通过。用 `<python.exe> tests/smoke_tray_shell.py build/package/AppIcon.ico` 在运行 Explorer 的 Windows 会话验证实际的 Shell 图标登记、重新登记和移除。测试使用自己的隐藏窗口和图标，不修改通知区域偏好。
 

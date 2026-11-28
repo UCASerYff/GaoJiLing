@@ -24,12 +24,12 @@ jobs:
         run: python -B tests/smoke_icon_assets.py build/package/AppIcon.ico build/package/programs/GaoJiLing.exe build/package/programs/GaoJiLing-cli.exe
       - name: Install, smoke-test, and uninstall in isolation
         run: |
-          $package = Get-Item -LiteralPath 'dist/GaoJiLing-1.16+6-Windows-x64.msi' -ErrorAction Stop
+          $package = Get-Item -LiteralPath 'dist/GaoJiLing-1.16+7-Windows-x64.msi' -ErrorAction Stop
           .\smoke-installed.ps1 -Package $package.FullName
       - uses: actions/upload-artifact@v4
         with:
-          name: GaoJiLing-Windows-1.16-build6
+          name: GaoJiLing-Windows-1.16-build7
           if-no-files-found: error
           path: |
-            windows/dist/GaoJiLing-1.16+6-Windows-x64.msi
-            windows/dist/GaoJiLing-1.16+6-Windows-x64.msi.sha256
+            windows/dist/GaoJiLing-1.16+7-Windows-x64.msi
+            windows/dist/GaoJiLing-1.16+7-Windows-x64.msi.sha256

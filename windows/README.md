@@ -1,10 +1,12 @@
 # 搞机灵 V1.16 for Windows
 
-面向 Windows 10/11 x64。桌面窗口显示 V1.16，关于页显示构建 4，命令行显示 1.16+4。使用按用户安装的 x64 MSI，无需管理员权限。安装包未进行 Authenticode 签名。
+面向 Windows 10/11 x64。桌面窗口显示 V1.16，关于页显示构建 5，命令行显示 1.16+5。使用按用户安装的 x64 MSI，无需管理员权限。安装包未进行 Authenticode 签名。
 
 ## 安装与运行
 
-从发布页下载 `GaoJiLing-1.16+4-Windows-x64.msi` 和同名 `.sha256`，用 `Get-FileHash -Algorithm SHA256` 核对后运行 MSI。升级前先从通知区域退出旧版。若旧版使用自定义安装目录，请继续用 `INSTALLDIR` 指定原目录。从开始菜单打开搞机灵。主窗口优先使用本机 WebView2 Runtime，系统未提供该组件时使用独立的 Microsoft Edge 应用窗口或系统浏览器。
+从发布页下载 `GaoJiLing-1.16+5-Windows-x64.msi` 和同名 `.sha256`，用 `Get-FileHash -Algorithm SHA256` 核对后运行 MSI。升级前先从通知区域退出旧版。若旧版使用自定义安装目录，请继续用 `INSTALLDIR` 指定原目录。从开始菜单打开搞机灵。主窗口优先使用本机 WebView2 Runtime，系统未提供该组件时使用独立的 Microsoft Edge 应用窗口或系统浏览器。
+
+构建 5 从现有书法图标生成 16 至 256 像素的 20 档原生资源。窗口和通知区域各按所在显示器的 DPI 选择图标。Windows 重新创建任务栏时，搞机灵会按当前 DPI 重新登记托盘图标。开始菜单快捷方式与原生窗口使用相同的应用标识。独立 Edge 后备窗口也使用这些资源，任务栏分组由浏览器管理。
 
 构建 4 修复了原生 WebView2 窗口进程启动时的缺失导入。此前故障会在主窗口启动或从通知区域恢复时触发 PyInstaller 异常窗口。Edge 后备窗口刚打开就关闭时，后续的托盘恢复请求会等到窗口可以打开。
 
@@ -51,7 +53,7 @@ Windows 通知由系统通知设置及专注模式决定是否显示。登录启
 
 任务对比沿用原任务汇总和采样频率。正常结束任务或从托盘确认保存退出时，最多为最近 48 个任务保留会话明细，每次至多 120 个真实趋势点和一次最多 8 组的进程排行。排行使用任务内整机 CPU 最高且有完整进程 CPU 基线的采样，显示该次工作集。更早的任务和应用中断后恢复的任务仍能读回已有汇总，有保留历史时可查看任务时段内的系统趋势。进程占用只取可归属到本会话的明细。
 
-新版在原 SQLite 文件中按需新增一张关联表，旧记录无需改写。完整 JSON 延用原格式，Windows 构建 4 可随任务导出和恢复明细。
+从 Windows 构建 4 起，应用在原 SQLite 文件中按需新增一张关联表，旧记录无需改写。完整 JSON 沿用原格式，可随任务导出和恢复明细。
 
 ## 构建与检查
 
@@ -61,9 +63,11 @@ Windows 通知由系统通知设置及专注模式决定是否显示。登录启
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Python <虚拟环境中的 python.exe>
 ```
 
-脚本运行测试并在 `windows/dist` 生成安装包和 SHA-256 文件。隔离冒烟用 `smoke-installed.ps1 -Package <MSI 路径> -Python <python.exe>`。传入 `-PreviousPackage <构建 3 的 MSI 路径>` 可核对 Windows Installer 从旧构建升级。冒烟校验原包摘要，使用独立的 MSI 标识与合成资料执行安装、运行和卸载。
+脚本运行测试并在 `windows/dist` 生成安装包和 SHA-256 文件。隔离冒烟用 `smoke-installed.ps1 -Package <MSI 路径> -Python <python.exe>`。传入 `-PreviousPackage <构建 4 的 MSI 路径>` 可核对 Windows Installer 从旧构建升级。冒烟校验原包摘要，使用独立的 MSI 标识与合成资料执行安装、运行和卸载。
 
 用 `<python.exe> smoke-desktop.py --exe <构建目录中的 GaoJiLing.exe>` 在独立的非活动 Windows 桌面验证通知区域回调、窗口和退出流程。加 `--require-webview2` 可要求原生 WebView2 窗口和实际页面内容都通过。用 `<python.exe> tests/smoke_tray_shell.py build/package/AppIcon.ico` 在运行 Explorer 的 Windows 会话验证实际的 Shell 图标登记、重新登记和移除。测试使用自己的隐藏窗口和图标，不修改通知区域偏好。
+
+CI 会比较冻结程序内的 ICO 和原生图标资源，并向 Windows 请求 100%、125%、150%、175%、200% 的尺寸。向桌面冒烟传入 `--expected-icon build/package/AppIcon.ico` 可核对窗口实际选中的 HICON。加 `--icon-artifacts <截图目录>` 可保存 WebView2「应用」页在五档浏览器缩放下的截图。
 
 运行 `GaoJiLing-cli.exe --version` 查看版本。用 `--inspect` 查看资料条数，或用 `--serve --no-browser --data-dir <隔离目录> --port <本机端口>` 进行独立调试。
 

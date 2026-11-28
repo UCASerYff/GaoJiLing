@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 import time
 
+from smoke_icon_assets import window_icon_bitmap
+
 
 def smoke(icon):
     from gaojiling import win32 as win
@@ -19,6 +21,7 @@ def smoke(icon):
     hwnd = None
     tray = None
     events = []
+    registered_icons = []
     try:
         hwnd = win.create_window(0, name, name, 0, 0, 0, 0, 0, None, None, module, None)
         assert hwnd
@@ -26,6 +29,8 @@ def smoke(icon):
         def measure(action, data):
             record = ctypes.cast(data, ctypes.POINTER(win.NotifyData)).contents
             assert record.hwnd == hwnd and record.id == win.NOTIFY_ID
+            if action == 0:
+                registered_icons.append(window_icon_bitmap(record.icon))
             result = bool(original(action, data))
             events.append((action, result))
             return result
@@ -38,6 +43,14 @@ def smoke(icon):
         tray = win.Tray(hwnd, icon)
         tray.tooltip("搞机灵 · 隔离 Shell 核验")
         assert tray.available and tray.owns_icon
+        dpi = win.window_dpi(win.find_window("Shell_TrayWnd", None) or hwnd)
+        dimensions = win.icon_dimensions(dpi, small=True)
+        reference = win.load_sized_icon(icon, dimensions)
+        assert reference
+        try:
+            expected = window_icon_bitmap(reference)
+        finally:
+            win.destroy_icon(reference)
         time.sleep(0.25)
         initial = rectangle()
         assert measure(2, ctypes.byref(tray._data()))
@@ -50,6 +63,8 @@ def smoke(icon):
         print(f"Shell icon rectangle after add/re-add/delete: {initial}/{restored}/{final}")
         assert events == [(0, True), (4, True), (1, True), (2, True), (0, True), (4, True), (2, True)]
         assert initial and restored and not final
+        assert registered_icons == [expected, expected] and expected[0] == dimensions
+        print(f"Shell at {dpi} DPI: both NIM_ADD calls received {dimensions[0]}x{dimensions[1]} packaged icon pixels.")
     finally:
         if tray:
             tray.close()

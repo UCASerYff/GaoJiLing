@@ -123,6 +123,22 @@ def package(path, files, work):
                       "InstallDirectory", "[INSTALLDIR]", "Registration")])
     add("Shortcut", [("MainShortcut", "ProgramMenuFolder", "GaoJiLnk|GaoJiLing", "Registration", "[#File1]", None,
                       "GaoJiLing system monitor", None, "GaoJiLingIcon.ico", 0, 1, "INSTALLDIR")])
+    # CPython's MSI schema predates the shortcut property table.
+    shortcut_properties = msilib.Table("MsiShortcutProperty")
+    formatted = msilib.type_valid | msilib.type_string
+    identifier = formatted | 72
+    shortcut_properties.add_field(1, "MsiShortcutProperty", identifier | msilib.type_key)
+    shortcut_properties.add_field(2, "Shortcut_", identifier)
+    shortcut_properties.add_field(3, "PropertyKey", formatted)
+    shortcut_properties.add_field(4, "PropVariantValue", formatted)
+    shortcut_properties.create(db)
+    add("_Validation", [
+        ("MsiShortcutProperty", "MsiShortcutProperty", "N", None, None, None, None, "Identifier", None, None),
+        ("MsiShortcutProperty", "Shortcut_", "N", None, None, "Shortcut", 1, "Identifier", None, None),
+        ("MsiShortcutProperty", "PropertyKey", "N", None, None, None, None, "Formatted", None, None),
+        ("MsiShortcutProperty", "PropVariantValue", "N", None, None, None, None, "Formatted", None, None),
+    ])
+    add("MsiShortcutProperty", [("MainShortcutAppID", "MainShortcut", "System.AppUserModel.ID", BUNDLE_ID)])
     add("RemoveFile", [("GaoStartup", "Registration", "GaoSta~1.lnk|" + SHORTCUT_NAME, "StartupFolder", 2)])
 
     cabinet = work / "payload.cab"

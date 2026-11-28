@@ -6,6 +6,8 @@ import ctypes as c
 from ctypes import wintypes as w
 import os
 
+from gaojiling.version import BUNDLE_ID
+
 
 user = c.WinDLL("user32", use_last_error=True)
 shell = c.WinDLL("shell32", use_last_error=True)
@@ -17,6 +19,7 @@ LR_LOADFROMFILE = 0x10
 WM_COMMAND, WM_HOTKEY, WM_TRAY = 0x111, 0x312, 0x803B
 WM_CONTEXTMENU, WM_RBUTTONUP = 0x7B, 0x205
 WM_LBUTTONUP, NIN_SELECT, NIN_KEYSELECT = 0x202, 0x400, 0x401
+WM_GETICON, WM_SETICON = 0x7F, 0x80
 SW_HIDE, SW_SHOWNOACTIVATE = 0, 4
 SWP_NOACTIVATE, SWP_NOOWNERZORDER = 0x10, 0x200
 WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE = 0x80, 0x08000000
@@ -80,6 +83,8 @@ destroy_window = _api(user, "DestroyWindow", w.BOOL, w.HWND)
 def_window_proc = _api(user, "DefWindowProcW", c.c_ssize_t, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
 find_window = _api(user, "FindWindowW", w.HWND, w.LPCWSTR, w.LPCWSTR)
 post_message = _api(user, "PostMessageW", w.BOOL, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
+send_message_timeout = _api(user, "SendMessageTimeoutW", w.LPARAM, w.HWND, w.UINT, w.WPARAM, w.LPARAM,
+                            w.UINT, w.UINT, c.POINTER(c.c_size_t))
 register_message = _api(user, "RegisterWindowMessageW", w.UINT, w.LPCWSTR)
 register_hotkey = _api(user, "RegisterHotKey", w.BOOL, w.HWND, c.c_int, w.UINT, w.UINT)
 unregister_hotkey = _api(user, "UnregisterHotKey", w.BOOL, w.HWND, c.c_int)
@@ -114,6 +119,12 @@ enum_monitors = _api(user, "EnumDisplayMonitors", w.BOOL, w.HDC, c.POINTER(w.REC
 load_icon = _api(user, "LoadIconW", w.HICON, w.HINSTANCE, c.c_void_p)
 load_image = _api(user, "LoadImageW", w.HANDLE, w.HINSTANCE, w.LPCWSTR, w.UINT, c.c_int, c.c_int, w.UINT)
 destroy_icon = _api(user, "DestroyIcon", w.BOOL, w.HICON)
+try:  # Per-window DPI APIs arrived in Windows 10, version 1607.
+    get_window_dpi = _api(user, "GetDpiForWindow", w.UINT, w.HWND)
+    get_system_dpi = _api(user, "GetDpiForSystem", w.UINT)
+    get_icon_metric = _api(user, "GetSystemMetricsForDpi", c.c_int, c.c_int, w.UINT)
+except AttributeError:
+    get_window_dpi = get_system_dpi = get_icon_metric = None
 create_menu = _api(user, "CreatePopupMenu", w.HMENU)
 append_menu = _api(user, "AppendMenuW", w.BOOL, w.HMENU, w.UINT, c.c_size_t, w.LPCWSTR)
 track_menu = _api(user, "TrackPopupMenu", w.UINT, w.HMENU, w.UINT, c.c_int, c.c_int, c.c_int, w.HWND, c.c_void_p)
@@ -127,10 +138,12 @@ button_messages = {0x201: (0, True), 0x202: (0, False), 0x204: (1, True), 0x205:
 def setup_dpi():
     # Do this before creating a single HWND, including the hidden command window.
     try:
-        _api(user, "SetProcessDpiAwarenessContext", w.BOOL, w.HANDLE)(-4)
+        configured = _api(user, "SetProcessDpiAwarenessContext", w.BOOL, w.HANDLE)(-4)
     except AttributeError:
+        configured = False
+    if not configured:
         _api(shcore, "SetProcessDpiAwareness", w.LONG, c.c_int)(2)
-    _api(shell, "SetCurrentProcessExplicitAppUserModelID", w.LONG, w.LPCWSTR)("com.gaoseries.GaoJiLing")
+    _api(shell, "SetCurrentProcessExplicitAppUserModelID", w.LONG, w.LPCWSTR)(BUNDLE_ID)
 
 
 def cursor():
@@ -214,18 +227,78 @@ def find_view(process_id: int, title: str):
     return matches[0] if matches else None
 
 
-def new_icon(path):
+def window_dpi(hwnd):
+    dpi = get_window_dpi(hwnd) if hwnd and get_window_dpi else 0
+    return dpi or (get_system_dpi() if get_system_dpi else 96) or 96
+
+
+def icon_dimensions(dpi, *, small):
+    if get_icon_metric:
+        # SM_CXSMICON/SM_CYSMICON, or SM_CXICON/SM_CYICON.
+        metric = 49 if small else 11
+        width, height = get_icon_metric(metric, dpi), get_icon_metric(metric + 1, dpi)
+        if width > 0 and height > 0:
+            return width, height
+    side = ((16 if small else 32) * dpi + 48) // 96
+    return side, side
+
+
+def load_sized_icon(path, dimensions):
     if path and os.path.isfile(path):
-        icon = load_image(None, str(path), 1, 0, 0, LR_LOADFROMFILE | 0x40)
-        if icon:
-            return icon, True
-    return load_icon(None, 32512), False
+        return load_image(None, str(path), 1, *dimensions, LR_LOADFROMFILE)
+    return None
+
+
+class WindowIcons:
+    """Keep DPI-specific HICONs alive for a single application-owned view."""
+
+    def __init__(self, path, *, browser_owned=False):
+        self.path = path
+        self.browser_owned = browser_owned
+        self.handles = {}
+        self.current = None
+        self.next_check = 0
+        self.check_until = 0
+
+    def update(self, hwnd, now):
+        dpi = window_dpi(hwnd)
+        unchanged = self.current == (hwnd, dpi)
+        if unchanged and (not self.browser_owned or not self.next_check <= now <= self.check_until):
+            return
+        # Edge can replace both icons asynchronously when its favicon arrives.
+        if not unchanged:
+            self.check_until = now + 12
+        self.next_check = now + 2
+        for kind in (0, 1):  # ICON_SMALL is the caption; ICON_BIG is the shell window icon.
+            dimensions = icon_dimensions(dpi, small=kind == 0)
+            icon = self.handles.get(dimensions)
+            if not icon:
+                icon = load_sized_icon(self.path, dimensions)
+                if not icon:
+                    return
+                self.handles[dimensions] = icon
+            result = c.c_size_t()
+            if unchanged and send_message_timeout(hwnd, WM_GETICON, kind, dpi, 0x2, 150, c.byref(result)):
+                if result.value == icon:
+                    continue
+            if not send_message_timeout(hwnd, WM_SETICON, kind, icon, 0x2, 150, c.byref(result)):
+                return
+        self.current = (hwnd, dpi)
+
+    def close(self):
+        for icon in self.handles.values():
+            destroy_icon(icon)
+        self.handles.clear()
+        self.current = None
 
 
 class Tray:
     def __init__(self, hwnd, icon):
         self.hwnd = hwnd
-        self.icon, self.owns_icon = new_icon(icon)
+        self.icon_path = icon
+        self.icon = None
+        self.owns_icon = False
+        self.icon_size = None
         self.available = False
         self.version4 = False
         self.closed = False
@@ -235,9 +308,28 @@ class Tray:
     def _data(self):
         return NotifyData(size=c.sizeof(NotifyData), hwnd=self.hwnd, id=NOTIFY_ID)
 
+    def _icon_dimensions(self):
+        # The notification area is on the primary taskbar. Its DPI may differ
+        # from both the hidden callback window and an open application window.
+        taskbar = find_window("Shell_TrayWnd", None)
+        return icon_dimensions(window_dpi(taskbar or self.hwnd), small=True)
+
+    def refresh_dpi(self):
+        if self.available and self._icon_dimensions() != self.icon_size:
+            self.register()
+
     def register(self):
         if self.closed:
             return False
+        dimensions = self._icon_dimensions()
+        retired = None
+        if dimensions != self.icon_size:
+            if self.owns_icon:
+                retired = self.icon
+            icon = load_sized_icon(self.icon_path, dimensions)
+            self.owns_icon = bool(icon)
+            self.icon = icon or load_icon(None, 32512)
+            self.icon_size = dimensions
         data = self._data()
         data.flags = 1 | 2 | 4 | 0x80
         data.message = WM_TRAY
@@ -249,6 +341,8 @@ class Tray:
         if self.available:
             data.version = 4
             self.version4 = bool(notify_icon(4, c.byref(data)))
+        if retired:
+            destroy_icon(retired)
         return self.available
 
     def tooltip(self, tip):

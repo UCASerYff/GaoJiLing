@@ -20,14 +20,16 @@ jobs:
           python-version: "3.12"
       - name: Test and build executables
         run: powershell -ExecutionPolicy Bypass -File .\build.ps1
+      - name: Verify frozen icon resources and DPI sizes
+        run: python -B tests/smoke_icon_assets.py build/package/AppIcon.ico build/package/programs/GaoJiLing.exe build/package/programs/GaoJiLing-cli.exe
       - name: Install, smoke-test, and uninstall in isolation
         run: |
-          $package = Get-Item -LiteralPath 'dist/GaoJiLing-1.16+4-Windows-x64.msi' -ErrorAction Stop
+          $package = Get-Item -LiteralPath 'dist/GaoJiLing-1.16+5-Windows-x64.msi' -ErrorAction Stop
           .\smoke-installed.ps1 -Package $package.FullName
       - uses: actions/upload-artifact@v4
         with:
-          name: GaoJiLing-Windows-1.16-build4
+          name: GaoJiLing-Windows-1.16-build5
           if-no-files-found: error
           path: |
-            windows/dist/GaoJiLing-1.16+4-Windows-x64.msi
-            windows/dist/GaoJiLing-1.16+4-Windows-x64.msi.sha256
+            windows/dist/GaoJiLing-1.16+5-Windows-x64.msi
+            windows/dist/GaoJiLing-1.16+5-Windows-x64.msi.sha256

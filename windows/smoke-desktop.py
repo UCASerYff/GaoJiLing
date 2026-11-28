@@ -211,7 +211,7 @@ socket.addEventListener("message", (message) => {
 """
 
 
-def verify_webview_dom(data, app, hwnd, address, predicate, label):
+def webview_target(data, app, hwnd, address, label):
     pid = window_pid(hwnd)
     signals = next((path for path, process in ready_webview_windows(data) if process == pid), None)
     assert signals is not None, f"{label} did not report a native WebView2 HWND and ready marker"
@@ -232,13 +232,76 @@ def verify_webview_dom(data, app, hwnd, address, predicate, label):
                 pass
         return None
 
-    target = until(private_target, f"No WebView2 target for the isolated {label} runtime", 20)
+    return until(private_target, f"No WebView2 target for the isolated {label} runtime", 20)
+
+
+def verify_webview_dom(data, app, hwnd, address, predicate, label):
+    target = webview_target(data, app, hwnd, address, label)
     result = subprocess.run(["node", "-e", _READ_WEBVIEW_DOM, target, predicate],
                             creationflags=subprocess.CREATE_NO_WINDOW, timeout=15, check=False)
     assert result.returncode == 0, f"The WebView2 {label} window did not render the expected app content"
     assert win.window_visible(hwnd), f"The WebView2 {label} HWND closed before verification"
     print(f"Verified native WebView2 {label}: visible process HWND, ready marker and rendered app DOM.", flush=True)
     return urlsplit(target).port
+
+
+def verify_window_icons(hwnd, icon_path, label, stable_seconds=0):
+    sys.path.insert(0, str(ROOT / "tests"))
+    from smoke_icon_assets import window_icon_bitmap
+
+    dpi = win.window_dpi(hwnd)
+    expected = []
+    for kind in (0, 1):
+        size = win.icon_dimensions(dpi, small=kind == 0)
+        icon = win.load_sized_icon(icon_path, size)
+        assert icon, f"Could not load reference {size[0]}px icon"
+        try:
+            expected.append(window_icon_bitmap(icon))
+        finally:
+            win.destroy_icon(icon)
+    observed = []
+    first_match = None
+
+    def matches():
+        nonlocal first_match
+        observed.clear()
+        for kind in range(len(expected)):
+            native = c.c_size_t()
+            sent = win.send_message_timeout(hwnd, 0x7F, kind, dpi, 0x2, 500, c.byref(native))  # WM_GETICON
+            try:
+                pixels = window_icon_bitmap(native.value) if sent and native.value else None
+            except OSError:
+                pixels = None  # Edge can replace a browser-owned HICON during the sample.
+            observed.append(pixels)
+        if observed != expected:
+            first_match = None
+            return False
+        now = time.monotonic()
+        first_match = first_match if first_match is not None else now
+        return now - first_match >= stable_seconds
+
+    try:
+        until(matches, "Window icon does not match the package", 10)
+    except AssertionError as error:
+        sizes = [item[0] if item else None for item in observed]
+        different = [sum(a != b for a, b in zip(item[1], reference[1])) if item else None
+                     for item, reference in zip(observed, expected)]
+        raise AssertionError(f"{label}: {dpi} DPI, native icons {sizes}, differing bytes {different}, expected sizes "
+                             f"{[item[0] for item in expected]} and matching pixels") from error
+    stability = f"; matched continuously for {stable_seconds} s" if stable_seconds else ""
+    print(f"{label}: WM_GETICON at actual {dpi} DPI returned both packaged brand bitmaps "
+          f"{observed[0][0][0]}px and {observed[1][0][0]}px{stability}.", flush=True)
+
+
+def verify_webview_icons(data, app, hwnd, output):
+    target = webview_target(data, app, hwnd, app.url, "packaged Applications view")
+    result = subprocess.run(
+        ["node", str(ROOT / "tests" / "webview_icon_probe.mjs"), target, str(output)],
+        creationflags=subprocess.CREATE_NO_WINDOW, timeout=60,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", check=False,
+    )
+    print(result.stdout, end="", flush=True)
+    assert result.returncode == 0, "Packaged Applications view icon probe failed"
 
 
 def owned_handle(hwnd):
@@ -343,7 +406,8 @@ def startup_probe(data, launcher):
             win.close_handle(handle)
 
 
-def smoke(data, launcher, cli, require_webview2=False, require_edge_fallback=False):
+def smoke(data, launcher, cli, require_webview2=False, require_edge_fallback=False,
+          expected_icon=None, icon_artifacts=None):
     app = LocalApp(launcher, data)
     handles = []
     webview_ports = []
@@ -351,6 +415,7 @@ def smoke(data, launcher, cli, require_webview2=False, require_edge_fallback=Fal
     main_title = f"搞机灵 V{MARKETING}"
     overview_dom = ('document.querySelector(".page-header h1")?.textContent.trim() === "概览"'
                     ' && document.querySelector(".viewport .section-title")?.textContent.trim() === "资源占用"')
+    stable_seconds = 3 if require_edge_fallback else 0
 
     def tracked_window(title):
         matches = []
@@ -389,6 +454,10 @@ def smoke(data, launcher, cli, require_webview2=False, require_edge_fallback=Fal
             webview_ports.append(verify_webview_dom(data, app, main, app.url, overview_dom, "main view"))
         if require_edge_fallback:
             assert backend == "edge-app", "The isolated missing-runtime probe did not exercise Edge fallback"
+        if expected_icon:
+            verify_window_icons(main, expected_icon, "Main window", stable_seconds)
+        if icon_artifacts:
+            verify_webview_icons(data, app, main, icon_artifacts)
         strip = until(lambda: win.find_view(window_pid(host), "搞机灵唤起条"), "The desktop strip was not shown")
         hotkey = check_hotkey(app)
         assert hotkey
@@ -445,6 +514,8 @@ def smoke(data, launcher, cli, require_webview2=False, require_edge_fallback=Fal
             assert (reopened, window_pid(reopened)) != closed_view, "Tray menu did not create a replacement window"
             webview_ports.append(verify_webview_dom(data, app, reopened, app.url, overview_dom,
                                                    "main view reopened by tray menu"))
+        if expected_icon:
+            verify_window_icons(reopened, expected_icon, "Main window after tray restore", stable_seconds)
         secondary = subprocess.run(app.arguments, timeout=35)
         assert secondary.returncode == 0, "A second launch did not forward to the original instance"
         time.sleep(0.6)
@@ -458,6 +529,8 @@ def smoke(data, launcher, cli, require_webview2=False, require_edge_fallback=Fal
         assert reopened != settings and app.api("state")["desktop"]["view"] in {"webview2", "edge-app"}
         if require_edge_fallback:
             assert app.api("state")["desktop"]["view"] == "edge-app"
+        if expected_icon:
+            verify_window_icons(settings, expected_icon, "Settings window", stable_seconds)
         if require_webview2:
             assert app.api("state")["desktop"]["view"] == "webview2"
             webview_ports.append(verify_webview_dom(
@@ -519,9 +592,15 @@ def main():
     mode.add_argument("--startup-probe", action="store_true", help="Check the background login entry and native quit without opening the main view.")
     mode.add_argument("--require-webview2", action="store_true", help="Require the native WebView2 window and rendered local app content; requires Node.js 22+.")
     mode.add_argument("--require-edge-fallback", action="store_true", help="Point only the test process at an empty WebView2 runtime folder and require the private Edge fallback.")
+    parser.add_argument("--expected-icon", type=Path, help="Compare native window icons with this packaged ICO (requires --exe).")
+    parser.add_argument("--icon-artifacts", type=Path, help="Capture the packaged Applications icon column at five DPRs (requires --require-webview2 and --expected-icon).")
     parser.add_argument("--_desktop", help=argparse.SUPPRESS)
     parser.add_argument("--_scratch", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.expected_icon and (not args.exe or args.startup_probe):
+        parser.error("--expected-icon requires the packaged GUI executable and a window test")
+    if args.icon_artifacts and (not args.expected_icon or not args.require_webview2):
+        parser.error("--icon-artifacts requires --require-webview2 and --expected-icon")
     directory = ROOT / "build"
     if args._desktop:
         if (not re.fullmatch("GaoJiLingSmoke-[0-9a-f]{32}", args._desktop) or args._scratch is None
@@ -547,7 +626,8 @@ def main():
                     startup_probe(data, launcher)
                 else:
                     smoke(data, launcher, cli, require_webview2=args.require_webview2,
-                          require_edge_fallback=args.require_edge_fallback)
+                          require_edge_fallback=args.require_edge_fallback, expected_icon=args.expected_icon,
+                          icon_artifacts=args.icon_artifacts)
             except BaseException:
                 traceback.print_exc()
                 return 1
@@ -564,6 +644,11 @@ def main():
         options.append("--require-webview2")
     if args.require_edge_fallback:
         options.append("--require-edge-fallback")
+    if args.expected_icon:
+        options.extend(("--expected-icon", str(args.expected_icon.resolve(strict=True))))
+    if args.icon_artifacts:
+        args.icon_artifacts.mkdir(parents=True, exist_ok=True)
+        options.extend(("--icon-artifacts", str(args.icon_artifacts.resolve(strict=True))))
     scratch = tempfile.TemporaryDirectory(prefix="desktop-smoke-", dir=directory)
     try:
         return run_isolated(Path(scratch.name), options)

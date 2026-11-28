@@ -12,9 +12,14 @@ sys.path.insert(0, str(ROOT / "src"))
 from gaojiling.version import BUILD, MARKETING, display
 
 
+# Tray/caption (16), taskbar (20/24), system large (32), and Explorer (48),
+# rasterized from the original at each common scale rather than enlarged later.
+ICON_SIZES = (16, 20, 24, 25, 28, 30, 32, 35, 36, 40, 42, 48, 56, 60, 64, 72, 84, 96, 128, 256)
+
+
 def main(build: Path):
     with Image.open(ROOT.parent / "Assets" / "AppIcon.png") as image:
-        image.save(build / "AppIcon.ico", sizes=[(size, size) for size in (16, 32, 48, 64, 128, 256)])
+        image.convert("RGBA").save(build / "AppIcon.ico", sizes=[(size, size) for size in ICON_SIZES])
 
     major, minor = map(int, MARKETING.split("."))
     version = f"({major}, {minor}, {BUILD}, 0)"

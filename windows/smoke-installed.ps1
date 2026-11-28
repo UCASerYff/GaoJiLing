@@ -49,7 +49,8 @@ function Uninstall-Fixture($Fixture, [string]$LogName) {
     Test-ProductState $Fixture.product -1
 }
 
-function Invoke-InstalledApp([string]$Version, [string]$TaskName, [string]$PreviousTaskId = '', [switch]$SeedSettings) {
+function Invoke-InstalledApp([string]$Version, [string]$TaskName, [string]$PreviousTaskId = '',
+    [string]$PreviousVersion = '', [switch]$SeedSettings) {
     $gui = Join-Path $installation 'GaoJiLing.exe'
     $cli = Join-Path $installation 'GaoJiLing-cli.exe'
     if ((& $cli --version) -ne $Version -or $LASTEXITCODE -ne 0) { throw "Installed CLI version mismatch" }
@@ -100,7 +101,8 @@ function Invoke-InstalledApp([string]$Version, [string]$TaskName, [string]$Previ
         $state = Invoke-RestMethod -Uri "$url/api/state" -Headers $headers -NoProxy
         if ($state.activeSession.name -ne $TaskName) { throw "Installed GUI failed to write a task" }
         $taskId = $state.activeSession.id
-        if ($PreviousTaskId) {
+        $hasSessionComparison = [version]($Version.Replace('+', '.')) -ge [version]'1.16.4'
+        if ($PreviousTaskId -or ($SeedSettings -and $hasSessionComparison)) {
             $started = $state.activeSession.start
             $deadline = (Get-Date).AddSeconds(35)
             do {
@@ -108,7 +110,7 @@ function Invoke-InstalledApp([string]$Version, [string]$TaskName, [string]$Previ
                 $state = Invoke-RestMethod -Uri "$url/api/state" -Headers $headers -NoProxy
                 if ($state.latest.timestamp -gt $started) { break }
             } while ((Get-Date) -lt $deadline)
-            if ($state.latest.timestamp -le $started) { throw 'The candidate task did not receive a real sample' }
+            if ($state.latest.timestamp -le $started) { throw "The task in $Version did not receive a real sample" }
         }
         Invoke-RestMethod -Uri "$url/api/session/stop" @post -Body '{}' | Out-Null
         if ($PreviousTaskId) {
@@ -116,10 +118,16 @@ function Invoke-InstalledApp([string]$Version, [string]$TaskName, [string]$Previ
             $comparison = Invoke-RestMethod -Uri "$url/api/session/compare" @post -Body $body
             $runs = @($comparison.sessions)
             if ($runs.Count -ne 2 -or $runs[0].id -ne $PreviousTaskId -or $runs[1].id -ne $taskId -or
-                $runs[0].trend.source -ne 'history' -or $runs[0].processes.available -ne $false -or
                 $runs[1].trend.source -ne 'session' -or $runs[1].sampleCount -lt 1 -or
                 $comparison.comparable.durationSeconds -ne $true) {
-                throw 'Upgraded GUI did not compare the legacy task and the newly sampled task as expected'
+                throw 'Upgraded GUI did not compare the saved task and the newly sampled task as expected'
+            }
+            if ([version]($PreviousVersion.Replace('+', '.')) -ge [version]'1.16.4') {
+                if ($runs[0].trend.source -ne 'session' -or $runs[0].sampleCount -lt 1 -or -not $runs[0].trend.available) {
+                    throw 'Upgraded GUI did not preserve the prior task trend and its samples'
+                }
+            } elseif ($runs[0].trend.source -ne 'history' -or $runs[0].processes.available -ne $false) {
+                throw 'A task from before session comparisons did not fall back to retained history'
             }
         }
         Invoke-RestMethod -Uri "$url/api/shutdown" @post -Body '{}' | Out-Null
@@ -171,7 +179,7 @@ try {
         }
     }
     if ((Get-FileHash -LiteralPath $legacyPanel).Hash -ne $originalPanel) { throw "Installer changed isolated panel settings" }
-    Invoke-InstalledApp $candidate.version 'Installed smoke' $previousTask | Out-Null
+    Invoke-InstalledApp $candidate.version 'Installed smoke' $previousTask -PreviousVersion $previous.version | Out-Null
     $runtimeHash = (Get-FileHash -LiteralPath $runtimeDatabase).Hash
     Uninstall-Fixture $candidate 'uninstall-candidate.log'
     if ((Test-Path -LiteralPath (Join-Path $installation 'GaoJiLing.exe')) -or
@@ -183,7 +191,7 @@ try {
     $verified = $true
     if ($previous) {
         Write-Output "Verified private MSI major upgrade $($previous.version) to $($candidate.version), saved task and settings."
-        Write-Output 'Verified the upgraded comparison of a legacy task and a new task with real samples.'
+        Write-Output 'Verified the upgraded comparison of the saved task and a new task with real samples.'
     }
     Write-Output 'Verified MSI SHA-256, private install, x64 headless launcher without tray, task round-trip, loopback shutdown and data-preserving uninstall.'
 } finally {

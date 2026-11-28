@@ -165,6 +165,7 @@ class _View:
     ready: bool = False
     closing: float | None = None
     reopen: tuple[str, str] | None = None
+    icons: win.WindowIcons | None = None
 
 
 def _view_handle(view, key):
@@ -468,7 +469,8 @@ class Desktop:
             self._fallback_view(key, target, backend)
             return
         self.view_backend = backend
-        self.views[key] = _View(process, signals, target, time.monotonic() + 25, backend)
+        self.views[key] = _View(process, signals, target, time.monotonic() + 25, backend,
+                                icons=win.WindowIcons(self.icon_path, browser_owned=backend == "edge-app"))
 
     def _poll_views(self, now):
         for key, view in list(self.views.items()):
@@ -483,11 +485,14 @@ class Desktop:
                     if view.reopen is None:
                         view.reopen = (view.target, self._next_view_backend(view.backend))
                     self._dismiss_view(key, view)
-                elif hwnd and view.reopen is not None:
-                    view.reopen = None
-                    if win.is_iconic(hwnd):
-                        win.show_window(hwnd, 9)
-                    win.set_foreground(hwnd)
+                elif hwnd:
+                    if view.icons:
+                        view.icons.update(hwnd, now)
+                    if view.reopen is not None:
+                        view.reopen = None
+                        if win.is_iconic(hwnd):
+                            win.show_window(hwnd, 9)
+                        win.set_foreground(hwnd)
             if not running or (view.closing is not None and now >= view.closing):
                 self._drop_view(key, view)
                 if view.reopen:
@@ -514,6 +519,8 @@ class Desktop:
 
     def _drop_view(self, key, view):
         view.process.close()
+        if view.icons:
+            view.icons.close()
         shutil.rmtree(view.signals, ignore_errors=True)
         del self.views[key]
 
@@ -742,6 +749,7 @@ class Desktop:
             cpu = f" · CPU {percent(sample.get('cpuPercent'))}" if self.settings.get("menuBarCPU") else ""
             paused = " · 暂停" if self.service.paused else ""
             memory = f" · 内存 {byte_size(sample.get('memoryUsed'))}"
+            self.tray.refresh_dpi()
             self.tray.tooltip("搞机灵" + paused + cpu + memory + "\n单击打开主窗口，右键更多选项")
             if not self.tray.available and now >= self.next_tray_retry:
                 self._register_tray()

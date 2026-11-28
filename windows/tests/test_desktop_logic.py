@@ -114,7 +114,8 @@ def test_tray_reuses_its_id_after_taskbar_created_and_deletes_once(monkeypatch):
 
     calls = []
     replies = iter([True, True, False, True, True, False, True, True, True])
-    monkeypatch.setattr(win, "new_icon", lambda path: (42, True))
+    monkeypatch.setattr(win, "load_sized_icon", lambda path, dimensions: 42)
+    monkeypatch.setattr(win, "window_dpi", lambda hwnd: 96)
     destroyed = []
     monkeypatch.setattr(win, "destroy_icon", destroyed.append)
 
@@ -136,3 +137,87 @@ def test_tray_reuses_its_id_after_taskbar_created_and_deletes_once(monkeypatch):
     assert [action for action, _, _ in calls] == [0, 4, 0, 1, 4, 1, 0, 4, 2]
     assert {(hwnd, icon_id) for _, hwnd, icon_id in calls} == {(23, win.NOTIFY_ID)}
     assert destroyed == [42]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 notification area")
+def test_tray_reselects_primary_taskbar_dpi_on_refresh_and_recovery(monkeypatch):
+    import ctypes
+
+    from gaojiling import win32 as win
+
+    dpi = 120
+    calls = []
+    destroyed = []
+
+    def read_dpi(hwnd):
+        assert hwnd == 91
+        return dpi
+
+    def notify(command, pointer):
+        data = ctypes.cast(pointer, ctypes.POINTER(win.NotifyData)).contents
+        assert (data.hwnd, data.id) == (23, win.NOTIFY_ID)
+        calls.append((command, data.icon))
+        return True
+
+    monkeypatch.setattr(win, "find_window", lambda title, name: 91)
+    monkeypatch.setattr(win, "window_dpi", read_dpi)
+    monkeypatch.setattr(win, "load_sized_icon", lambda path, dimensions: dimensions[0] * 100)
+    monkeypatch.setattr(win, "destroy_icon", destroyed.append)
+    monkeypatch.setattr(win, "notify_icon", notify)
+
+    tray = win.Tray(23, "fixture.ico")
+    tray.refresh_dpi()
+    dpi = 168
+    tray.refresh_dpi()
+    dpi = 192
+    assert tray.register()  # TaskbarCreated goes through the same registration route.
+    tray.close()
+
+    assert calls == [(0, 2000), (4, 2000), (0, 2800), (4, 2800), (0, 3200), (4, 3200), (2, None)]
+    assert destroyed == [2000, 2800, 3200]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 window icons")
+def test_owned_edge_window_restores_dpi_frames_after_favicon_replaces_an_icon(monkeypatch):
+    import ctypes
+
+    from gaojiling import win32 as win
+
+    selected = {}
+    requests = []
+    installed = []
+    dpi = 144
+
+    def send(hwnd, message, kind, value, flags, timeout, reply):
+        assert hwnd == 27
+        requests.append(message)
+        if message == win.WM_GETICON:
+            assert value == dpi
+            ctypes.cast(reply, ctypes.POINTER(ctypes.c_size_t)).contents.value = selected[kind]
+        else:
+            assert message == win.WM_SETICON
+            selected[kind] = value
+            installed.append((kind, value))
+        return True
+
+    monkeypatch.setattr(win, "window_dpi", lambda hwnd: dpi)
+    monkeypatch.setattr(win, "load_sized_icon", lambda path, dimensions: dimensions[0] * 100)
+    monkeypatch.setattr(win, "send_message_timeout", send)
+    destroyed = []
+    monkeypatch.setattr(win, "destroy_icon", destroyed.append)
+    icons = win.WindowIcons("fixture.ico", browser_owned=True)
+    icons.update(27, 1)
+    selected[1] = 80  # Edge supplied its own icon after the initial window setup.
+    icons.update(27, 2)
+    assert requests == [win.WM_SETICON] * 2
+    icons.update(27, 3)
+    icons.update(27, 5)
+    count = len(requests)
+    icons.update(27, 14)
+    assert len(requests) == count
+    dpi = 192
+    icons.update(27, 15)
+    icons.close()
+
+    assert installed == [(0, 2400), (1, 4800), (1, 4800), (0, 3200), (1, 6400)]
+    assert destroyed == [2400, 4800, 3200, 6400]

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import ctypes
+from ipaddress import IPv4Address
 import re
 import socket
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -12,6 +15,92 @@ from gaojiling.errors import AppError
 
 _HOST = re.compile(r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _IPV4 = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+_ERROR_INSUFFICIENT_BUFFER = 122
+_DIRECT_ROUTE = 3
+_INDIRECT_ROUTE = 4
+_UNUSED_METRIC = 0xFFFFFFFF
+_MAX_ROUTE_TABLE_BYTES = 4 * 1024 * 1024
+
+
+class _IPv4ForwardRow(ctypes.Structure):
+    # MIB_IPFORWARDROW. Fields use fixed-width Windows DWORDs.
+    _fields_ = [
+        ("destination", ctypes.c_uint32),
+        ("mask", ctypes.c_uint32),
+        ("policy", ctypes.c_uint32),
+        ("next_hop", ctypes.c_uint32),
+        ("interface", ctypes.c_uint32),
+        ("type", ctypes.c_uint32),
+        ("protocol", ctypes.c_uint32),
+        ("age", ctypes.c_uint32),
+        ("next_hop_as", ctypes.c_uint32),
+        ("metric", ctypes.c_uint32),
+        ("other_metrics", ctypes.c_uint32 * 4),
+    ]
+
+
+class _IPv4ForwardTable(ctypes.Structure):
+    _fields_ = [("count", ctypes.c_uint32), ("rows", _IPv4ForwardRow * 1)]
+
+
+def _route_table_gateway(buffer, length: int) -> str | None:
+    offset = _IPv4ForwardTable.rows.offset
+    if not offset <= length <= ctypes.sizeof(buffer):
+        return None
+    count = ctypes.c_uint32.from_buffer(buffer).value
+    row_bytes = ctypes.sizeof(_IPv4ForwardRow)
+    if count > (length - offset) // row_bytes:
+        return None
+
+    # Windows includes the interface cost in dwForwardMetric1.
+    best_metric = _UNUSED_METRIC
+    best_hops = set()
+    for row in (_IPv4ForwardRow * count).from_buffer(buffer, offset):
+        if (row.destination or row.mask or not row.interface or row.type not in {_DIRECT_ROUTE, _INDIRECT_ROUTE}
+                or row.metric == _UNUSED_METRIC or row.metric > best_metric):
+            continue
+        if row.metric < best_metric:
+            best_metric = row.metric
+            best_hops.clear()
+        # The DWORD holds bytes in network order even on little-endian Windows.
+        hop = IPv4Address(row.next_hop.to_bytes(4, sys.byteorder))
+        if (row.type == _DIRECT_ROUTE or hop.is_unspecified or hop.is_loopback
+                or hop.is_multicast or hop.is_reserved):
+            best_hops.add(None)
+        else:
+            best_hops.add(hop)
+    # An on-link route or distinct equal-cost gateways cannot identify one next hop.
+    gateway = next(iter(best_hops)) if len(best_hops) == 1 else None
+    return str(gateway) if gateway is not None else None
+
+
+def _windows_default_gateway() -> str | None:
+    from ctypes import wintypes
+
+    try:
+        read_table = ctypes.WinDLL("iphlpapi", use_last_error=True).GetIpForwardTable
+        read_table.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), wintypes.BOOL]
+        read_table.restype = wintypes.DWORD
+        length = wintypes.DWORD()
+        buffer = None
+        # The route table may grow after the initial buffer-size query.
+        for _ in range(4):
+            capacity = ctypes.sizeof(buffer) if buffer is not None else 0
+            length.value = capacity
+            status = read_table(buffer, ctypes.byref(length), False)
+            if status == 0 and buffer is not None:
+                return _route_table_gateway(buffer, length.value)
+            if status != _ERROR_INSUFFICIENT_BUFFER or not capacity < length.value <= _MAX_ROUTE_TABLE_BYTES:
+                return None
+            buffer = ctypes.create_string_buffer(length.value)
+    except (OSError, AttributeError):
+        return None
+    return None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def validate_host(host: str) -> str:
@@ -29,7 +118,6 @@ def validate_host(host: str) -> str:
 
 
 def default_gateway() -> str | None:
-    import sys
     if sys.platform.startswith("linux"):
         try:
             for line in open("/proc/net/route", encoding="utf-8"):
@@ -41,14 +129,7 @@ def default_gateway() -> str | None:
         except OSError:
             return None
     if sys.platform == "win32":
-        try:
-            import ctypes
-            from ctypes import wintypes
-            size = wintypes.DWORD(0)
-            ctypes.windll.iphlpapi.GetIpForwardTable(None, ctypes.byref(size), False)
-            # 表结构随系统变化。读不到时明确返回未知，不用 0.0.0.0 充数。
-        except Exception:
-            return None
+        return _windows_default_gateway()
     return None
 
 
@@ -93,11 +174,13 @@ def diagnose(host: str, resolver=None, gateway=None, probe=None, https=None) -> 
         request.add_header("User-Agent", "GaoJiLing")
         started = time.monotonic()
         try:
-            with urllib.request.urlopen(request, timeout=8) as response:
+            opener = urllib.request.build_opener(_NoRedirect())
+            with opener.open(request, timeout=8) as response:
                 code = getattr(response, "status", 0)
                 return True, code, int((time.monotonic() - started) * 1000), None
         except urllib.error.HTTPError as error:
-            return True, error.code, int((time.monotonic() - started) * 1000), None
+            with error:
+                return True, error.code, int((time.monotonic() - started) * 1000), None
         except Exception as error:
             return False, 0, int((time.monotonic() - started) * 1000), str(error)
 

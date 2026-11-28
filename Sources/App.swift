@@ -70,6 +70,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
     private var statusItem: NSStatusItem!
     private var edgeHandle: EdgeHandleController?
     private var edgeTimer: Timer?
+    private var sleeping = false
     private var subscriptions = Set<AnyCancellable>()
     private var panelAutoCollapse = PanelAutoCollapse()
     private var panelContentHeight: CGFloat = 620
@@ -180,8 +181,6 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(activeApplicationChanged(_:)), name: NSWorkspace.didActivateApplicationNotification, object: nil)
-        edgeTimer = Timer.scheduledTimer(timeInterval: 0.05, target: self, selector: #selector(checkEdge), userInfo: nil, repeats: true)
-        if let edgeTimer { RunLoop.main.add(edgeTimer, forMode: .common) }
         settingsChanged()
         showDashboard()
         let pending = pendingPackages
@@ -417,8 +416,17 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         if let hotkey { UnregisterEventHotKey(hotkey) }
         if let hotkeyHandler { RemoveEventHandler(hotkeyHandler) }
     }
-    @objc private func willSleep() { store.prepareForSleep(); hidePanel(); edgeHandle?.suspend() }
-    @objc private func didWake() { edgeHandle?.resume() }
+    @objc private func willSleep() {
+        sleeping = true
+        store.prepareForSleep()
+        hidePanel()
+        edgeHandle?.suspend()
+    }
+    @objc private func didWake() {
+        sleeping = false
+        edgeHandle?.resume()
+        updateEdgeTimer()
+    }
     @objc private func screensChanged() { hidePanel(); edgeHandle?.screensChanged() }
     @objc private func resetEdgeHandle() { hidePanel(); edgeHandle?.reset() }
     @objc private func dockEdgeHandle() { hidePanel(); edgeHandle?.dock() }
@@ -428,6 +436,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         edgeHandle?.update(enabled: store.settings.edgeEnabled, edge: store.settings.edge,
                            restorePosition: notification?.object as? String == "restored")
         if !store.settings.edgeEnabled { hidePanel() }
+        updateEdgeTimer()
     }
     private func updateStatus(_ sample: MetricsSample) {
         guard let button = statusItem?.button else { return }
@@ -558,6 +567,7 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
         panel.alphaValue = 0
         edgeHandle?.setExpanded(true)
         panel.orderFrontRegardless()
+        updateEdgeTimer()
         updateSamplingDemand()
         if manual { panel.makeKeyAndOrderFront(nil) }
         NSAnimationContext.runAnimationGroup { context in context.duration = 0.16; panel.animator().alphaValue = 1 }
@@ -599,8 +609,21 @@ final class MonitorPanelContentView: NSHostingView<PanelView> {
             if didDrag, let screen { edgeHandle?.commitPanelPosition(panel.frame, on: screen, edge: panelExpansionEdge) }
         }
         panelAutoCollapse.closed(); openingStripFrame = nil; panel.orderOut(nil)
+        updateEdgeTimer()
         updateSamplingDemand()
         suppressEdgeUntil = Date().addingTimeInterval(0.8); edgeHandle?.setExpanded(false)
+    }
+    private func updateEdgeTimer() {
+        guard !sleeping, store.settings.edgeEnabled || panel?.isVisible == true else {
+            edgeTimer?.invalidate()
+            edgeTimer = nil
+            return
+        }
+        guard edgeTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.05, target: self, selector: #selector(checkEdge), userInfo: nil, repeats: true)
+        timer.tolerance = 0.01
+        RunLoop.main.add(timer, forMode: .common)
+        edgeTimer = timer
     }
     @objc private func checkEdge() {
         guard !NSScreen.screens.isEmpty else { return }
